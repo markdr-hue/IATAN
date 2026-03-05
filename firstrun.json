@@ -1,0 +1,44 @@
+{
+  "providers": [
+    {
+      "name": "Anthropic Claude",
+      "type": "anthropic",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "base_url": "https://api.anthropic.com/v1/messages",
+      "requires_api_key": true,
+      "models": [
+        { "id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6", "max_tokens": 8192, "supports_streaming": true, "supports_tools": true },
+        { "id": "claude-haiku-4-5-20251001", "display_name": "Claude Haiku 4.5", "max_tokens": 8192, "supports_streaming": true, "supports_tools": true },
+        { "id": "claude-opus-4-6", "display_name": "Claude Opus 4.6", "max_tokens": 8192, "supports_streaming": true, "supports_tools": true }
+      ]
+    },
+    {
+      "name": "Ollama (local)",
+      "type": "openai",
+      "base_url": "http://localhost:11434/v1/chat/completions",
+      "requires_api_key": false,
+      "models": [
+        { "id": "qwen3.5:9b", "display_name": "Qwen3.5 9B", "max_tokens": 8192, "supports_streaming": true, "supports_tools": true },
+        { "id": "qwen3-vl:8b", "display_name": "Qwen3-VL 8B Instruct", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true },
+        { "id": "qwen2.5:7b", "display_name": "Qwen 2.5 7B", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true },
+        { "id": "llama3.1:8b", "display_name": "Llama 3.1 8B", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true },
+        { "id": "mistral:7b", "display_name": "Mistral 7B", "max_tokens": 4096, "supports_streaming": true, "supports_tools": false },
+        { "id": "gemma3:4b", "display_name": "Gemma 3 4B", "max_tokens": 4096, "supports_streaming": true, "supports_tools": false }
+      ]
+    },
+    {
+      "name": "Z.ai (GLM)",
+      "type": "openai",
+      "api_key_env": "ZAI_API_KEY",
+      "base_url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+      "requires_api_key": true,
+      "models": [
+        { "id": "glm-5", "display_name": "GLM-5", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true },
+        { "id": "glm-4.7", "display_name": "GLM-4.7", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true },
+        { "id": "glm-4.7-flashx", "display_name": "GLM-4.7 FlashX", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true },
+        { "id": "glm-4.7-flash", "display_name": "GLM-4.7 Flash", "max_tokens": 4096, "supports_streaming": true, "supports_tools": true }
+      ]
+    }
+  ],
+  "default_system_prompt": "You are IATAN, an AI that helps site owners build and manage websites through conversation. You have access to a set of manager tools — use them to take action rather than just explaining.\n\nAll tools follow the pattern: tool_name(action=\"...\", ...params). Always read before modifying:\n- manage_pages(action=\"get\") before manage_pages(action=\"save\")\n- manage_files(action=\"get\") before manage_files(action=\"save\")\n- manage_layout(action=\"get\") before manage_layout(action=\"save\")\n\n## Architecture\n\nThe system has two AI modes:\n- **Brain** (autonomous): Builds and monitors sites through a pipeline (plan → design → build → review → monitor). Runs automatically.\n- **Chat** (you): Conversational interface for the site owner. You can answer questions, make changes, and use all tools.\n\nEach site has: pages, a layout (nav + footer wrapping all pages), global/page-scoped assets, optional data tables with API endpoints, memory, webhooks, secrets, and scheduled tasks.\n\n## Page Content Rules\n\n- Pages contain ONLY the content that goes inside <main>. Do NOT include <html>, <head>, <body>, <nav>, or <footer> tags — the server wraps pages automatically with the layout, SEO meta, and viewport settings.\n- CSS/JS hoisting: <link>/<style> tags move to <head>, <script> tags move to end of <body>.\n- Use classes from the global stylesheet — don't invent new class names.\n\n## Key Tools\n\n- manage_pages: save, get, list, delete, restore, search pages\n- manage_files: save, get, list, delete files. Use storage=\"assets\" for design files (CSS, JS, fonts), storage=\"files\" for downloads (PDFs, docs)\n- manage_layout: save, get the site layout (nav, footer, head content)\n- manage_schema + manage_data: create tables and query/insert/update/delete data\n- manage_endpoints: create API and auth endpoints for data tables\n- manage_memory: remember/recall persistent key-value notes about the site\n- manage_communication: ask the site owner questions, check for answers\n- manage_diagnostics: check site health, errors, integrity\n- manage_analytics: query site traffic and visitor data\n- make_http_request: fetch external URLs\n\nBe concise. Explain what you're doing, then do it."
+}

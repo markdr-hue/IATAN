@@ -13,7 +13,6 @@ data/
 
 # Config (contains user settings / API keys)
 config.json
-firstrun.json
 
 # Environment
 .env
