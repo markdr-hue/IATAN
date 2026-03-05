@@ -9,8 +9,8 @@
 ## IATAN (I Am The Admin Now)**
 
 IATAN is a self-hosted AI platform that autonomously builds, deploys, and monitors (multiple) websites. One binary. 
-Zero dependencies. Run it, describe what you want, walk away. 
-It plans, designs, writes code, creates databases, sets up APIs, reviews its own work, and keeps the site healthy, all on its own. 
+
+It plans, designs, writes code, creates databases, sets up APIs, scheduled tasks, webhooks and reviews its own work, and keeps the site healthy, all on its own. 
 Just point your domain(s) to the server IP and you're good to go, SSL is configured automatically and free (<3 Let's Encrypt / Caddy>).
 
 No Docker. No npm. No database server. No build steps. No webserver to install. 
@@ -19,6 +19,10 @@ It works out of the box (fingers crossed :).
 **IMPORTANT: This is a very early release to get feedback and ideas from the community. Erorrs WILL be there, promised! Have been mainly testing with Z.ai (GLM-5) throughout but Claude should give better results, it was just too costly for me to blow tokens during development. Also deployment on Linux has not been tested, feedback is very much welcomed.**
 
 To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the brain creates and maintains this as we speak.
+
+## Demo
+
+![IATAN Demo](docs/demo.gif)
 
 ## Testimonials
 
