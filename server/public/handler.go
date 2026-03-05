@@ -1,0 +1,1448 @@
+/*
+ * Created by Mark Durlinger. MIT License.
+ * 50% human, 50% AI, 100% chaos.
+ */
+
+package public
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"html"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/markdr-hue/IATAN/db/models"
+	"github.com/markdr-hue/IATAN/security"
+	"github.com/markdr-hue/IATAN/server/middleware"
+)
+
+type contextKey string
+
+const siteContextKey contextKey = "resolved_site"
+
+// Handler provides the main public request handlers.
+type Handler struct {
+	deps *Deps
+}
+
+// SiteResolver is middleware that resolves the site from the Host header
+// and injects it into the request context.
+func (h *Handler) SiteResolver(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		// Strip port if present.
+		if idx := strings.LastIndex(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+
+		site, err := models.GetSiteByDomain(h.deps.DB.DB, host)
+		if err != nil {
+			// If no site matches the domain, try to serve the first active site
+			// as a fallback for single-site setups.
+			sites, listErr := models.ListActiveSites(h.deps.DB.DB)
+			if listErr != nil || len(sites) == 0 {
+				writePublicError(w, http.StatusNotFound, "site not found")
+				return
+			}
+			site = &sites[0]
+		}
+
+		// Block inactive sites — return 404 so disabled sites are hidden.
+		if site.Status != "active" {
+			writePublicError(w, http.StatusNotFound, "site not found")
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), siteContextKey, site)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// getSite extracts the resolved site from the context.
+func getSite(r *http.Request) *models.Site {
+	site, _ := r.Context().Value(siteContextKey).(*models.Site)
+	return site
+}
+
+// ---------------------------------------------------------------------------
+// Page JSON API (kept for backward compat with any JS that uses it)
+// ---------------------------------------------------------------------------
+
+// Page serves page content as JSON for the given path query parameter.
+// GET /api/page?path=/about
+func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	if site == nil {
+		writePublicError(w, http.StatusNotFound, "site not found")
+		return
+	}
+
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	pagePath := r.URL.Query().Get("path")
+	if pagePath == "" {
+		pagePath = "/"
+	}
+
+	var content, title, metadata, pageAssets sql.NullString
+	err = siteDB.QueryRow(
+		"SELECT title, content, metadata, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+		pagePath,
+	).Scan(&title, &content, &metadata, &pageAssets)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "page not found")
+		return
+	}
+
+	// Strip shared asset refs the brain may have embedded, then strip external
+	// scripts and CSS links for SPA — extracting their URLs so the router
+	// can load them dynamically.
+	cleaned := stripSharedAssetRefs(content.String, siteDB.DB)
+	cleanContent, contentCSS, contentJS := stripForSPA(cleaned)
+
+	resp := map[string]interface{}{
+		"path":     pagePath,
+		"title":    title.String,
+		"content":  strings.TrimSpace(cleanContent),
+		"metadata": metadata.String,
+		"site_id":  site.ID,
+	}
+
+	// Merge DB-declared page assets with URLs extracted from content.
+	if pageAssets.String != "" && pageAssets.String != "null" {
+		dbCSS, dbJS := parsePageAssetURLs(pageAssets.String)
+		contentCSS = append(dbCSS, contentCSS...)
+		contentJS = append(dbJS, contentJS...)
+	}
+	if len(contentCSS) > 0 {
+		resp["page_css"] = dedupStrings(contentCSS)
+	}
+	if len(contentJS) > 0 {
+		resp["page_js"] = dedupStrings(contentJS)
+	}
+	writePublicJSON(w, http.StatusOK, resp)
+}
+
+// ---------------------------------------------------------------------------
+// SSR — Server-Side Rendered Pages
+// ---------------------------------------------------------------------------
+
+type pageMetadata struct {
+	Description string `json:"description"`
+	OGImage     string `json:"og_image"`
+	Canonical   string `json:"canonical"`
+	Keywords    string `json:"keywords"`
+}
+
+// ServePage serves a fully-rendered HTML page by its URL path.
+func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	if site == nil {
+		writePublicError(w, http.StatusNotFound, "site not found")
+		return
+	}
+
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	pagePath := r.URL.Path
+	if pagePath == "" {
+		pagePath = "/"
+	}
+
+	var content, title, metadata, layoutName, pageAssets sql.NullString
+	err = siteDB.QueryRow(
+		"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+		pagePath,
+	).Scan(&title, &content, &metadata, &layoutName, &pageAssets)
+	if err != nil {
+		// Try common homepage variants: the brain often saves as /index.html instead of /
+		found := false
+		for _, alt := range homeFallbacks(pagePath) {
+			if siteDB.QueryRow(
+				"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+				alt,
+			).Scan(&title, &content, &metadata, &layoutName, &pageAssets) == nil {
+				found = true
+				pagePath = alt
+				break
+			}
+		}
+		if !found {
+			h.serve404(w, site)
+			return
+		}
+	}
+
+	// Track analytics (fire-and-forget).
+	go h.trackPageView(site.ID, pagePath, r)
+
+	// Render the full HTML document with layout wrapping.
+	doc := h.renderDocument(site, siteDB.DB, pagePath, title.String, content.String, metadata.String, layoutName.String, pageAssets.String)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(doc))
+}
+
+func (h *Handler) serve404(w http.ResponseWriter, site *models.Site) {
+	// Check for a custom 404 page.
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err == nil {
+		var content, title, metadata, layoutName, pageAssets sql.NullString
+		err = siteDB.QueryRow(
+			"SELECT title, content, metadata, layout, assets FROM pages WHERE path = '/404' AND status = 'published' AND is_deleted = 0",
+		).Scan(&title, &content, &metadata, &layoutName, &pageAssets)
+		if err == nil {
+			doc := h.renderDocument(site, siteDB.DB, "/404", title.String, content.String, metadata.String, layoutName.String, pageAssets.String)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(doc))
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte("<!DOCTYPE html><html><head><title>Page Not Found</title></head><body><h1>404 — Page Not Found</h1></body></html>"))
+}
+
+// layoutData holds a loaded layout from the layouts table.
+type layoutData struct {
+	HeadContent    string
+	BodyBeforeMain string
+	BodyAfterMain  string
+}
+
+// loadLayout loads a layout by name from the site database. Returns nil if not found.
+func loadLayout(siteDB *sql.DB, name string) *layoutData {
+	var ld layoutData
+	err := siteDB.QueryRow(
+		"SELECT head_content, body_before_main, body_after_main FROM layouts WHERE name = ?",
+		name,
+	).Scan(&ld.HeadContent, &ld.BodyBeforeMain, &ld.BodyAfterMain)
+	if err != nil {
+		return nil
+	}
+	return &ld
+}
+
+// autoInjectAssets queries global-scoped CSS/JS assets and returns link/script tags.
+// Page-scoped assets are injected separately per page via injectPageAssets.
+func autoInjectAssets(siteDB *sql.DB) (cssLinks, jsScripts string) {
+	rows, err := siteDB.Query(
+		"SELECT filename FROM assets WHERE scope = 'global' AND (filename LIKE '%.css' OR filename LIKE '%.js') ORDER BY filename",
+	)
+	if err != nil {
+		return "", ""
+	}
+	defer rows.Close()
+
+	var css, js strings.Builder
+	for rows.Next() {
+		var fn string
+		if rows.Scan(&fn) != nil {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(fn), ".css") {
+			css.WriteString(`  <link rel="stylesheet" href="/assets/` + fn + `">` + "\n")
+		} else if strings.HasSuffix(strings.ToLower(fn), ".js") {
+			js.WriteString(`  <script src="/assets/` + fn + `"></script>` + "\n")
+		}
+	}
+	return css.String(), js.String()
+}
+
+// injectPageAssets generates link/script tags for page-scoped assets.
+// pageAssetsJSON is a JSON array of filenames, e.g. ["charts.js","maps.css"].
+func injectPageAssets(pageAssetsJSON string) (cssLinks, jsScripts string) {
+	if pageAssetsJSON == "" || pageAssetsJSON == "null" {
+		return "", ""
+	}
+	var filenames []string
+	if err := json.Unmarshal([]byte(pageAssetsJSON), &filenames); err != nil {
+		return "", ""
+	}
+	var css, js strings.Builder
+	for _, fn := range filenames {
+		fn = strings.TrimSpace(fn)
+		if fn == "" {
+			continue
+		}
+		lower := strings.ToLower(fn)
+		if strings.HasSuffix(lower, ".css") {
+			css.WriteString(`  <link rel="stylesheet" href="/assets/` + fn + `">` + "\n")
+		} else if strings.HasSuffix(lower, ".js") {
+			js.WriteString(`  <script src="/assets/` + fn + `"></script>` + "\n")
+		}
+	}
+	return css.String(), js.String()
+}
+
+func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, title, content, metadataJSON, layoutName, pageAssetsJSON string) string {
+	// Parse page metadata.
+	var meta pageMetadata
+	if metadataJSON != "" && metadataJSON != "{}" {
+		json.Unmarshal([]byte(metadataJSON), &meta)
+	}
+
+	// Text direction attribute (always LTR for now; the site.Direction field
+	// stores the owner's building goals, NOT text direction).
+	dir := "ltr"
+
+	// Build the page title.
+	pageTitle := html.EscapeString(site.Name)
+	if title != "" {
+		pageTitle = html.EscapeString(title) + " | " + html.EscapeString(site.Name)
+	}
+
+	// Build canonical URL.
+	canonicalURL := meta.Canonical
+	if canonicalURL == "" && site.Domain != nil && *site.Domain != "" {
+		canonicalURL = "https://" + *site.Domain + pagePath
+	}
+
+	// Description.
+	description := meta.Description
+	if description == "" && site.Description != nil {
+		description = *site.Description
+	}
+
+	// Load layout (NULL or empty → "default", "none" → no layout).
+	var layout *layoutData
+	if layoutName != "none" {
+		if layoutName == "" {
+			layoutName = "default"
+		}
+		layout = loadLayout(siteDB, layoutName)
+	}
+
+	// Auto-inject global-scoped CSS/JS assets from the assets table.
+	cssLinks, jsScripts := autoInjectAssets(siteDB)
+
+	// Page-scoped assets (only for this page).
+	pageCSSLinks, pageJSScripts := injectPageAssets(pageAssetsJSON)
+
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n")
+	b.WriteString(`<html lang="en" dir="` + html.EscapeString(dir) + `">` + "\n")
+	b.WriteString("<head>\n")
+	b.WriteString(`  <meta charset="utf-8">` + "\n")
+	b.WriteString(`  <meta name="viewport" content="width=device-width, initial-scale=1">` + "\n")
+	b.WriteString("  <title>" + pageTitle + "</title>\n")
+
+	if description != "" {
+		b.WriteString(`  <meta name="description" content="` + html.EscapeString(description) + `">` + "\n")
+	}
+	if meta.Keywords != "" {
+		b.WriteString(`  <meta name="keywords" content="` + html.EscapeString(meta.Keywords) + `">` + "\n")
+	}
+
+	// Open Graph tags.
+	b.WriteString(`  <meta property="og:title" content="` + html.EscapeString(title) + `">` + "\n")
+	if description != "" {
+		b.WriteString(`  <meta property="og:description" content="` + html.EscapeString(description) + `">` + "\n")
+	}
+	if meta.OGImage != "" {
+		b.WriteString(`  <meta property="og:image" content="` + html.EscapeString(meta.OGImage) + `">` + "\n")
+	}
+	if canonicalURL != "" {
+		b.WriteString(`  <meta property="og:url" content="` + html.EscapeString(canonicalURL) + `">` + "\n")
+		b.WriteString(`  <link rel="canonical" href="` + html.EscapeString(canonicalURL) + `">` + "\n")
+	}
+
+	// Auto-injected global CSS assets.
+	if cssLinks != "" {
+		b.WriteString(cssLinks)
+	}
+	// Page-scoped CSS assets.
+	if pageCSSLinks != "" {
+		b.WriteString(pageCSSLinks)
+	}
+
+	// Layout head_content (extra fonts, meta, etc.).
+	if layout != nil && layout.HeadContent != "" {
+		b.WriteString(layout.HeadContent)
+		b.WriteString("\n")
+	}
+
+	// Strip any document-level tags the LLM may have included (DOCTYPE, html, head, body).
+	content = stripDocumentShell(content)
+
+	// Strip shared asset references that the LLM accidentally included in page content.
+	// This prevents duplicate CSS/JS since assets are auto-injected above.
+	content = stripSharedAssetRefs(content, siteDB)
+
+	// Extract page-specific CSS and JS tags from page content:
+	// page <style> blocks → <head>, inline <script> blocks → end of <body>.
+	headTags, bodyEndTags, cleanContent := extractAssetTags(content)
+	if headTags != "" {
+		b.WriteString(headTags)
+		b.WriteString("\n")
+	}
+
+	b.WriteString("</head>\n")
+	b.WriteString("<body>\n")
+
+	if layout != nil {
+		// Layout wrapping: body_before_main → <main> → content → </main> → body_after_main
+		if layout.BodyBeforeMain != "" {
+			b.WriteString(layout.BodyBeforeMain)
+			b.WriteString("\n")
+		}
+		b.WriteString("<main>\n")
+		b.WriteString(cleanContent)
+		b.WriteString("\n</main>\n")
+		if layout.BodyAfterMain != "" {
+			b.WriteString(layout.BodyAfterMain)
+			b.WriteString("\n")
+		}
+	} else {
+		// No layout — render content directly (fallback for pre-layout sites / blueprint in progress).
+		b.WriteString(cleanContent)
+	}
+
+	// Auto-injected global JS assets (after footer/layout).
+	if jsScripts != "" {
+		b.WriteString(jsScripts)
+	}
+	// Page-scoped JS assets.
+	if pageJSScripts != "" {
+		b.WriteString(pageJSScripts)
+	}
+
+	// Page-specific inline scripts.
+	if bodyEndTags != "" {
+		b.WriteString(bodyEndTags)
+		b.WriteString("\n")
+	}
+	b.WriteString("</body>\n</html>")
+
+	return b.String()
+}
+
+// stripSharedAssetRefs removes <link> and <script src> tags referencing /assets/
+// from page content. These are auto-injected by the server, so duplicates in
+// page content would cause double-loading.
+func stripSharedAssetRefs(content string, siteDB *sql.DB) string {
+	// Collect known asset filenames for matching.
+	assetNames := map[string]bool{}
+	rows, err := siteDB.Query("SELECT filename FROM assets WHERE (filename LIKE '%.css' OR filename LIKE '%.js')")
+	if err != nil {
+		return content
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fn string
+		if rows.Scan(&fn) == nil {
+			assetNames[strings.ToLower(fn)] = true
+		}
+	}
+	if len(assetNames) == 0 {
+		return content
+	}
+
+	// Remove <link rel="stylesheet" href="/assets/..."> for known assets.
+	content = cssLinkRe.ReplaceAllStringFunc(content, func(match string) string {
+		lower := strings.ToLower(match)
+		for name := range assetNames {
+			if strings.Contains(lower, "/assets/"+name) {
+				return ""
+			}
+		}
+		return match
+	})
+
+	// Remove <script src="/assets/...">...</script> for known assets.
+	// Only check the opening <script> tag for src=, not the script body.
+	content = scriptBlockRe.ReplaceAllStringFunc(content, func(match string) string {
+		if !isExternalScript(match) {
+			return match // inline script — keep it
+		}
+		lower := strings.ToLower(match)
+		for name := range assetNames {
+			if strings.Contains(lower, "/assets/"+name) {
+				return ""
+			}
+		}
+		return match
+	})
+
+	// Remove self-closing <script src="/assets/..." /> for known assets.
+	content = scriptSelfCloseRe.ReplaceAllStringFunc(content, func(match string) string {
+		lower := strings.ToLower(match)
+		for name := range assetNames {
+			if strings.Contains(lower, "/assets/"+name) {
+				return ""
+			}
+		}
+		return match
+	})
+
+	return content
+}
+
+// ---------------------------------------------------------------------------
+// Asset tag extraction — hoists CSS to <head> and JS to end of <body>.
+// ---------------------------------------------------------------------------
+
+// Regex patterns for extracting asset tags from page content.
+var (
+	// Matches <link ... rel="stylesheet" ... > or <link ... rel='stylesheet' ... >
+	cssLinkRe = regexp.MustCompile(`(?i)<link[^>]*rel=["']stylesheet["'][^>]*/?>`)
+	// Matches <style> ... </style> blocks (including attributes)
+	styleBlockRe = regexp.MustCompile(`(?isU)<style[\s>].*</style>`)
+	// Matches <script ...> ... </script> blocks (inline or src-based)
+	scriptBlockRe = regexp.MustCompile(`(?isU)<script[\s>].*</script>`)
+	// Matches self-closing <script ... /> (rare but valid)
+	scriptSelfCloseRe = regexp.MustCompile(`(?i)<script[^>]*/\s*>`)
+	// Matches the opening <script ...> tag (up to the first '>').
+	scriptOpenTagRe = regexp.MustCompile(`(?i)<script[^>]*>`)
+	// Matches a src attribute inside a tag.
+	scriptSrcRe = regexp.MustCompile(`(?i)\bsrc\s*=`)
+	// Attribute extractors for SPA asset URL extraction.
+	hrefAttrRe = regexp.MustCompile(`(?i)href\s*=\s*["']([^"']+)["']`)
+	srcAttrRe  = regexp.MustCompile(`(?i)src\s*=\s*["']([^"']+)["']`)
+)
+
+// extractHref returns the href attribute value from an HTML tag, or "".
+func extractHref(tag string) string {
+	m := hrefAttrRe.FindStringSubmatch(tag)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+// extractSrc returns the src attribute value from an HTML tag, or "".
+func extractSrc(tag string) string {
+	m := srcAttrRe.FindStringSubmatch(tag)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+// isExternalScript checks whether a <script>...</script> block has a src
+// attribute on the opening tag (making it an external script). This avoids
+// false positives from 'src=' appearing inside JavaScript code — e.g.
+// template literals like `<img src="${imgSrc}">`.
+func isExternalScript(block string) bool {
+	openTag := scriptOpenTagRe.FindString(block)
+	if openTag == "" {
+		return false
+	}
+	return scriptSrcRe.MatchString(openTag)
+}
+
+// extractScriptSrc extracts the src URL from a <script> block's opening tag only.
+func extractScriptSrc(block string) string {
+	openTag := scriptOpenTagRe.FindString(block)
+	if openTag == "" {
+		return ""
+	}
+	return extractSrc(openTag)
+}
+
+// dedupStrings returns a slice with duplicate strings removed, preserving order.
+func dedupStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// extractAssetTags separates CSS and JS tags from page content so they can be
+// placed in the correct locations: CSS in <head>, JS at end of <body>.
+func extractAssetTags(content string) (headTags, bodyEndTags, cleanContent string) {
+	var head []string
+	var bodyEnd []string
+
+	// Extract <link rel="stylesheet"> tags → head
+	content = cssLinkRe.ReplaceAllStringFunc(content, func(match string) string {
+		head = append(head, match)
+		return ""
+	})
+
+	// Extract <style> blocks → head
+	content = styleBlockRe.ReplaceAllStringFunc(content, func(match string) string {
+		head = append(head, match)
+		return ""
+	})
+
+	// Extract <script> blocks → body end
+	content = scriptBlockRe.ReplaceAllStringFunc(content, func(match string) string {
+		bodyEnd = append(bodyEnd, match)
+		return ""
+	})
+
+	// Extract self-closing <script /> → body end
+	content = scriptSelfCloseRe.ReplaceAllStringFunc(content, func(match string) string {
+		bodyEnd = append(bodyEnd, match)
+		return ""
+	})
+
+	headTags = strings.Join(head, "\n")
+	bodyEndTags = strings.Join(bodyEnd, "\n")
+	cleanContent = content
+	return
+}
+
+// parsePageAssetURLs splits a JSON array of filenames into CSS and JS URL arrays.
+func parsePageAssetURLs(assetsJSON string) (cssURLs, jsURLs []string) {
+	var filenames []string
+	if err := json.Unmarshal([]byte(assetsJSON), &filenames); err != nil {
+		return nil, nil
+	}
+	for _, fn := range filenames {
+		fn = strings.TrimSpace(fn)
+		if fn == "" {
+			continue
+		}
+		lower := strings.ToLower(fn)
+		if strings.HasSuffix(lower, ".css") {
+			cssURLs = append(cssURLs, "/assets/"+fn)
+		} else if strings.HasSuffix(lower, ".js") {
+			jsURLs = append(jsURLs, "/assets/"+fn)
+		}
+	}
+	return
+}
+
+// stripForSPA prepares page content for the SPA JSON endpoint (/api/page).
+// Strips CSS links and external scripts (src=...) but keeps <style> blocks
+// and inline scripts. Returns the extracted CSS and JS URLs so the SPA
+// router can load them dynamically.
+func stripForSPA(content string) (string, []string, []string) {
+	var cssURLs, jsURLs []string
+
+	// Extract CSS link hrefs, then remove the tags.
+	for _, match := range cssLinkRe.FindAllString(content, -1) {
+		if href := extractHref(match); href != "" {
+			cssURLs = append(cssURLs, href)
+		}
+	}
+	content = cssLinkRe.ReplaceAllString(content, "")
+	// Keep <style> blocks — they work in innerHTML and may contain page-specific styles.
+
+	// Extract external script srcs, then remove the tags.
+	// Keep inline <script>...</script> for page-specific logic.
+	// IMPORTANT: Only check the opening <script> tag for src=, NOT the
+	// script body — JavaScript code often contains 'src=' in template
+	// literals, DOM manipulation, etc.
+	content = scriptBlockRe.ReplaceAllStringFunc(content, func(match string) string {
+		if isExternalScript(match) {
+			if src := extractScriptSrc(match); src != "" {
+				jsURLs = append(jsURLs, src)
+			}
+			return "" // external script — strip it
+		}
+		return match // inline script — keep it
+	})
+
+	// Remove self-closing <script src="..." /> tags, extract src.
+	content = scriptSelfCloseRe.ReplaceAllStringFunc(content, func(match string) string {
+		if src := extractSrc(match); src != "" {
+			jsURLs = append(jsURLs, src)
+		}
+		return ""
+	})
+
+	return strings.TrimSpace(content), cssURLs, jsURLs
+}
+
+// ---------------------------------------------------------------------------
+// Document shell stripping — removes structural HTML tags from LLM content.
+// ---------------------------------------------------------------------------
+
+var (
+	doctypeRe   = regexp.MustCompile(`(?i)<!DOCTYPE[^>]*>`)
+	htmlOpenRe  = regexp.MustCompile(`(?i)<html[^>]*>`)
+	htmlCloseRe = regexp.MustCompile(`(?i)</html\s*>`)
+	headBlockRe = regexp.MustCompile(`(?isU)<head[\s>].*</head>`)
+	bodyOpenRe  = regexp.MustCompile(`(?i)<body[^>]*>`)
+	bodyCloseRe = regexp.MustCompile(`(?i)</body\s*>`)
+)
+
+// stripDocumentShell removes structural HTML tags (DOCTYPE, html, head, body)
+// from page content. The system wraps content in its own document shell via
+// renderDocument, so these tags must not be present in stored content.
+// CSS/JS inside <head> are rescued so extractAssetTags can hoist them later.
+func stripDocumentShell(content string) string {
+	lower := strings.ToLower(content)
+	if !strings.Contains(lower, "<!doctype") && !strings.Contains(lower, "<html") {
+		return content
+	}
+
+	// Rescue <style>, <link rel="stylesheet">, and <script> from inside <head>
+	// before we remove the entire <head> block.
+	var rescued []string
+	for _, headMatch := range headBlockRe.FindAllString(content, -1) {
+		for _, m := range cssLinkRe.FindAllString(headMatch, -1) {
+			rescued = append(rescued, m)
+		}
+		for _, m := range styleBlockRe.FindAllString(headMatch, -1) {
+			rescued = append(rescued, m)
+		}
+		for _, m := range scriptBlockRe.FindAllString(headMatch, -1) {
+			rescued = append(rescued, m)
+		}
+	}
+
+	content = doctypeRe.ReplaceAllString(content, "")
+	content = headBlockRe.ReplaceAllString(content, "")
+	content = htmlOpenRe.ReplaceAllString(content, "")
+	content = htmlCloseRe.ReplaceAllString(content, "")
+	content = bodyOpenRe.ReplaceAllString(content, "")
+	content = bodyCloseRe.ReplaceAllString(content, "")
+
+	if len(rescued) > 0 {
+		content = strings.Join(rescued, "\n") + "\n" + content
+	}
+
+	return strings.TrimSpace(content)
+}
+
+// homeFallbacks returns alternate paths to try when an exact page path isn't found.
+// This handles the common case where the brain saves the homepage as "/index.html"
+// but the browser requests "/", or vice versa.
+func homeFallbacks(path string) []string {
+	switch path {
+	case "/":
+		return []string{"/index.html", "/index", "/home"}
+	case "/index.html", "/index":
+		return []string{"/"}
+	default:
+		// No fallback for non-root paths. Each route must be a real page.
+		// SPA client-side routing handles transitions; the server serves
+		// each route individually for SSR/SEO.
+		return nil
+	}
+}
+
+func (h *Handler) trackPageView(siteID int, pagePath string, r *http.Request) {
+	siteDB, err := h.deps.SiteDBManager.Open(siteID)
+	if err != nil {
+		return
+	}
+
+	ip := middleware.ClientIP(r)
+	visitorHash := fmt.Sprintf("%x", sha256.Sum256([]byte(ip+r.UserAgent())))[:16]
+	referrer := r.Referer()
+	ua := r.UserAgent()
+
+	siteDB.ExecWrite(
+		"INSERT INTO analytics (page_path, visitor_hash, referrer, user_agent) VALUES (?, ?, ?, ?)",
+		pagePath, visitorHash, referrer, ua,
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Sitemap
+// ---------------------------------------------------------------------------
+
+func (h *Handler) Sitemap(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	if site == nil {
+		writePublicError(w, http.StatusNotFound, "site not found")
+		return
+	}
+
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	baseURL := "https://" + r.Host
+	if site.Domain != nil && *site.Domain != "" {
+		baseURL = "https://" + *site.Domain
+	}
+
+	rows, err := siteDB.Query(
+		"SELECT path, updated_at FROM pages WHERE status = 'published' AND is_deleted = 0 ORDER BY path",
+	)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+	b.WriteString(`<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` + "\n")
+
+	for rows.Next() {
+		var path string
+		var updatedAt time.Time
+		if err := rows.Scan(&path, &updatedAt); err != nil {
+			continue
+		}
+		b.WriteString("  <url>\n")
+		b.WriteString("    <loc>" + html.EscapeString(baseURL+path) + "</loc>\n")
+		b.WriteString("    <lastmod>" + updatedAt.Format("2006-01-02") + "</lastmod>\n")
+		b.WriteString("  </url>\n")
+	}
+
+	b.WriteString("</urlset>\n")
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(b.String()))
+}
+
+// ---------------------------------------------------------------------------
+// Robots.txt
+// ---------------------------------------------------------------------------
+
+func (h *Handler) Robots(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	baseURL := "https://" + r.Host
+	if site != nil && site.Domain != nil && *site.Domain != "" {
+		baseURL = "https://" + *site.Domain
+	}
+
+	body := "User-agent: *\nAllow: /\nSitemap: " + baseURL + "/sitemap.xml\n"
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(body))
+}
+
+// ---------------------------------------------------------------------------
+// Asset Serving
+// ---------------------------------------------------------------------------
+
+func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	if site == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Extract filename from path: /assets/{filename}
+	filename := strings.TrimPrefix(r.URL.Path, "/assets/")
+	if filename == "" || strings.Contains(filename, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Look up the asset in the database.
+	var storagePath, contentType sql.NullString
+	err = siteDB.QueryRow(
+		"SELECT storage_path, content_type FROM assets WHERE filename = ?",
+		filename,
+	).Scan(&storagePath, &contentType)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Serve the file from disk.
+	fpath := storagePath.String
+	if fpath == "" {
+		fpath = filepath.Join("data", "sites", fmt.Sprintf("%d", site.ID), "assets", filename)
+	}
+
+	data, err := os.ReadFile(fpath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	ct := contentType.String
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+
+	// ETag for cache busting — browsers revalidate when assets change.
+	etag := fmt.Sprintf(`"%x"`, sha256.Sum256(data))[:18] + `"`
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+// ServeFile serves user-uploaded files from the files table.
+func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	if site == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Extract filename from path: /files/{filename}
+	filename := strings.TrimPrefix(r.URL.Path, "/files/")
+	if filename == "" || strings.Contains(filename, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Look up the file in the database.
+	var storagePath, contentType sql.NullString
+	err = siteDB.QueryRow(
+		"SELECT storage_path, content_type FROM files WHERE filename = ?",
+		filename,
+	).Scan(&storagePath, &contentType)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Serve the file from disk.
+	fpath := storagePath.String
+	if fpath == "" {
+		fpath = filepath.Join("data", "sites", fmt.Sprintf("%d", site.ID), "files", filename)
+	}
+
+	data, err := os.ReadFile(fpath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	ct := contentType.String
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+
+	etag := fmt.Sprintf(`"%x"`, sha256.Sum256(data))[:18] + `"`
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic API Handler
+// ---------------------------------------------------------------------------
+
+type apiEndpoint struct {
+	ID            int
+	Path          string
+	TableName     string
+	Methods       []string
+	PublicColumns []string // nil means all non-secure
+	RequiresAuth  bool
+	RateLimit     int
+	SecureCols    map[string]string // column → "hash" or "encrypt"
+}
+
+func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
+	site := getSite(r)
+	if site == nil {
+		writePublicError(w, http.StatusNotFound, "site not found")
+		return
+	}
+
+	siteDB, err := h.deps.SiteDBManager.Open(site.ID)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	// Extract the endpoint path: /api/{path...}
+	// The full URL path is /api/something or /api/something/123
+	fullPath := strings.TrimPrefix(r.URL.Path, "/api/")
+	if fullPath == "" {
+		writePublicError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+
+	// Try auth endpoint first (handles /api/{path}/register, /api/{path}/login, /api/{path}/me).
+	if h.handleAuthRequest(w, r, site.ID, siteDB.Writer(), fullPath) {
+		return
+	}
+
+	// Split into endpoint path and optional ID.
+	// e.g. "contacts" → path="contacts", id=""
+	// e.g. "contacts/5" → path="contacts", id="5"
+	parts := strings.SplitN(fullPath, "/", 2)
+	endpointPath := parts[0]
+	var rowID string
+	if len(parts) > 1 {
+		rowID = parts[1]
+	}
+
+	// Look up the endpoint config.
+	ep, err := h.loadEndpoint(siteDB.DB, endpointPath)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+
+	// Check method is allowed.
+	if !methodAllowed(ep.Methods, r.Method) {
+		writePublicError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Check auth if required (accepts site API key or user JWT).
+	if ep.RequiresAuth {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !h.validateSiteTokenOrJWT(site.ID, token) {
+			writePublicError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+
+	// Physical table name (per-site DB, no prefix needed).
+	physTable := ep.TableName
+
+	switch r.Method {
+	case http.MethodGet:
+		if rowID != "" {
+			h.apiGetOne(w, r, siteDB.DB, physTable, rowID, ep)
+		} else {
+			h.apiList(w, r, siteDB.DB, physTable, ep)
+		}
+	case http.MethodPost:
+		h.apiInsert(w, r, siteDB.Writer(), physTable, ep)
+	case http.MethodPut:
+		if rowID == "" {
+			writePublicError(w, http.StatusBadRequest, "ID required for PUT")
+			return
+		}
+		h.apiUpdate(w, r, siteDB.Writer(), physTable, rowID, ep)
+	case http.MethodDelete:
+		if rowID == "" {
+			writePublicError(w, http.StatusBadRequest, "ID required for DELETE")
+			return
+		}
+		h.apiDelete(w, siteDB.Writer(), physTable, rowID, ep)
+	default:
+		writePublicError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *Handler) loadEndpoint(siteDB *sql.DB, path string) (*apiEndpoint, error) {
+	var ep apiEndpoint
+	var methodsJSON string
+	var publicColsJSON sql.NullString
+	err := siteDB.QueryRow(
+		"SELECT id, path, table_name, methods, public_columns, requires_auth, rate_limit FROM api_endpoints WHERE path = ?",
+		path,
+	).Scan(&ep.ID, &ep.Path, &ep.TableName, &methodsJSON, &publicColsJSON, &ep.RequiresAuth, &ep.RateLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	json.Unmarshal([]byte(methodsJSON), &ep.Methods)
+	if publicColsJSON.Valid && publicColsJSON.String != "" {
+		json.Unmarshal([]byte(publicColsJSON.String), &ep.PublicColumns)
+	}
+
+	// Load secure columns for this table.
+	var secureRaw string
+	err = siteDB.QueryRow(
+		"SELECT secure_columns FROM dynamic_tables WHERE table_name = ?",
+		ep.TableName,
+	).Scan(&secureRaw)
+	if err == nil {
+		json.Unmarshal([]byte(secureRaw), &ep.SecureCols)
+	}
+
+	return &ep, nil
+}
+
+func methodAllowed(methods []string, method string) bool {
+	for _, m := range methods {
+		if strings.EqualFold(m, method) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) validateSiteToken(siteID int, token string) bool {
+	if token == "" {
+		return false
+	}
+	// Check if the token matches the site's configured API key.
+	// The API key is stored in the site's config JSON as "api_key".
+	site, err := models.GetSiteByID(h.deps.DB.DB, siteID)
+	if err != nil {
+		return false
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(site.Config), &cfg); err != nil {
+		return false
+	}
+	apiKey, _ := cfg["api_key"].(string)
+	return apiKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(token)) == 1
+}
+
+// reservedParams are query parameters with special meaning that are not column filters.
+var reservedParams = map[string]bool{
+	"limit": true, "offset": true, "sort": true, "order": true,
+}
+
+// apiList handles GET /api/{path} — list rows with pagination and filtering.
+// Column filtering: ?column=value adds WHERE column = value.
+// Sorting: ?sort=column&order=asc|desc (default: id DESC).
+func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable string, ep *apiEndpoint) {
+	limit := 50
+	offset := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if n, err := strconv.Atoi(o); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	cols := h.visibleColumns(ep)
+	if cols == "" {
+		cols = "*"
+	}
+
+	// Build WHERE clause from query parameters (column filters).
+	var whereClauses []string
+	var whereArgs []interface{}
+	for key, vals := range r.URL.Query() {
+		if reservedParams[key] || len(vals) == 0 {
+			continue
+		}
+		if err := security.ValidateColumnName(key); err != nil {
+			continue // silently skip invalid column names
+		}
+		// Don't allow filtering on secure columns.
+		if kind, ok := ep.SecureCols[key]; ok && kind == "hash" {
+			continue
+		}
+		whereClauses = append(whereClauses, key+" = ?")
+		whereArgs = append(whereArgs, vals[0])
+	}
+
+	whereSQL := ""
+	if len(whereClauses) > 0 {
+		whereSQL = " WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	// Sorting.
+	orderSQL := "id DESC"
+	if sortCol := r.URL.Query().Get("sort"); sortCol != "" {
+		if security.ValidateColumnName(sortCol) == nil {
+			dir := "ASC"
+			if strings.EqualFold(r.URL.Query().Get("order"), "desc") {
+				dir = "DESC"
+			}
+			orderSQL = sortCol + " " + dir
+		}
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s LIMIT ? OFFSET ?", cols, physTable, whereSQL, orderSQL)
+	args := append(whereArgs, limit, offset)
+	rows, err := siteDB.Query(query, args...)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "query error")
+		return
+	}
+	defer rows.Close()
+
+	results := h.scanRowsToMaps(rows)
+	stripSecureColumns(results, ep.SecureCols)
+	writePublicJSON(w, http.StatusOK, map[string]interface{}{
+		"data":   results,
+		"count":  len(results),
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// apiGetOne handles GET /api/{path}/{id} — get single row.
+func (h *Handler) apiGetOne(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
+	cols := h.visibleColumns(ep)
+	if cols == "" {
+		cols = "*"
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", cols, physTable)
+	rows, err := siteDB.Query(query, rowID)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "query error")
+		return
+	}
+	defer rows.Close()
+
+	results := h.scanRowsToMaps(rows)
+	if len(results) == 0 {
+		writePublicError(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	stripSecureColumns(results, ep.SecureCols)
+	writePublicJSON(w, http.StatusOK, results[0])
+}
+
+// apiInsert handles POST /api/{path} — insert a row.
+func (h *Handler) apiInsert(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable string, ep *apiEndpoint) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writePublicError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	// Remove id field if provided (auto-generated).
+	delete(body, "id")
+
+	// Process secure columns.
+	for col, kind := range ep.SecureCols {
+		if val, ok := body[col]; ok {
+			processed, err := processPublicSecureValue(kind, val, h.deps.Encryptor)
+			if err != nil {
+				writePublicError(w, http.StatusBadRequest, fmt.Sprintf("error processing %s: %s", col, err))
+				return
+			}
+			body[col] = processed
+		}
+	}
+
+	if len(body) == 0 {
+		writePublicError(w, http.StatusBadRequest, "no data provided")
+		return
+	}
+
+	columns := make([]string, 0, len(body))
+	placeholders := make([]string, 0, len(body))
+	values := make([]interface{}, 0, len(body))
+	for col, val := range body {
+		if err := security.ValidateColumnName(col); err != nil {
+			writePublicError(w, http.StatusBadRequest, "invalid field name: "+col)
+			return
+		}
+		columns = append(columns, col)
+		placeholders = append(placeholders, "?")
+		values = append(values, val)
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", physTable, strings.Join(columns, ", "), strings.Join(placeholders, ", "))
+	result, err := siteDB.Exec(query, values...)
+	if err != nil {
+		slog.Error("public API insert failed", "table", physTable, "error", err)
+		writePublicError(w, http.StatusBadRequest, "insert failed")
+		return
+	}
+
+	id, _ := result.LastInsertId()
+	writePublicJSON(w, http.StatusCreated, map[string]interface{}{
+		"id":      id,
+		"success": true,
+	})
+}
+
+// apiUpdate handles PUT /api/{path}/{id} — update a row.
+func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writePublicError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	delete(body, "id")
+
+	// Process secure columns.
+	for col, kind := range ep.SecureCols {
+		if val, ok := body[col]; ok {
+			processed, err := processPublicSecureValue(kind, val, h.deps.Encryptor)
+			if err != nil {
+				writePublicError(w, http.StatusBadRequest, fmt.Sprintf("error processing %s: %s", col, err))
+				return
+			}
+			body[col] = processed
+		}
+	}
+
+	if len(body) == 0 {
+		writePublicError(w, http.StatusBadRequest, "no data provided")
+		return
+	}
+
+	setClauses := make([]string, 0, len(body))
+	values := make([]interface{}, 0, len(body)+1)
+	for col, val := range body {
+		if err := security.ValidateColumnName(col); err != nil {
+			writePublicError(w, http.StatusBadRequest, "invalid field name: "+col)
+			return
+		}
+		setClauses = append(setClauses, col+" = ?")
+		values = append(values, val)
+	}
+	values = append(values, rowID)
+
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", physTable, strings.Join(setClauses, ", "))
+	result, err := siteDB.Exec(query, values...)
+	if err != nil {
+		slog.Error("public API update failed", "table", physTable, "error", err)
+		writePublicError(w, http.StatusBadRequest, "update failed")
+		return
+	}
+
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		writePublicError(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	writePublicJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// apiDelete handles DELETE /api/{path}/{id} — delete a row.
+func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
+	query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", physTable)
+	result, err := siteDB.Exec(query, rowID)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "delete failed")
+		return
+	}
+
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		writePublicError(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	writePublicJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// visibleColumns returns a SQL column list based on the endpoint's public_columns
+// and secure column configuration. PASSWORD columns are always excluded.
+func (h *Handler) visibleColumns(ep *apiEndpoint) string {
+	if ep.PublicColumns != nil && len(ep.PublicColumns) > 0 {
+		// Filter out any password columns from the explicit public list.
+		var safe []string
+		for _, col := range ep.PublicColumns {
+			if kind, ok := ep.SecureCols[col]; ok && kind == "hash" {
+				continue // never expose password hashes
+			}
+			safe = append(safe, col)
+		}
+		if len(safe) == 0 {
+			return "id"
+		}
+		return strings.Join(safe, ", ")
+	}
+	// No explicit public columns — return * and post-filter secure columns.
+	return "*"
+}
+
+// scanRowsToMaps converts sql.Rows into a slice of maps.
+func (h *Handler) scanRowsToMaps(rows *sql.Rows) []map[string]interface{} {
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil
+	}
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			val := values[i]
+			// Convert []byte to string for JSON serialization.
+			if b, ok := val.([]byte); ok {
+				row[col] = string(b)
+			} else {
+				row[col] = val
+			}
+		}
+		results = append(results, row)
+	}
+
+	return results
+}
+
+// stripSecureColumns removes PASSWORD (hash) and ENCRYPTED columns from API
+// results when no explicit public_columns filter was set on the endpoint.
+func stripSecureColumns(results []map[string]interface{}, secureCols map[string]string) {
+	if len(secureCols) == 0 {
+		return
+	}
+	for _, row := range results {
+		for col, kind := range secureCols {
+			if kind == "hash" {
+				delete(row, col)
+			}
+		}
+	}
+}
+
+// processPublicSecureValue delegates to the shared security.ProcessSecureValue.
+func processPublicSecureValue(kind string, value interface{}, enc *security.Encryptor) (interface{}, error) {
+	return security.ProcessSecureValue(kind, value, enc)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// writePublicJSON writes a JSON response.
+func writePublicJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+// writePublicError writes a JSON error response.
+func writePublicError(w http.ResponseWriter, status int, msg string) {
+	writePublicJSON(w, status, map[string]string{"error": msg})
+}
