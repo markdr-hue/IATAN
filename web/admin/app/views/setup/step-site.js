@@ -26,8 +26,8 @@ export function renderSite(container, setupData, onNext) {
 
   const directionInput = h('textarea', {
     className: 'input',
-    placeholder: 'Describe what you want \u2014 style, features, content, anything...',
-    rows: '4',
+    placeholder: 'Tell me about your site \u2014 what it\u2019s for, how it should look, what features you need...',
+    rows: '5',
     value: setupData.siteDirection || '',
   });
 
@@ -69,7 +69,7 @@ export function renderSite(container, setupData, onNext) {
     h('div', { className: 'setup-card__header' }, [
       h('div', { className: 'setup-card__icon', innerHTML: icon('globe') }),
       h('h2', { className: 'setup-card__title' }, title),
-      h('p', { className: 'setup-card__desc' }, 'Give me a name and a rough idea. You can always refine it later.'),
+      h('p', { className: 'setup-card__desc' }, 'Just a name and a rough idea \u2014 you can always change things later.'),
     ]),
     h('div', { className: 'form-group' }, [
       h('label', {}, ['Site Name', h('span', { className: 'required' }, ' *')]),

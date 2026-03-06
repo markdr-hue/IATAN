@@ -19,7 +19,7 @@ export async function renderProvider(container, setupData, onNext) {
   // Show loading state while fetching providers
   const loading = h('div', { className: 'setup-card__header' }, [
     h('div', { className: 'setup-card__icon', innerHTML: icon('cpu') }),
-    h('h2', { className: 'setup-card__title' }, 'Connect an AI provider'),
+    h('h2', { className: 'setup-card__title' }, 'Choose your AI'),
     h('p', { className: 'setup-card__desc' }, 'Loading providers...'),
     h('div', { style: 'text-align:center;padding:2rem' }, [
       h('span', { className: 'spinner' }),
@@ -79,7 +79,7 @@ function buildForm(container, providers, setupData, onNext) {
     type: 'password',
     placeholder: 'Paste your API key',
   });
-  const apiKeyHint = h('p', { className: 'form-hint' }, 'Encrypted and stored locally. Never shared.');
+  const apiKeyHint = h('p', { className: 'form-hint' }, 'Your key stays on this server. We never share it.');
 
   function updateModels() {
     modelSelect.innerHTML = '';
@@ -173,11 +173,11 @@ function buildForm(container, providers, setupData, onNext) {
   const content = h('div', {}, [
     h('div', { className: 'setup-card__header' }, [
       h('div', { className: 'setup-card__icon', innerHTML: icon('cpu') }),
-      h('h2', { className: 'setup-card__title' }, 'Connect an AI provider'),
-      h('p', { className: 'setup-card__desc' }, 'Choose which AI model powers the brain. You can change this anytime.'),
+      h('h2', { className: 'setup-card__title' }, 'Choose your AI'),
+      h('p', { className: 'setup-card__desc' }, 'Pick the AI that will build your site. Don\u2019t worry \u2014 you can switch anytime.'),
     ]),
     h('div', { className: 'form-group' }, [
-      h('label', {}, 'Provider'),
+      h('label', {}, 'AI Service'),
       providerSelect,
     ]),
     h('div', { className: 'form-group' }, [

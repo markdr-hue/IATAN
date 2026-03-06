@@ -13,7 +13,7 @@ const THEME_KEY = 'iatan_theme';
  * Get the current theme.
  */
 export function get() {
-  return document.documentElement.getAttribute('data-theme') || 'dark';
+  return document.documentElement.getAttribute('data-theme') || 'light';
 }
 
 /**

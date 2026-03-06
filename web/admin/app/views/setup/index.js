@@ -17,7 +17,6 @@ import { renderSite } from './step-site.js';
 import { renderLaunching } from './step-launching.js';
 
 const STEPS = ['welcome', 'account', 'provider', 'site', 'launching'];
-
 /**
  * Render the setup wizard.
  */
@@ -45,14 +44,21 @@ export function renderSetup(container) {
   function renderStep() {
     clear(wrapper);
 
-    // Create progress indicator
-    const progress = h('div', { className: 'setup-progress' },
-      STEPS.map((name, i) =>
-        h('div', {
-          className: `setup-progress__step${i < currentStep ? ' done' : ''}${i === currentStep ? ' active' : ''}`,
-        })
-      )
-    );
+    // Create labeled stepper
+    const stepperItems = [];
+    STEPS.forEach((name, i) => {
+      if (i > 0) {
+        stepperItems.push(h('div', {
+          className: `setup-stepper__line${i <= currentStep ? ' done' : ''}`,
+        }));
+      }
+      const state = i < currentStep ? 'done' : i === currentStep ? 'active' : '';
+      const circleContent = i < currentStep ? '\u2713' : String(i + 1);
+      stepperItems.push(h('div', { className: `setup-stepper__item ${state}` }, [
+        h('div', { className: 'setup-stepper__circle' }, circleContent),
+      ]));
+    });
+    const progress = h('div', { className: 'setup-stepper' }, stepperItems);
 
     const card = h('div', { className: 'setup-card' }, [progress]);
     wrapper.appendChild(card);
