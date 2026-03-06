@@ -6,7 +6,7 @@
 
 ---
 
-## IATAN (I Am The Admin Now)**
+## IATAN (I Am The Admin Now)
 
 IATAN is a self-hosted AI platform that autonomously builds, deploys, and monitors (multiple) websites. One binary. 
 
