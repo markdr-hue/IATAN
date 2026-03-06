@@ -114,7 +114,7 @@ func (t *ProvidersTool) executeAdd(ctx *ToolContext, args map[string]interface{}
 	}}, nil
 }
 
-func (t *ProvidersTool) executeList(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *ProvidersTool) executeList(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		`SELECT id, name, base_url, auth_type, secret_name, description, api_docs, is_enabled, created_at
 		 FROM service_providers ORDER BY name`,

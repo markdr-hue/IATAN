@@ -53,7 +53,7 @@ func (t *DiagnosticsTool) Execute(ctx *ToolContext, args map[string]interface{})
 	}
 }
 
-func (t *DiagnosticsTool) executeHealth(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *DiagnosticsTool) executeHealth(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
@@ -137,7 +137,7 @@ func (t *DiagnosticsTool) executeErrors(ctx *ToolContext, args map[string]interf
 	return &Result{Success: true, Data: errors}, nil
 }
 
-func (t *DiagnosticsTool) executeIntegrity(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *DiagnosticsTool) executeIntegrity(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	var issues []string
 
 	// 1. Check layout exists
