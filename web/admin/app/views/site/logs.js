@@ -11,6 +11,7 @@ import { h, clear } from '../../core/dom.js';
 import { get } from '../../core/http.js';
 import { icon } from '../../ui/icon.js';
 import * as toast from '../../ui/toast.js';
+import * as state from '../../core/state.js';
 import { emptyState } from '../../ui/helpers.js';
 
 export async function renderSiteLogs(container, siteId) {
@@ -439,7 +440,20 @@ export async function renderSiteLogs(container, siteId) {
     return n.toLocaleString();
   }
 
+  // --- Real-time SSE watchers ---
+  let statsTimer = null;
+  const unwatchTool = state.watch('toolExecuted', (evt) => {
+    if (!evt || evt.site_id !== siteId) return;
+    if (statsTimer) clearTimeout(statsTimer);
+    statsTimer = setTimeout(() => loadStats(), 3000);
+  });
+
   // --- Initialize ---
   loadStats();
   loadLogs();
+
+  return function cleanup() {
+    unwatchTool();
+    if (statsTimer) clearTimeout(statsTimer);
+  };
 }

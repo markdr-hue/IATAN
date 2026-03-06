@@ -98,13 +98,6 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 		}
 	}()
 
-	// Short delay before starting.
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(3 * time.Second):
-	}
-
 	// Load site mode to determine initial behavior.
 	site, err := models.GetSiteByID(w.deps.DB, w.siteID)
 	if err != nil {
@@ -333,14 +326,16 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 		}
 
 	case CommandChat:
-		// User sent a chat message — reset idle counter so the next
-		// monitoring tick fires at the base interval (5min) instead of
-		// the backed-off interval. No immediate goroutine to avoid
-		// concurrent tick races and rebuild loops.
 		if w.State() == StateMonitoring {
 			w.mu.Lock()
 			w.idleTickCount = 0
 			w.mu.Unlock()
+
+			// If the command carries a user message, run a chat-wake with
+			// write tools so the brain can fix things the owner reports.
+			if msg, ok := cmd.Payload["message"].(string); ok && msg != "" {
+				go w.handleChatWake(ctx, msg)
+			}
 		}
 
 	case CommandShutdown:
@@ -386,11 +381,12 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 		for attempt := 0; attempt < 2; attempt++ {
 			llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
 			resp, callErr = loggedProvider.Complete(llmCtx, llm.CompletionRequest{
-				Model:     modelID,
-				System:    systemPrompt,
-				Messages:  messages,
-				Tools:     toolDefs,
-				MaxTokens: maxTokens,
+				Model:       modelID,
+				System:      systemPrompt,
+				Messages:    messages,
+				Tools:       toolDefs,
+				MaxTokens:   maxTokens,
+				CacheSystem: true,
 			})
 			llmCancel()
 			if callErr == nil {
@@ -584,6 +580,39 @@ func (w *PipelineWorker) executeScheduledTask(ctx context.Context, prompt string
 	w.finalizeTaskRun(runID, taskID, true, "")
 }
 
+// handleChatWake runs a targeted LLM call with write tools in response to
+// a user chat message during monitoring. This lets the brain fix issues
+// the owner reports without restarting the full pipeline.
+func (w *PipelineWorker) handleChatWake(ctx context.Context, userMessage string) {
+	start := time.Now()
+
+	// Acquire semaphore to prevent concurrent execution with monitoring ticks.
+	select {
+	case w.semaphore <- struct{}{}:
+		defer func() { <-w.semaphore }()
+	case <-ctx.Done():
+		return
+	}
+
+	provider, modelID, err := w.getProvider()
+	if err != nil {
+		w.logger.Error("chat-wake: provider error", "error", err)
+		return
+	}
+
+	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+	prompt := buildChatWakePrompt(site, w.siteDB.DB)
+	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
+	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(chatWakeTools))
+
+	_, lastModel, totalTokens, _, iterErr := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 10, 8192)
+	if iterErr != nil {
+		w.logger.Error("chat-wake: tool loop error", "error", iterErr)
+	}
+
+	w.logBrainEvent("chat_wake", "Responded to owner chat message", userMessage, totalTokens, lastModel, time.Since(start).Milliseconds())
+}
+
 // --- Provider resolution ---
 
 func (w *PipelineWorker) getProvider() (llm.Provider, string, error) {
@@ -660,7 +689,7 @@ func (w *PipelineWorker) saveChatMessage(msg llm.Message) {
 func (w *PipelineWorker) saveChatMessageOnce(msg llm.Message) {
 	if msg.Role == llm.RoleUser {
 		var exists int
-		w.siteDB.QueryRow(
+		w.siteDB.Writer().QueryRow(
 			"SELECT COUNT(*) FROM chat_messages WHERE session_id = 'brain' AND role = 'user' AND content = ? AND created_at > datetime('now', '-30 minutes')",
 			msg.Content,
 		).Scan(&exists)
@@ -739,12 +768,10 @@ func truncate(s string, maxLen int) string {
 }
 
 func truncateToolResult(toolName string, result string) string {
-	switch toolName {
-	case "manage_data", "make_http_request":
-		return truncate(result, 4000)
-	default:
-		return result
-	}
+	// Cap all tool results at 4KB to prevent context bloat.
+	// The LLM rarely needs more than a confirmation after writes,
+	// and reads are summarized in summarizeToolResult for DB storage.
+	return truncate(result, 4000)
 }
 
 func summarizeToolResult(toolName string, result string) string {

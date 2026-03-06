@@ -35,6 +35,7 @@ type CompletionRequest struct {
 	Temperature *float64  `json:"temperature,omitempty"`
 	TopP        *float64  `json:"top_p,omitempty"`
 	StopWords   []string  `json:"stop,omitempty"`
+	CacheSystem bool      `json:"-"` // Anthropic prompt caching: cache system prompt + tools
 }
 
 // CompletionResponse is the output from a completion call.

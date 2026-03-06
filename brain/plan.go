@@ -52,7 +52,7 @@ type PagePlan struct {
 	Sections   []string `json:"sections"`
 	LinksTo    []string `json:"links_to,omitempty"`
 	NeedsData  bool     `json:"needs_data"`
-	DataTable  string   `json:"data_table,omitempty"`
+	DataTables []string `json:"data_tables,omitempty"`
 	PageAssets []string `json:"page_assets,omitempty"`
 }
 

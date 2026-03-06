@@ -105,6 +105,9 @@ func (c *Client) Complete(ctx context.Context, req llm.CompletionRequest) (*llm.
 		return nil, fmt.Errorf("anthropic: create request: %w", err)
 	}
 	c.setHeaders(httpReq)
+	if req.CacheSystem {
+		httpReq.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -138,6 +141,9 @@ func (c *Client) Stream(ctx context.Context, req llm.CompletionRequest, callback
 		return fmt.Errorf("anthropic: create request: %w", err)
 	}
 	c.setHeaders(httpReq)
+	if req.CacheSystem {
+		httpReq.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -165,9 +171,20 @@ func (c *Client) buildRequestBody(req llm.CompletionRequest, stream bool) map[st
 		"model": req.Model,
 	}
 
-	// Anthropic uses a separate "system" field, not a system message in the array
+	// Anthropic uses a separate "system" field, not a system message in the array.
+	// When caching is enabled, format as content blocks with cache_control.
 	if req.System != "" {
-		body["system"] = req.System
+		if req.CacheSystem {
+			body["system"] = []map[string]interface{}{
+				{
+					"type":          "text",
+					"text":          req.System,
+					"cache_control": map[string]string{"type": "ephemeral"},
+				},
+			}
+		} else {
+			body["system"] = req.System
+		}
 	}
 
 	// Convert messages (skip system role since we handle it above)
@@ -264,6 +281,10 @@ func (c *Client) buildRequestBody(req llm.CompletionRequest, stream bool) map[st
 				}
 				tools = append(tools, tool)
 			}
+		}
+		// Add cache_control to the last tool so the entire tool set is cached.
+		if req.CacheSystem && len(tools) > 0 {
+			tools[len(tools)-1]["cache_control"] = map[string]string{"type": "ephemeral"}
 		}
 		body["tools"] = tools
 	}

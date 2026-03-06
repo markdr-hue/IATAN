@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/markdr-hue/IATAN/db/models"
@@ -54,6 +55,20 @@ var (
 		"manage_analytics",
 		"manage_communication",
 		"manage_memory",
+	}
+
+	// chatWakeTools gives the brain write access when the owner sends a
+	// chat message during monitoring. Includes page/file/layout/data tools
+	// for targeted fixes, but excludes schema/endpoint tools to prevent
+	// accidental rebuild loops.
+	chatWakeTools = []string{
+		"manage_pages",
+		"manage_files",
+		"manage_layout",
+		"manage_data",
+		"manage_diagnostics",
+		"manage_memory",
+		"manage_communication",
 	}
 )
 
@@ -205,7 +220,7 @@ func (w *PipelineWorker) runDesign(ctx context.Context) (PipelineStage, error) {
 	}
 
 	// Validate design output.
-	issues := validateDesign(w.siteDB.DB, plan)
+	issues := validateDesign(w.siteDB.Writer(), plan)
 	if len(issues) > 0 {
 		w.logger.Warn("design validation failed", "issues", issues)
 		LogStageError(w.siteDB, logID, strings.Join(issues, "; "))
@@ -257,12 +272,36 @@ func (w *PipelineWorker) runDataLayer(ctx context.Context) (PipelineStage, error
 		return StageDataLayer, err
 	}
 
-	// Validate data layer.
-	issues := validateDataLayer(w.siteDB.DB, plan)
-	if len(issues) > 0 {
-		w.logger.Warn("data layer validation failed", "issues", issues)
-		LogStageError(w.siteDB, logID, strings.Join(issues, "; "))
-		return StageDataLayer, fmt.Errorf("data layer validation: %s", strings.Join(issues, "; "))
+	// Validate and fix-up loop: if items are missing, give the LLM a
+	// targeted message to fix just those items instead of retrying the
+	// entire stage from scratch.
+	for fixAttempt := 0; fixAttempt < 3; fixAttempt++ {
+		issues := validateDataLayer(w.siteDB.Writer(), plan)
+		if len(issues) == 0 {
+			break
+		}
+		if fixAttempt == 2 {
+			LogStageError(w.siteDB, logID, strings.Join(issues, "; "))
+			return StageDataLayer, fmt.Errorf("data layer validation: %s", strings.Join(issues, "; "))
+		}
+		w.logger.Warn("data layer fix-up needed", "attempt", fixAttempt+1, "issues", issues)
+
+		var fixMsg strings.Builder
+		fixMsg.WriteString("The data layer is ALMOST complete but these items are still missing:\n\n")
+		for _, issue := range issues {
+			fixMsg.WriteString("- " + issue + "\n")
+		}
+		fixMsg.WriteString("\nFix ONLY the missing items listed above. Do NOT recreate tables or endpoints that already exist.\n")
+		fixMsg.WriteString("For missing auth endpoints, use manage_endpoints(action=\"create_auth\") with the appropriate username_column and password_column.\n")
+		fixMessages := []llm.Message{{Role: llm.RoleUser, Content: fixMsg.String()}}
+
+		_, _, fixTokens, fixCalls, fixErr := w.runToolLoop(ctx, provider, modelID, prompt, fixMessages, toolDefs, 5, 4096)
+		totalTokens += fixTokens
+		toolCalls += fixCalls
+		if fixErr != nil {
+			LogStageError(w.siteDB, logID, fixErr.Error())
+			return StageDataLayer, fixErr
+		}
 	}
 
 	w.publishBrainMessage("Data layer created successfully.")
@@ -278,76 +317,78 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		return StageBuildPages, err
 	}
 
-	// Load current page index for resume support.
-	state, err := LoadPipelineState(w.siteDB.DB)
-	if err != nil {
-		return StageBuildPages, err
-	}
-	startIdx := state.CurrentPageIndex
-
 	// Collect all page paths for link context.
 	allPaths := make([]string, len(plan.Pages))
 	for i, p := range plan.Pages {
 		allPaths[i] = p.Path
 	}
 
-	// Get layout summary for page context.
+	// Pre-load shared read-only context ONCE (avoids redundant disk I/O).
 	layoutSummary := w.getLayoutSummary()
+	cssContent := w.getGlobalCSS()
 
-	var previousWarnings []string
+	// Build pages concurrently with a worker pool.
+	const maxParallel = 3
+	sem := make(chan struct{}, maxParallel)
+	var mu sync.Mutex
+	var firstErr error
+	var wg sync.WaitGroup
 
-	for i := startIdx; i < len(plan.Pages); i++ {
+	for _, page := range plan.Pages {
 		if ctx.Err() != nil {
-			return StageBuildPages, ctx.Err()
+			break
+		}
+		mu.Lock()
+		hasErr := firstErr != nil
+		mu.Unlock()
+		if hasErr {
+			break
 		}
 
-		page := plan.Pages[i]
-
-		// Update current page index for crash recovery.
-		w.siteDB.ExecWrite("UPDATE pipeline_state SET current_page_index = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1", i)
-
-		// Check if page already exists (crash recovery).
+		// Skip already-built pages (crash recovery).
+		// Use writer pool for WAL visibility (pages written by parallel workers).
 		var exists int
-		w.siteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
+		w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
 		if exists > 0 {
 			w.logger.Info("page already exists, skipping", "path", page.Path)
 			continue
 		}
 
-		err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, previousWarnings)
-		if err != nil {
-			w.logger.Error("page build failed", "path", page.Path, "error", err)
-			// If page was created despite the error, continue to next page.
-			var created int
-			w.siteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&created)
-			if created > 0 {
-				w.logger.Info("page was created despite error, continuing", "path", page.Path)
-			} else {
-				// Let stage-level retry handle it (resumes from current_page_index).
-				return StageBuildPages, err
-			}
-		}
+		sem <- struct{}{} // acquire slot
+		wg.Add(1)
+		go func(page PagePlan) {
+			defer wg.Done()
+			defer func() { <-sem }() // release slot
 
-		// Validate the page we just built.
-		var content string
-		w.siteDB.QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&content)
-		if content != "" {
-			warnings := validatePageHTML(content, w.siteDB.DB)
-			if len(warnings) > 0 {
-				previousWarnings = warnings
-			} else {
-				previousWarnings = nil
+			err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssContent)
+			if err != nil {
+				w.logger.Error("page build failed", "path", page.Path, "error", err)
+				// If page was created despite the error, don't propagate.
+				var created int
+				w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&created)
+				if created == 0 {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
 			}
-		}
+			w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
+		}(page)
+	}
+	wg.Wait()
 
-		w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
+	if firstErr != nil {
+		return StageBuildPages, firstErr
 	}
 
 	// Missing pages (if any) are caught by the REVIEW stage.
 	return StageReview, nil
 }
 
-func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary string, previousWarnings []string) error {
+func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssContent string) error {
 	start := time.Now()
 	logID, _ := LogStageStart(w.siteDB, StageBuildPages)
 
@@ -357,24 +398,31 @@ func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, pa
 		return err
 	}
 
-	// Load table schema if page needs data.
+	// Load table schemas if page needs data (supports multiple tables per page).
+	// Use writer pool for WAL visibility (tables/endpoints written in DATA_LAYER).
 	var tableSchema string
-	if page.NeedsData && page.DataTable != "" {
-		var schemaDef sql.NullString
-		w.siteDB.QueryRow("SELECT schema_def FROM dynamic_tables WHERE table_name = ?", page.DataTable).Scan(&schemaDef)
-		if schemaDef.Valid {
-			tableSchema = schemaDef.String
+	if page.NeedsData && len(page.DataTables) > 0 {
+		var parts []string
+		for _, tableName := range page.DataTables {
+			var entry strings.Builder
+			var schemaDef sql.NullString
+			w.siteDB.Writer().QueryRow("SELECT schema_def FROM dynamic_tables WHERE table_name = ?", tableName).Scan(&schemaDef)
+			if schemaDef.Valid {
+				entry.WriteString(schemaDef.String)
+			} else {
+				entry.WriteString(fmt.Sprintf("Table: %s", tableName))
+			}
+			var apiPath sql.NullString
+			w.siteDB.Writer().QueryRow("SELECT path FROM api_endpoints WHERE table_name = ?", tableName).Scan(&apiPath)
+			if apiPath.Valid {
+				entry.WriteString(fmt.Sprintf("\nAPI endpoint: /api/%s", apiPath.String))
+			}
+			parts = append(parts, entry.String())
 		}
-		// Also find the API endpoint path.
-		var apiPath sql.NullString
-		w.siteDB.QueryRow("SELECT path FROM api_endpoints WHERE table_name = ?", page.DataTable).Scan(&apiPath)
-		if apiPath.Valid {
-			tableSchema += fmt.Sprintf("\nAPI endpoint: %s", apiPath.String)
-		}
+		tableSchema = strings.Join(parts, "\n\n")
 	}
 
-	cssContent := w.getGlobalCSS()
-	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssContent, tableSchema, previousWarnings)
+	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssContent, tableSchema, nil)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: fmt.Sprintf("Build the page: %s (%s)", page.Title, page.Path)}}
 	w.saveChatMessageOnce(messages[0])
 
@@ -388,7 +436,7 @@ func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, pa
 
 	// Verify the page was actually saved by the LLM.
 	var saved int
-	w.siteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&saved)
+	w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&saved)
 	if saved == 0 {
 		errMsg := fmt.Sprintf("page %s was not saved by LLM after tool loop", page.Path)
 		LogStageError(w.siteDB, logID, errMsg)
@@ -413,14 +461,16 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			allPaths[i] = p.Path
 		}
 		layoutSummary := w.getLayoutSummary()
+		cssContent := w.getGlobalCSS()
 
 		for _, page := range plan.Pages {
 			var exists int
-			w.siteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
+			// Use writer pool so we see pages created during BUILD_PAGES (WAL visibility).
+			w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
 			if exists == 0 {
 				w.logger.Warn("review: rebuilding missing planned page", "path", page.Path)
 				w.publishBrainMessage(fmt.Sprintf("Rebuilding missing page: %s", page.Path))
-				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, nil); err != nil {
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssContent); err != nil {
 					w.logger.Error("review: failed to rebuild page", "path", page.Path, "error", err)
 				}
 			}
@@ -428,7 +478,8 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 	}
 
 	// Run Go-based validation (zero tokens).
-	issues := validateSite(w.siteDB.DB)
+	// Use writer pool so we see all tool writes (read pool may lag in WAL mode).
+	issues := validateSite(w.siteDB.Writer())
 	totalTokens := 0
 
 	if len(issues) > 0 {
@@ -449,7 +500,7 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 		}
 
 		// Re-validate after fixes.
-		remainingIssues := validateSite(w.siteDB.DB)
+		remainingIssues := validateSite(w.siteDB.Writer())
 		if len(remainingIssues) > 0 {
 			w.publishBrainMessage(fmt.Sprintf("Review: %d issues remain after fixes: %s", len(remainingIssues), strings.Join(remainingIssues, "; ")))
 		}
@@ -583,11 +634,11 @@ func (w *PipelineWorker) monitoringTick(ctx context.Context) {
 	}
 
 	// Run Go-based health check first.
-	issues := validateSite(w.siteDB.DB)
+	issues := validateSite(w.siteDB.Writer())
 
 	// Check for recent errors.
 	var recentErrors int
-	w.siteDB.QueryRow("SELECT COUNT(*) FROM brain_log WHERE event_type = 'error' AND created_at > datetime('now', '-1 hour')").Scan(&recentErrors)
+	w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM brain_log WHERE event_type = 'error' AND created_at > datetime('now', '-1 hour')").Scan(&recentErrors)
 
 	// If no issues and no errors, this is an idle tick.
 	if len(issues) == 0 && recentErrors == 0 {
@@ -656,7 +707,7 @@ func (w *PipelineWorker) ownerName() string {
 
 func (w *PipelineWorker) getLayoutSummary() string {
 	var before, after sql.NullString
-	w.siteDB.QueryRow("SELECT body_before_main, body_after_main FROM layouts WHERE name = 'default'").Scan(&before, &after)
+	w.siteDB.Writer().QueryRow("SELECT body_before_main, body_after_main FROM layouts WHERE name = 'default'").Scan(&before, &after)
 	if !before.Valid && !after.Valid {
 		return "No layout created yet."
 	}
@@ -678,7 +729,7 @@ func (w *PipelineWorker) getLayoutSummary() string {
 // getGlobalCSS reads the global CSS file content from disk.
 func (w *PipelineWorker) getGlobalCSS() string {
 	var storagePath sql.NullString
-	w.siteDB.QueryRow(
+	w.siteDB.Writer().QueryRow(
 		"SELECT storage_path FROM assets WHERE scope = 'global' AND filename LIKE '%.css' ORDER BY filename LIMIT 1",
 	).Scan(&storagePath)
 	if !storagePath.Valid || storagePath.String == "" {
@@ -767,7 +818,10 @@ func validateDataLayer(db *sql.DB, plan *SitePlan) []string {
 				issues = append(issues, fmt.Sprintf("API endpoint for table %q not created", t.Name))
 			}
 		}
-		if t.HasAuth {
+		// Auth endpoints only make sense for tables that have a PASSWORD column.
+		// Tables with HasAuth but no PASSWORD column just need requires_auth on
+		// their API endpoint, which doesn't create an auth_endpoints row.
+		if t.HasAuth && tableHasPasswordColumn(t) {
 			var authExists int
 			db.QueryRow("SELECT COUNT(*) FROM auth_endpoints WHERE table_name = ?", t.Name).Scan(&authExists)
 			if authExists == 0 {
@@ -777,4 +831,14 @@ func validateDataLayer(db *sql.DB, plan *SitePlan) []string {
 	}
 
 	return issues
+}
+
+// tableHasPasswordColumn checks if a table plan defines a PASSWORD column.
+func tableHasPasswordColumn(t TablePlan) bool {
+	for _, col := range t.Columns {
+		if strings.EqualFold(col.Type, "PASSWORD") {
+			return true
+		}
+	}
+	return false
 }

@@ -147,10 +147,16 @@ func main() {
 	})
 
 	// Wake the brain when the user sends a chat message so it can
-	// validate any changes the chat may have made.
+	// validate any changes the chat may have made, or fix things during monitoring.
 	bus.Subscribe(events.EventChatMessage, func(e events.Event) {
+		role, _ := e.Payload["role"].(string)
+		if role != "user" {
+			return
+		}
+		content, _ := e.Payload["content"].(string)
 		_ = brainMgr.SendCommand(e.SiteID, brain.BrainCommand{
-			Type: brain.CommandChat,
+			Type:    brain.CommandChat,
+			Payload: map[string]interface{}{"message": content},
 		})
 	})
 

@@ -39,18 +39,27 @@ export function renderSiteHome(container, siteId) {
   let brainStatusEl = null;
   let brainStatusDot = null;
   let brainModeEl = null;
+  let tokensValueEl = null;
+  let tokensSubEl = null;
+  let visitorsValueEl = null;
+  let visitorsSubEl = null;
+
+  // Debounced summary refresh (tokens, pages, visitors)
+  let summaryTimer = null;
+  function debouncedRefreshSummary() {
+    if (summaryTimer) clearTimeout(summaryTimer);
+    summaryTimer = setTimeout(() => refreshSummary(siteId), 3000);
+  }
 
   // Load initial stats
   loadStats(statsBar, siteId);
 
   // --- Real-time SSE watchers ---
 
-  // Pages refresh when modified
+  // Any tool execution → debounced summary refresh (tokens, pages, visitors)
   unwatchers.push(state.watch('toolExecuted', (evt) => {
-    if (!evt || evt.site_id !== siteId || !evt.success) return;
-    if (['save_page', 'delete_page'].includes(evt.tool)) {
-      refreshPages(siteId);
-    }
+    if (!evt || evt.site_id !== siteId) return;
+    debouncedRefreshSummary();
   }));
 
   // Brain status updates
@@ -99,6 +108,8 @@ export function renderSiteHome(container, siteId) {
         `${summary.brain_actions} brain actions`,
         'zap',
       );
+      tokensValueEl = tokensCard.valueEl;
+      tokensSubEl = tokensCard.subEl;
       grid.appendChild(tokensCard.el);
 
       // 3. Pages
@@ -113,6 +124,8 @@ export function renderSiteHome(container, siteId) {
         `${summary.page_views} page views`,
         'activity',
       );
+      visitorsValueEl = viewsCard.valueEl;
+      visitorsSubEl = viewsCard.subEl;
       grid.appendChild(viewsCard.el);
 
       bar.appendChild(grid);
@@ -153,8 +166,20 @@ export function renderSiteHome(container, siteId) {
     } catch { /* ignore */ }
   }
 
+  async function refreshSummary(sid) {
+    try {
+      const s = await get(`/admin/api/sites/${sid}/summary`);
+      if (tokensValueEl) tokensValueEl.textContent = s.total_tokens.toLocaleString();
+      if (tokensSubEl) tokensSubEl.textContent = `${s.brain_actions} brain actions`;
+      if (pagesValueEl) pagesValueEl.textContent = String(s.pages_count);
+      if (visitorsValueEl) visitorsValueEl.textContent = String(s.unique_visitors);
+      if (visitorsSubEl) visitorsSubEl.textContent = `${s.page_views} page views`;
+    } catch { /* ignore */ }
+  }
+
   return function cleanup() {
     if (chatCleanup) chatCleanup();
+    if (summaryTimer) clearTimeout(summaryTimer);
     for (const unwatch of unwatchers) unwatch();
   };
 }

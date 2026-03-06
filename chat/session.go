@@ -74,6 +74,15 @@ func (s *Session) Send(ctx context.Context, message string, onChunk llm.StreamCa
 		return fmt.Errorf("chat: save user message: %w", err)
 	}
 
+	// Publish user message event so the brain can react (e.g. chat-wake).
+	if s.deps.Bus != nil {
+		s.deps.Bus.Publish(events.NewEvent(events.EventChatMessage, s.SiteID, map[string]interface{}{
+			"session_id": s.ID,
+			"role":       "user",
+			"content":    message,
+		}))
+	}
+
 	// 2. Load recent chat history.
 	history, err := LoadHistory(s.siteDB, s.ID, historyLimit)
 	if err != nil {

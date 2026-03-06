@@ -543,7 +543,7 @@ type DataTool struct{}
 
 func (t *DataTool) Name() string { return "manage_data" }
 func (t *DataTool) Description() string {
-	return "Manage dynamic table data. Actions: query (select rows), insert, update (by id), delete (by id), count. PASSWORD columns are auto-hashed, ENCRYPTED columns are auto-encrypted."
+	return "Manage dynamic table data. Actions: query (select rows), insert (single row via 'data' or bulk via 'rows' array), update (by id), delete (by id), count. PASSWORD columns are auto-hashed, ENCRYPTED columns are auto-encrypted."
 }
 func (t *DataTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -581,7 +581,12 @@ func (t *DataTool) Parameters() map[string]interface{} {
 			"limit": map[string]interface{}{"type": "number", "description": "Maximum number of rows for query"},
 			"data": map[string]interface{}{
 				"type":        "object",
-				"description": "Key-value pairs for insert/update",
+				"description": "Key-value pairs for single-row insert/update",
+			},
+			"rows": map[string]interface{}{
+				"type":        "array",
+				"description": "Array of row objects for bulk insert [{col: val}, ...]. Use instead of 'data' to insert multiple rows in one call.",
+				"items":       map[string]interface{}{"type": "object"},
 			},
 			"id": map[string]interface{}{"type": "number", "description": "Row ID for update/delete"},
 		},
@@ -661,6 +666,8 @@ func (t *DataTool) query(ctx *ToolContext, args map[string]interface{}) (*Result
 
 	if limit, ok := args["limit"].(float64); ok && limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", int(limit))
+	} else {
+		query += " LIMIT 50" // default cap to prevent unbounded results
 	}
 
 	rows, err := ctx.DB.Query(query, queryParams...)
@@ -700,9 +707,8 @@ func (t *DataTool) query(ctx *ToolContext, args map[string]interface{}) (*Result
 
 func (t *DataTool) insert(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
 	tableName, _ := args["table_name"].(string)
-	data, _ := args["data"].(map[string]interface{})
-	if tableName == "" || len(data) == 0 {
-		return &Result{Success: false, Error: "table_name and data are required"}, nil
+	if tableName == "" {
+		return &Result{Success: false, Error: "table_name is required"}, nil
 	}
 
 	physicalName, err := sanitizedTableName(tableName)
@@ -710,9 +716,24 @@ func (t *DataTool) insert(ctx *ToolContext, args map[string]interface{}) (*Resul
 		return &Result{Success: false, Error: err.Error()}, nil
 	}
 
-	// Load secure columns to handle hashing/encryption.
+	// Load secure columns once for all rows.
 	secureCols, _ := loadSecureColumns(ctx, tableName)
 
+	// Bulk insert via "rows" parameter.
+	if rowsRaw, ok := args["rows"].([]interface{}); ok && len(rowsRaw) > 0 {
+		return t.insertBulk(ctx, physicalName, tableName, rowsRaw, secureCols)
+	}
+
+	// Single row via "data" parameter.
+	data, _ := args["data"].(map[string]interface{})
+	if len(data) == 0 {
+		return &Result{Success: false, Error: "data or rows parameter is required for insert"}, nil
+	}
+
+	return t.insertSingle(ctx, physicalName, tableName, data, secureCols)
+}
+
+func (t *DataTool) insertSingle(ctx *ToolContext, physicalName, tableName string, data map[string]interface{}, secureCols map[string]string) (*Result, error) {
 	var colNames []string
 	var placeholders []string
 	var values []interface{}
@@ -724,7 +745,6 @@ func (t *DataTool) insert(ctx *ToolContext, args map[string]interface{}) (*Resul
 		colNames = append(colNames, col)
 		placeholders = append(placeholders, "?")
 
-		// Process secure columns.
 		if secureCols != nil {
 			if kind, isSecure := secureCols[col]; isSecure {
 				processed, err := processSecureValue(kind, val, ctx.Encryptor)
@@ -734,7 +754,6 @@ func (t *DataTool) insert(ctx *ToolContext, args map[string]interface{}) (*Resul
 				val = processed
 			}
 		}
-
 		values = append(values, val)
 	}
 
@@ -750,6 +769,72 @@ func (t *DataTool) insert(ctx *ToolContext, args map[string]interface{}) (*Resul
 	return &Result{Success: true, Data: map[string]interface{}{
 		"id":    id,
 		"table": tableName,
+	}}, nil
+}
+
+func (t *DataTool) insertBulk(ctx *ToolContext, physicalName, tableName string, rowsRaw []interface{}, secureCols map[string]string) (*Result, error) {
+	if len(rowsRaw) > 100 {
+		return &Result{Success: false, Error: "maximum 100 rows per bulk insert"}, nil
+	}
+
+	tx, err := ctx.DB.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("starting transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var insertedIDs []int64
+
+	for i, rowRaw := range rowsRaw {
+		row, ok := rowRaw.(map[string]interface{})
+		if !ok {
+			return &Result{Success: false, Error: fmt.Sprintf("row %d is not a valid object", i)}, nil
+		}
+
+		var colNames []string
+		var placeholders []string
+		var values []interface{}
+
+		for col, val := range row {
+			if !validColumnName.MatchString(col) {
+				return &Result{Success: false, Error: fmt.Sprintf("invalid column name in row %d: %s", i, col)}, nil
+			}
+			colNames = append(colNames, col)
+			placeholders = append(placeholders, "?")
+
+			if secureCols != nil {
+				if kind, isSecure := secureCols[col]; isSecure {
+					processed, err := processSecureValue(kind, val, ctx.Encryptor)
+					if err != nil {
+						return nil, fmt.Errorf("processing secure column %s in row %d: %w", col, i, err)
+					}
+					val = processed
+				}
+			}
+			values = append(values, val)
+		}
+
+		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+			physicalName, strings.Join(colNames, ", "), strings.Join(placeholders, ", "))
+
+		res, err := tx.Exec(query, values...)
+		if err != nil {
+			return nil, fmt.Errorf("inserting row %d: %w", i, err)
+		}
+
+		id, _ := res.LastInsertId()
+		insertedIDs = append(insertedIDs, id)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing bulk insert: %w", err)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"table":    tableName,
+		"inserted": len(insertedIDs),
+		"first_id": insertedIDs[0],
+		"last_id":  insertedIDs[len(insertedIDs)-1],
 	}}, nil
 }
 

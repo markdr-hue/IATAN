@@ -63,7 +63,7 @@ Create a complete site plan as a JSON object with this exact structure:
       "sections": ["hero", "features", "cta"],
       "links_to": ["/about", "/services"],
       "needs_data": false,
-      "data_table": "",
+      "data_tables": [],
       "page_assets": []
     }
   ],
@@ -99,6 +99,7 @@ Create a complete site plan as a JSON object with this exact structure:
 9. If the site needs dynamic data (products, blog posts, user accounts), set "needs_data_layer": true and define tables
 10. For data_tables, each column is {"name": "col_name", "type": "TYPE"}. Types: TEXT, INTEGER, REAL, BOOLEAN, PASSWORD, ENCRYPTED. Optional: "primary": true, "required": true
 11. Set "data_tables": [] and "needs_data_layer": false if the site doesn't need dynamic data
+12. Each page's "data_tables" is an array of table names the page needs (e.g. ["articles", "comments"]). A page can use multiple tables.
 
 ## Vague Descriptions
 
@@ -194,6 +195,9 @@ func buildDataLayerPrompt(plan *SitePlan) string {
 
 	b.WriteString("You are IATAN, an AI that creates database schemas and API endpoints. Use the tools to create all tables and endpoints.\n\n")
 
+	var authProviderTables []string // tables with PASSWORD column → need create_auth
+	var authProtectedTables []string // tables without PASSWORD column but HasAuth → need requires_auth on API
+
 	b.WriteString("## Data Tables to Create\n\n")
 	for _, t := range plan.DataTables {
 		colJSON, _ := json.Marshal(t.Columns)
@@ -203,10 +207,23 @@ func buildDataLayerPrompt(plan *SitePlan) string {
 			b.WriteString("Needs API endpoint: yes\n")
 		}
 		if t.HasAuth {
-			b.WriteString("Needs auth endpoint: yes\n")
+			hasPasswordCol := false
+			for _, col := range t.Columns {
+				if strings.EqualFold(col.Type, "PASSWORD") {
+					hasPasswordCol = true
+					break
+				}
+			}
+			if hasPasswordCol {
+				b.WriteString("**Needs auth endpoint (create_auth): YES** — this table has a PASSWORD column\n")
+				authProviderTables = append(authProviderTables, t.Name)
+			} else {
+				b.WriteString("Needs auth protection: yes — set requires_auth=true on its API endpoint\n")
+				authProtectedTables = append(authProtectedTables, t.Name)
+			}
 		}
 		if t.SeedData {
-			b.WriteString("Needs seed data: yes (create 3-5 sample rows)\n")
+			b.WriteString("Needs seed data: yes (use bulk insert with rows parameter)\n")
 		}
 		b.WriteString("\n")
 	}
@@ -219,12 +236,26 @@ func buildDataLayerPrompt(plan *SitePlan) string {
 
 2. Create API endpoints using manage_endpoints(action="create_api")
    - Set public_columns to exclude sensitive fields
-   - Set requires_auth if the table needs authentication
+   - For auth-protected tables, set requires_auth=true
 
-3. Create auth endpoints using manage_endpoints(action="create_auth") for tables with has_auth
-   - Requires a username_column and password_column
+3. Create auth endpoints using manage_endpoints(action="create_auth") ONLY for tables that have a PASSWORD column
+   - Requires a username_column and password_column from the SAME table
+   - Do NOT create auth endpoints for tables without a PASSWORD column
 
-4. Seed data using manage_data(action="insert") if seed_data is true
+`)
+
+	if len(authProviderTables) > 0 {
+		b.WriteString(fmt.Sprintf("**CRITICAL: Create auth endpoints for: %s** (these have PASSWORD columns)\n", strings.Join(authProviderTables, ", ")))
+		b.WriteString("Use manage_endpoints(action=\"create_auth\", table_name=\"...\", username_column=\"...\", password_column=\"password\")\n\n")
+	}
+
+	if len(authProtectedTables) > 0 {
+		b.WriteString(fmt.Sprintf("**Auth-protected tables: %s** — set requires_auth=true on their API endpoints (do NOT use create_auth for these)\n\n", strings.Join(authProtectedTables, ", ")))
+	}
+
+	b.WriteString(`4. Seed data using manage_data(action="insert", rows=[{...}, {...}]) if seed_data is true
+   - Use the rows parameter with an array of row objects for bulk insert (3-5 rows per table)
+   - Example: manage_data(action="insert", table_name="posts", rows=[{"title": "First Post", "body": "Hello"}, {"title": "Second Post", "body": "World"}])
 `)
 
 	return b.String()
@@ -272,7 +303,7 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 	b.WriteString(strings.Join(allPaths, ", ") + "\n\n")
 
 	if tableSchema != "" {
-		b.WriteString("## Data Available\n")
+		b.WriteString("## Data Available (LIVE — already seeded with real data)\n")
 		b.WriteString(tableSchema + "\n\n")
 	}
 
@@ -317,11 +348,16 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 
 	if page.NeedsData && tableSchema != "" {
 		b.WriteString(`
-5. Data Integration:
-   - Use fetch() to call the API endpoint listed above
-   - Display data in a meaningful way (cards, tables, lists)
-   - Handle loading states and empty states
-   - API returns: {data: [...], count, limit, offset}
+5. Data Integration (CRITICAL):
+   - The API endpoint above is LIVE and contains real seed data — use it directly
+   - Do NOT use placeholder data, mock arrays, or TODO comments — fetch from the real API
+   - Use fetch() with the exact endpoint path shown in "Data Available" above
+   - Response format: GET /api/{path} → {"data":[...],"count":N,"limit":N,"offset":N}
+   - Single item: GET /api/{path}/{id} → bare object
+   - Filtering: /api/{path}?column=value&sort=column&order=asc|desc
+   - Example: fetch('/api/articles').then(r=>r.json()).then(res => { res.data.forEach(item => { ... }) })
+   - Always handle loading states and empty states
+   - If you create a JS asset file (via manage_files), it MUST use the real API endpoint — no placeholders or TODOs
 `)
 	}
 
@@ -420,6 +456,45 @@ func buildMonitoringPrompt(site *models.Site, siteDB *sql.DB) string {
 - Do NOT modify pages, layout, files, or site settings — monitoring is read-only
 - If a critical issue requires fixes, use manage_communication to notify the owner
 - Be brief in your response
+`)
+
+	return b.String()
+}
+
+// --- CHAT-WAKE prompt (monitoring + write tools) ---
+
+func buildChatWakePrompt(site *models.Site, siteDB *sql.DB) string {
+	var b strings.Builder
+
+	b.WriteString("You are IATAN, responding to the site owner's message. The site is live and in monitoring mode.\n")
+	b.WriteString("The owner has sent you a message — read it carefully and take action if needed.\n\n")
+
+	b.WriteString("## Site\n")
+	b.WriteString(fmt.Sprintf("- Name: %s\n\n", site.Name))
+
+	manifest := loadSiteManifest(siteDB)
+	if manifest != "" {
+		b.WriteString(manifest)
+	}
+
+	cssContent := loadGlobalCSS(siteDB)
+	if cssContent != "" {
+		b.WriteString("## Global Stylesheet\n```css\n")
+		b.WriteString(cssContent)
+		b.WriteString("\n```\n\n")
+	}
+
+	b.WriteString(`## Instructions
+
+- Read the owner's message and determine what needs fixing
+- Use manage_pages to read and update pages
+- Use manage_files to update CSS or JS files
+- Use manage_layout to fix navigation or footer issues
+- Use manage_data to fix data issues
+- Use manage_diagnostics to check site health if needed
+- After making changes, briefly confirm what you did
+- Do NOT rebuild the entire site — make targeted fixes only
+- If the request requires a major restructure, use manage_communication to tell the owner they should trigger a rebuild instead
 `)
 
 	return b.String()

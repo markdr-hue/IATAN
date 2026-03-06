@@ -25,12 +25,8 @@ type EndpointsTool struct{}
 
 func (t *EndpointsTool) Name() string { return "manage_endpoints" }
 func (t *EndpointsTool) Description() string {
-	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, verify_password.\n" +
-		"Response formats for API endpoints: GET /api/{path} → {\"data\":[...],\"count\":N,\"limit\":N,\"offset\":N}. " +
-		"GET /api/{path}/{id} → bare object. POST → {\"success\":true,\"id\":N}. PUT/DELETE → {\"success\":true}.\n" +
-		"Filtering: GET /api/{path}?column=value&sort=column&order=asc|desc. Multiple filters use AND.\n" +
-		"JS example: fetch('/api/items?category=shoes&sort=price&order=asc').then(r=>r.json()).then(res => res.data.forEach(...))\n" +
-		"Auth endpoints create /api/{path}/register, /api/{path}/login, /api/{path}/me routes using JWT."
+	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, verify_password. " +
+		"API endpoints serve CRUD at /api/{path}. Auth endpoints create /register, /login, /me routes using JWT."
 }
 
 func (t *EndpointsTool) Parameters() map[string]interface{} {
