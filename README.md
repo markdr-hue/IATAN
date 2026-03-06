@@ -20,9 +20,9 @@ It works out of the box (fingers crossed :).
 
 To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the brain creates and maintains this as we speak.
 
-## Demo
+## Simple Setup
 
-![IATAN Demo](docs/demo.gif)
+![Get Going in No Time!](docs/demo.gif)
 
 ## Testimonials
 
