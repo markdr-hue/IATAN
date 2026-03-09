@@ -20,7 +20,7 @@ It works out of the box (fingers crossed :).
 
 To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the brain creates and maintains this as we speak.
 
-## Capabilities
+## Features
 
 - **Autonomous site/app building** : Describe what you want, the AI plans, designs, codes, and deploys it
 - **Dynamic REST APIs** : Auto-generated CRUD endpoints with filtering, sorting, and pagination
@@ -83,30 +83,6 @@ Grab the latest release:
 - **[IATAN_VX.X.X.zip](https://github.com/markdr-hue/IATAN/releases)** : contains `iatan.exe`, `config.json`, and `firstrun.json`
 
 Unzip somewhere convenient, run `iatan.exe`, open `http://localhost:5001`.
-
----
-
-## Features
-
-**Core**
-- **Single binary** : Web server, database, reverse proxy, admin panel, all in one
-- **Zero config** : Works out of the box with sane defaults
-- **Multi-site** : Run "unlimited" sites from a single instance
-- **Self-hosted** : Your data stays on your machine, always
-
-**AI**
-- **Pipeline brain** : Deterministic build stages, not random guessing loops
-- **5 providers** : Anthropic Claude, OpenAI, Google Gemini, Ollama (local/free), Z.ai
-- **18 unified tools** : Pages, files, schemas, APIs, webhooks, secrets, email, payments, scheduling, analytics, and more
-- **Streaming chat** : Talk to the brain in real time, ask questions, give directions
-
-**Infrastructure**
-- **Free HTTPS** : Embedded [Caddy](https://caddyserver.com) + [Let's Encrypt](https://letsencrypt.org), zero effort
-- **Per-site databases** : Each site gets its own SQLite DB, managed automatically
-- **Dynamic APIs** : AI creates REST endpoints, auth flows, and database tables on the fly
-- **Webhooks** : Incoming and outgoing, 20+ event types
-- **Scheduled tasks** : Cron-based automation the AI can set up itself
-- **Encrypted secrets** : AES-256-GCM storage for API keys and credentials
 
 ---
 
