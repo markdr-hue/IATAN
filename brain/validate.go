@@ -263,36 +263,37 @@ var (
 )
 
 // validateCSSAlignment checks that CSS classes used in HTML pages are defined
-// in the global stylesheet. Reports pages where most classes are undefined.
+// in the global or page-scoped stylesheets. Reports pages where most classes are undefined.
 func validateCSSAlignment(db *sql.DB) []string {
-	// Load global CSS from disk.
-	var storagePath sql.NullString
-	db.QueryRow(
-		"SELECT storage_path FROM assets WHERE scope = 'global' AND filename LIKE '%.css' ORDER BY filename LIMIT 1",
-	).Scan(&storagePath)
-	if !storagePath.Valid || storagePath.String == "" {
-		return nil // No CSS file to validate against.
-	}
-	cssData, err := os.ReadFile(storagePath.String)
+	// Load all global CSS from disk.
+	globalClasses := make(map[string]bool)
+	globalRows, err := db.Query("SELECT storage_path FROM assets WHERE scope = 'global' AND filename LIKE '%.css'")
 	if err != nil {
 		return nil
 	}
-	cssContent := string(cssData)
-
-	// Extract all class names defined in CSS.
-	cssClasses := make(map[string]bool)
-	for _, m := range cssSelectorRe.FindAllStringSubmatch(cssContent, -1) {
-		if len(m) > 1 {
-			cssClasses[m[1]] = true
+	defer globalRows.Close()
+	for globalRows.Next() {
+		var sp string
+		if globalRows.Scan(&sp) != nil {
+			continue
+		}
+		data, err := os.ReadFile(sp)
+		if err != nil {
+			continue
+		}
+		for _, m := range cssSelectorRe.FindAllStringSubmatch(string(data), -1) {
+			if len(m) > 1 {
+				globalClasses[m[1]] = true
+			}
 		}
 	}
-	if len(cssClasses) == 0 {
+	if len(globalClasses) == 0 {
 		return []string{"Global CSS file has no class selectors — pages will be unstyled"}
 	}
 
 	// Check each page's HTML class usage against CSS definitions.
 	var issues []string
-	rows, err := db.Query("SELECT path, content FROM pages WHERE is_deleted = 0 AND content IS NOT NULL")
+	rows, err := db.Query("SELECT path, content, assets FROM pages WHERE is_deleted = 0 AND content IS NOT NULL")
 	if err != nil {
 		return nil
 	}
@@ -300,7 +301,8 @@ func validateCSSAlignment(db *sql.DB) []string {
 
 	for rows.Next() {
 		var path, content string
-		if rows.Scan(&path, &content) != nil {
+		var assetsJSON sql.NullString
+		if rows.Scan(&path, &content, &assetsJSON) != nil {
 			continue
 		}
 
@@ -310,13 +312,44 @@ func validateCSSAlignment(db *sql.DB) []string {
 			if len(m) < 2 {
 				continue
 			}
-			// Split space-separated classes: class="hero container dark"
 			for _, cls := range strings.Fields(m[1]) {
 				pageClasses[cls] = true
 			}
 		}
 		if len(pageClasses) == 0 {
 			continue
+		}
+
+		// Build combined class set: global + page-scoped CSS.
+		allClasses := make(map[string]bool, len(globalClasses))
+		for cls := range globalClasses {
+			allClasses[cls] = true
+		}
+
+		// Load page-scoped CSS classes from the page's asset list.
+		if assetsJSON.Valid && assetsJSON.String != "" && assetsJSON.String != "[]" {
+			var assetList []string
+			if json.Unmarshal([]byte(assetsJSON.String), &assetList) == nil {
+				for _, asset := range assetList {
+					if !strings.HasSuffix(asset, ".css") {
+						continue
+					}
+					var sp sql.NullString
+					db.QueryRow("SELECT storage_path FROM assets WHERE filename = ?", asset).Scan(&sp)
+					if !sp.Valid || sp.String == "" {
+						continue
+					}
+					data, err := os.ReadFile(sp.String)
+					if err != nil {
+						continue
+					}
+					for _, m := range cssSelectorRe.FindAllStringSubmatch(string(data), -1) {
+						if len(m) > 1 {
+							allClasses[m[1]] = true
+						}
+					}
+				}
+			}
 		}
 
 		// Common utility/state classes toggled by JS — don't need CSS definitions.
@@ -327,10 +360,10 @@ func validateCSSAlignment(db *sql.DB) []string {
 			"fade-in": true, "fade-out": true,
 		}
 
-		// Find classes used in HTML that aren't in CSS.
+		// Find classes used in HTML that aren't in any CSS.
 		var undefined []string
 		for cls := range pageClasses {
-			if !cssClasses[cls] && !skipClasses[cls] {
+			if !allClasses[cls] && !skipClasses[cls] {
 				undefined = append(undefined, cls)
 			}
 		}
@@ -342,13 +375,12 @@ func validateCSSAlignment(db *sql.DB) []string {
 
 		// Report if >40% of classes are undefined.
 		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.4 {
-			// Limit to 5 example classes to keep issue text compact.
 			examples := undefined
 			if len(examples) > 5 {
 				examples = examples[:5]
 			}
 			issues = append(issues, fmt.Sprintf(
-				"Page %s uses %d CSS classes not defined in stylesheet (e.g. %s) — update HTML to use classes from the global CSS",
+				"Page %s uses %d CSS classes not defined in any stylesheet (e.g. %s) — update HTML to use classes from the global or page-scoped CSS",
 				path, len(undefined), strings.Join(examples, ", "),
 			))
 		}
@@ -495,8 +527,12 @@ func validateContentLength(db *sql.DB) []string {
 			continue
 		}
 
-		// Skip pages that are intentionally short.
-		if path == "/404" || path == "/contact" || path == "/login" || path == "/register" {
+		// Skip pages that are intentionally short (auth forms, utility pages,
+		// data-driven dashboards with little static text).
+		if path == "/404" || path == "/contact" || path == "/login" || path == "/register" ||
+			path == "/signup" || path == "/reset-password" || path == "/callback" ||
+			path == "/dashboard" || path == "/profile" || path == "/settings" ||
+			path == "/auth" || path == "/verify" {
 			continue
 		}
 

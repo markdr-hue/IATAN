@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS questions (
     status TEXT DEFAULT 'pending',
     type TEXT DEFAULT 'text',
     secret_name TEXT,
+    fields TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

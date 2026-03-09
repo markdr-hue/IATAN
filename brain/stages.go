@@ -167,12 +167,14 @@ func (w *PipelineWorker) runPlan(ctx context.Context) (PipelineStage, error) {
 			if len(q.Options) > 0 {
 				opts = strings.Join(q.Options, ", ")
 			}
-			w.siteDB.ExecWrite(
+			qResult, _ := w.siteDB.ExecWrite(
 				"INSERT INTO questions (question, urgency, status, options) VALUES (?, 'normal', 'pending', ?)",
 				q.Question, opts,
 			)
+			qID, _ := qResult.LastInsertId()
 			if w.deps.Bus != nil {
 				w.deps.Bus.Publish(events.NewEvent(events.EventQuestionAsked, w.siteID, map[string]interface{}{
+					"id":       qID,
 					"question": q.Question,
 					"options":  q.Options,
 				}))

@@ -1101,6 +1101,42 @@ select.input {
 .toast--error { border-left: 3px solid var(--danger); }
 .toast--warning { border-left: 3px solid var(--warning); }
 .toast--info { border-left: 3px solid var(--info); }
+.toast--clickable { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+
+/* ---------- Sidebar Badge (pulsing) ---------- */
+.sidebar__badge--pulse {
+  animation: pulse-badge 2s ease-in-out infinite;
+}
+@keyframes pulse-badge {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ---------- Multi-field Question Card ---------- */
+.chat-card__fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+.chat-card__field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chat-card__field-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.chat-card__field-row .input {
+  width: 100%;
+}
+.chat-card__field-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
 
 /* ---------- Status Dots ---------- */
 .status-dot {

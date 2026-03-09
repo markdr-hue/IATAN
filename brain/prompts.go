@@ -505,8 +505,11 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
    - Only create webhooks if the site actually integrates with external services that send them
 
 10. For OAuth (social login), after creating the auth endpoint:
-   - Ask the site owner for client_id and client_secret: manage_communication(action="ask", question="Please provide OAuth client ID and secret for Google login. Register at https://console.cloud.google.com. Callback URL: /api/{auth_path}/oauth/google/callback", type="text")
-   - Then create: manage_endpoints(action="create_oauth", provider_name="google", display_name="Google", client_id="...", client_secret="...", authorize_url="https://accounts.google.com/o/oauth2/v2/auth", token_url="https://oauth2.googleapis.com/token", userinfo_url="https://www.googleapis.com/oauth2/v3/userinfo", scopes="openid email profile", username_field="email", auth_path="auth")
+   - Ask the site owner for ALL OAuth credentials in ONE question using structured fields:
+     manage_communication(action="ask", question="Please provide OAuth credentials for the providers below.", context="Register apps at these URLs and set the callback URL to /api/{auth_path}/oauth/{provider}/callback\nGoogle: https://console.cloud.google.com\nGitHub: https://github.com/settings/developers\nDiscord: https://discord.com/developers", fields="[{\"name\":\"google_client_id\",\"label\":\"Google Client ID\",\"type\":\"text\"},{\"name\":\"google_client_secret\",\"label\":\"Google Client Secret\",\"type\":\"secret\",\"secret_name\":\"google_oauth_secret\"},{\"name\":\"github_client_id\",\"label\":\"GitHub Client ID\",\"type\":\"text\"},{\"name\":\"github_client_secret\",\"label\":\"GitHub Client Secret\",\"type\":\"secret\",\"secret_name\":\"github_oauth_secret\"}]")
+   - Only include fields for providers the site actually needs (check the plan)
+   - After the owner answers, read the field values from memory (for client_id) and secrets (for client_secret)
+   - Then create each provider: manage_endpoints(action="create_oauth", provider_name="google", display_name="Google", client_id="...", client_secret_name="google_oauth_secret", ...)
    Common provider URLs:
    - Google: authorize=https://accounts.google.com/o/oauth2/v2/auth, token=https://oauth2.googleapis.com/token, userinfo=https://www.googleapis.com/oauth2/v3/userinfo
    - GitHub: authorize=https://github.com/login/oauth/authorize, token=https://github.com/login/oauth/access_token, userinfo=https://api.github.com/user, username_field="login"
@@ -572,7 +575,7 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 	if cssClassMap != "" {
 		b.WriteString("## Global CSS Reference\n")
 		b.WriteString(cssClassMap)
-		b.WriteString("\nIMPORTANT: Use ONLY the CSS classes and custom properties listed above. Do NOT invent new class names.\n\n")
+		b.WriteString("\nUse the CSS classes above as your primary toolkit. If you need a page-specific style not covered by global CSS, create a page-scoped CSS file via manage_files(action=\"save\", storage=\"assets\", scope=\"page\") and list it in the page's assets array.\n\n")
 	}
 
 	b.WriteString("## Layout\n")
@@ -585,16 +588,16 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 		b.WriteString("## Available SVG Illustrations\n")
 		b.WriteString(svgAssets)
 		b.WriteString("Use these in hero sections and feature areas via <img src=\"/assets/svg/...\"> or inline SVG.\n")
-		b.WriteString("IMPORTANT: ONLY reference SVG filenames listed above. Do NOT invent new asset paths that don't exist.\n\n")
+		b.WriteString("Only reference SVG filenames listed above. If you need a custom SVG, create it first via manage_files(action=\"save\", storage=\"assets\") then reference it.\n\n")
 	} else {
-		b.WriteString("No SVG assets are available. Use CSS gradients, borders, and shapes for decorative elements instead of <img> tags.\n\n")
+		b.WriteString("No SVG assets are available. Use CSS gradients, borders, and shapes for decorative elements. You can also create SVGs via manage_files(action=\"save\", storage=\"assets\") if needed.\n\n")
 	}
 
 	// Blueprint context: detailed page spec from BLUEPRINT_PAGES stage.
 	if blueprint != nil {
 		pageBP := blueprint.BlueprintForPage(page.Path)
 		if pageBP != nil {
-			b.WriteString("## Page Blueprint (FOLLOW THIS STRUCTURE)\n")
+			b.WriteString("## Page Blueprint (use as structural guide — adapt freely)\n")
 			if pageBP.HTMLSkeleton != "" {
 				b.WriteString("HTML skeleton:\n```\n" + pageBP.HTMLSkeleton + "\n```\n")
 			}
@@ -753,11 +756,10 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 
 	b.WriteString(`
 7. Functional completeness:
-   - Do NOT create links, buttons, or UI elements that have no backing functionality
+   - Every interactive element must work when clicked/submitted
    - Example: do NOT add a "Forgot Password" link unless you implement the reset flow
    - Example: do NOT add a "Search" input unless you implement the search functionality
-   - Every interactive element must DO something when clicked/submitted
-   - If a feature is beyond scope, leave it out entirely — do NOT add dead UI elements
+   - If a feature is beyond scope, either leave it out entirely or mark it as "Coming Soon" with the element visually disabled (e.g. a muted button with no click handler)
 `)
 
 	return b.String()

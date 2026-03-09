@@ -20,7 +20,7 @@ type CommunicationTool struct{}
 
 func (t *CommunicationTool) Name() string { return "manage_communication" }
 func (t *CommunicationTool) Description() string {
-	return "Manage communication with site owner. Actions: ask (create question for admin), check (check for answers)."
+	return "Communicate with the site owner when you need information you cannot determine on your own. Actions: ask (ask the owner a question — use for missing credentials, design preferences, or ambiguous requirements), check (check if the owner has answered your questions). Do NOT ask questions you can answer yourself."
 }
 func (t *CommunicationTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -33,6 +33,7 @@ func (t *CommunicationTool) Parameters() map[string]interface{} {
 			"urgency":     map[string]interface{}{"type": "string", "description": "Urgency level: low, normal, high", "enum": []string{"low", "normal", "high"}},
 			"type":        map[string]interface{}{"type": "string", "description": "Question type: 'text' (default) or 'secret' (for API keys/tokens — value will be encrypted)", "enum": []string{"text", "secret"}},
 			"secret_name": map[string]interface{}{"type": "string", "description": "For type='secret': the name to store the secret under (e.g. 'openai_api_key')"},
+			"fields":      map[string]interface{}{"type": "string", "description": "JSON array of input fields for structured questions: [{\"name\": \"client_id\", \"label\": \"Client ID\", \"type\": \"text\"}, {\"name\": \"client_secret\", \"label\": \"Client Secret\", \"type\": \"secret\", \"secret_name\": \"my_secret\"}]. Each field creates a labeled input box."},
 			"question_id": map[string]interface{}{"type": "number", "description": "Specific question ID to check (optional for check, omit to check all pending)"},
 		},
 		"required": []string{"action"},
@@ -73,10 +74,11 @@ func (t *CommunicationTool) ask(ctx *ToolContext, args map[string]interface{}) (
 	if qType == "secret" && secretName == "" {
 		return &Result{Success: false, Error: "secret_name is required when type is 'secret'"}, nil
 	}
+	fields, _ := args["fields"].(string)
 
 	result, err := ctx.DB.Exec(
-		"INSERT INTO questions (question, context, options, urgency, type, secret_name) VALUES (?, ?, ?, ?, ?, ?)",
-		question, qContext, options, urgency, qType, secretName,
+		"INSERT INTO questions (question, context, options, urgency, type, secret_name, fields) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		question, qContext, options, urgency, qType, secretName, fields,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating question: %w", err)
@@ -94,6 +96,7 @@ func (t *CommunicationTool) ask(ctx *ToolContext, args map[string]interface{}) (
 			"urgency":     urgency,
 			"type":        qType,
 			"secret_name": secretName,
+			"fields":      fields,
 		}))
 	}
 

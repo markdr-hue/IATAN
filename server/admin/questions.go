@@ -7,9 +7,11 @@ package admin
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -111,14 +113,14 @@ func (h *QuestionsHandler) ListBySite(w http.ResponseWriter, r *http.Request) {
 
 	if statusFilter != "" {
 		rows, err = siteDB.Query(
-			`SELECT q.id, q.question, q.context, q.options, q.urgency, q.status, q.created_at, q.type, q.secret_name,
+			`SELECT q.id, q.question, q.context, q.options, q.urgency, q.status, q.created_at, q.type, q.secret_name, q.fields,
 			        (SELECT a.answer FROM answers a WHERE a.question_id = q.id ORDER BY a.created_at DESC LIMIT 1) as answer
 			 FROM questions q WHERE q.status = ? ORDER BY q.created_at DESC`,
 			statusFilter,
 		)
 	} else {
 		rows, err = siteDB.Query(
-			`SELECT q.id, q.question, q.context, q.options, q.urgency, q.status, q.created_at, q.type, q.secret_name,
+			`SELECT q.id, q.question, q.context, q.options, q.urgency, q.status, q.created_at, q.type, q.secret_name, q.fields,
 			        (SELECT a.answer FROM answers a WHERE a.question_id = q.id ORDER BY a.created_at DESC LIMIT 1) as answer
 			 FROM questions q ORDER BY q.created_at DESC`,
 		)
@@ -134,7 +136,7 @@ func (h *QuestionsHandler) ListBySite(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var q siteQuestion
 		q.SiteID = siteID
-		if err := rows.Scan(&q.ID, &q.Question, &q.Context, &q.Options, &q.Urgency, &q.Status, &q.CreatedAt, &q.Type, &q.SecretName, &q.Answer); err != nil {
+		if err := rows.Scan(&q.ID, &q.Question, &q.Context, &q.Options, &q.Urgency, &q.Status, &q.CreatedAt, &q.Type, &q.SecretName, &q.Fields, &q.Answer); err != nil {
 			continue
 		}
 		questions = append(questions, q)
@@ -159,6 +161,7 @@ type siteQuestion struct {
 	CreatedAt  time.Time `json:"created_at"`
 	Type       *string   `json:"type,omitempty"`
 	SecretName *string   `json:"secret_name,omitempty"`
+	Fields     *string   `json:"fields,omitempty"`
 }
 
 type answerRequest struct {
@@ -211,14 +214,64 @@ func (h *QuestionsHandler) Answer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is a secret-type question.
-	var qType, secretName sql.NullString
+	// Check if this is a secret-type question or has structured fields.
+	var qType, secretName, fieldsJSON sql.NullString
 	_ = siteDB.QueryRow(
-		"SELECT type, secret_name FROM questions WHERE id = ?", questionID,
-	).Scan(&qType, &secretName)
+		"SELECT type, secret_name, fields FROM questions WHERE id = ?", questionID,
+	).Scan(&qType, &secretName, &fieldsJSON)
 
-	if qType.Valid && qType.String == "secret" && secretName.Valid && secretName.String != "" {
-		// Encrypt and store the secret value.
+	// Handle multi-field structured answers.
+	if fieldsJSON.Valid && fieldsJSON.String != "" && fieldsJSON.String != "[]" {
+		var fieldDefs []struct {
+			Name       string `json:"name"`
+			Label      string `json:"label"`
+			Type       string `json:"type"`
+			SecretName string `json:"secret_name"`
+		}
+		if json.Unmarshal([]byte(fieldsJSON.String), &fieldDefs) == nil {
+			// Parse the answer as JSON field values.
+			var fieldValues map[string]string
+			if json.Unmarshal([]byte(req.Answer), &fieldValues) == nil {
+				var configured []string
+				for _, fd := range fieldDefs {
+					val, ok := fieldValues[fd.Name]
+					if !ok || val == "" {
+						continue
+					}
+					if fd.Type == "secret" && fd.SecretName != "" {
+						encrypted, encErr := h.deps.Encryptor.Encrypt(val)
+						if encErr != nil {
+							h.deps.Logger.Error("failed to encrypt field secret", "field", fd.Name, "error", encErr)
+							continue
+						}
+						_, _ = siteDB.ExecWrite(
+							`INSERT INTO secrets (name, value_encrypted, updated_at)
+							 VALUES (?, ?, CURRENT_TIMESTAMP)
+							 ON CONFLICT(name) DO UPDATE SET value_encrypted = excluded.value_encrypted, updated_at = CURRENT_TIMESTAMP`,
+							fd.SecretName, encrypted,
+						)
+						configured = append(configured, fd.Label)
+						if h.deps.Bus != nil {
+							h.deps.Bus.Publish(events.NewEvent(events.EventSecretStored, siteID, map[string]interface{}{
+								"name":        fd.SecretName,
+								"question_id": questionID,
+							}))
+						}
+					} else {
+						// Store non-secret field values in memory for the brain to use.
+						_, _ = siteDB.ExecWrite(
+							`INSERT INTO memory (key, value, category) VALUES (?, ?, 'field_answer')
+							 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+							fd.Name, val,
+						)
+						configured = append(configured, fd.Label)
+					}
+				}
+				req.Answer = "Configured: " + strings.Join(configured, ", ")
+			}
+		}
+	} else if qType.Valid && qType.String == "secret" && secretName.Valid && secretName.String != "" {
+		// Single secret-type question (legacy path).
 		encrypted, encErr := h.deps.Encryptor.Encrypt(req.Answer)
 		if encErr != nil {
 			h.deps.Logger.Error("failed to encrypt secret", "error", encErr)
@@ -231,7 +284,6 @@ func (h *QuestionsHandler) Answer(w http.ResponseWriter, r *http.Request) {
 			 ON CONFLICT(name) DO UPDATE SET value_encrypted = excluded.value_encrypted, updated_at = CURRENT_TIMESTAMP`,
 			secretName.String, encrypted,
 		)
-		// Replace the answer text with a safe reference (don't store the actual secret).
 		req.Answer = fmt.Sprintf("Secret '%s' configured", secretName.String)
 
 		if h.deps.Bus != nil {

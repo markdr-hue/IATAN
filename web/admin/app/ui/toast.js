@@ -23,12 +23,14 @@ function ensureContainer() {
  * @param {string} message - The message to display.
  * @param {'success'|'error'|'warning'|'info'} [type='info'] - Toast type.
  * @param {number} [duration=4000] - Duration in ms before auto-dismiss.
+ * @param {Function} [onClick] - Optional click callback (navigates instead of just dismissing).
  */
-export function show(message, type = 'info', duration = 4000) {
+export function show(message, type = 'info', duration = 4000, onClick = null) {
   const c = ensureContainer();
 
   const toast = document.createElement('div');
   toast.className = `toast toast--${type}`;
+  if (onClick) toast.classList.add('toast--clickable');
   toast.textContent = message;
 
   c.appendChild(toast);
@@ -41,9 +43,10 @@ export function show(message, type = 'info', duration = 4000) {
   // Auto dismiss
   const timer = setTimeout(() => dismiss(toast), duration);
 
-  // Click to dismiss
+  // Click to dismiss (or navigate)
   toast.addEventListener('click', () => {
     clearTimeout(timer);
+    if (onClick) onClick();
     dismiss(toast);
   });
 }

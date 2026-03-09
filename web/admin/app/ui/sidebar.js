@@ -106,6 +106,17 @@ export function createSidebar() {
 
       for (const link of siteLinks) {
         const isActive = activeTab === link.id;
+        const children = [
+          h('span', { innerHTML: icon(link.icon) }),
+          h('span', {}, link.label),
+        ];
+        // Add pending questions badge
+        if (link.id === 'questions') {
+          const count = state.get('pendingQuestions') || 0;
+          if (count > 0) {
+            children.push(h('span', { className: 'sidebar__badge sidebar__badge--pulse' }, String(count)));
+          }
+        }
         const el = h('a', {
           className: `sidebar__link sidebar__link--site${isActive ? ' active' : ''}`,
           onClick: (e) => {
@@ -113,10 +124,7 @@ export function createSidebar() {
             navigate(`/sites/${activeSiteId}/${link.id}`);
             element.classList.remove('mobile-open');
           },
-        }, [
-          h('span', { innerHTML: icon(link.icon) }),
-          h('span', {}, link.label),
-        ]);
+        }, children);
         siteNavSectionEl.appendChild(el);
       }
     }
@@ -194,6 +202,7 @@ export function createSidebar() {
   state.watch('runningSites', () => switcher.update());
   // No pending badge needed for providers (no approval flow).
   state.watch('siteActivity', () => switcher.update());
+  state.watch('pendingQuestions', renderNav);
 
   renderNav();
 

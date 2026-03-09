@@ -147,7 +147,16 @@ export function createToolCard(toolName, status, args, result) {
  * Create an inline question card with interactive option buttons.
  */
 export function createQuestionCard(questionData) {
-  const { id, question, options, urgency, context } = questionData;
+  const { id, question, options, urgency, context, fields } = questionData;
+
+  // Parse structured fields if present.
+  let parsedFields = [];
+  if (fields) {
+    try {
+      parsedFields = typeof fields === 'string' ? JSON.parse(fields) : fields;
+    } catch { /* ignore */ }
+  }
+  if (!Array.isArray(parsedFields)) parsedFields = [];
 
   let parsedOptions = [];
   if (options) {
@@ -175,45 +184,88 @@ export function createQuestionCard(questionData) {
     body.appendChild(h('p', { className: 'chat-card__context text-sm text-secondary' }, context));
   }
 
-  // Option buttons
-  const optionsContainer = h('div', { className: 'chat-card__options' });
-  for (const opt of parsedOptions) {
-    const label = typeof opt === 'string' ? opt : opt.label || opt;
-    const btn = h('button', {
-      className: 'btn btn--sm btn--ghost chat-card__option-btn',
-      onClick: () => submitAnswer(id, label, card),
-    }, label);
-    optionsContainer.appendChild(btn);
-  }
+  card.appendChild(header);
+  card.appendChild(body);
 
-  // Custom answer input
-  const customInput = h('input', {
-    type: 'text',
-    className: 'input input--sm',
-    placeholder: 'Or type a custom answer...',
-    onKeyDown: (e) => {
-      if (e.key === 'Enter' && customInput.value.trim()) {
-        submitAnswer(id, customInput.value.trim(), card);
-      }
-    },
-  });
+  // Multi-field structured input form.
+  if (parsedFields.length > 0) {
+    const fieldsContainer = h('div', { className: 'chat-card__fields' });
+    const fieldInputs = {};
 
-  const customRow = h('div', { className: 'chat-card__custom-answer' }, [
-    customInput,
-    h('button', {
+    for (const field of parsedFields) {
+      const inputType = field.type === 'secret' ? 'password' : 'text';
+      const input = h('input', {
+        type: inputType,
+        className: 'input input--sm',
+        placeholder: field.label || field.name,
+        'data-field-name': field.name,
+      });
+      fieldInputs[field.name] = input;
+
+      const row = h('div', { className: 'chat-card__field-row' }, [
+        h('label', { className: 'chat-card__field-label' }, field.label || field.name),
+        input,
+      ]);
+      fieldsContainer.appendChild(row);
+    }
+
+    const submitBtn = h('button', {
       className: 'btn btn--sm btn--primary',
       onClick: () => {
-        if (customInput.value.trim()) {
+        const values = {};
+        let hasValue = false;
+        for (const field of parsedFields) {
+          const val = fieldInputs[field.name].value.trim();
+          if (val) hasValue = true;
+          values[field.name] = val;
+        }
+        if (hasValue) {
+          submitAnswer(id, JSON.stringify(values), card);
+        }
+      },
+    }, 'Submit');
+
+    fieldsContainer.appendChild(h('div', { className: 'chat-card__field-actions' }, [submitBtn]));
+    card.appendChild(fieldsContainer);
+  } else {
+    // Option buttons (original path)
+    const optionsContainer = h('div', { className: 'chat-card__options' });
+    for (const opt of parsedOptions) {
+      const label = typeof opt === 'string' ? opt : opt.label || opt;
+      const btn = h('button', {
+        className: 'btn btn--sm btn--ghost chat-card__option-btn',
+        onClick: () => submitAnswer(id, label, card),
+      }, label);
+      optionsContainer.appendChild(btn);
+    }
+
+    // Custom answer input
+    const customInput = h('input', {
+      type: 'text',
+      className: 'input input--sm',
+      placeholder: 'Or type a custom answer...',
+      onKeyDown: (e) => {
+        if (e.key === 'Enter' && customInput.value.trim()) {
           submitAnswer(id, customInput.value.trim(), card);
         }
       },
-    }, 'Send'),
-  ]);
+    });
 
-  card.appendChild(header);
-  card.appendChild(body);
-  if (parsedOptions.length > 0) card.appendChild(optionsContainer);
-  card.appendChild(customRow);
+    const customRow = h('div', { className: 'chat-card__custom-answer' }, [
+      customInput,
+      h('button', {
+        className: 'btn btn--sm btn--primary',
+        onClick: () => {
+          if (customInput.value.trim()) {
+            submitAnswer(id, customInput.value.trim(), card);
+          }
+        },
+      }, 'Send'),
+    ]);
+
+    if (parsedOptions.length > 0) card.appendChild(optionsContainer);
+    card.appendChild(customRow);
+  }
 
   return { element: card, questionId: id };
 }

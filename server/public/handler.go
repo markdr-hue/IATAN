@@ -866,7 +866,7 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	cleaned := filepath.Clean(filename)
+	cleaned := filepath.ToSlash(filepath.Clean(filename))
 	if cleaned != filename || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
 		http.NotFound(w, r)
 		return
@@ -991,7 +991,7 @@ func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	cleaned := filepath.Clean(filename)
+	cleaned := filepath.ToSlash(filepath.Clean(filename))
 	if cleaned != filename || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
 		http.NotFound(w, r)
 		return

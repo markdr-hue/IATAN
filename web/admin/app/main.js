@@ -18,6 +18,7 @@ import { addRecent, setActiveSite } from './ui/site-switcher.js';
 import { createLayout } from './ui/layout.js';
 import { renderLogin } from './views/login.js';
 import { renderSetup } from './views/setup/index.js';
+import * as toast from './ui/toast.js';
 import { renderDashboard } from './views/dashboard.js';
 import { renderSites } from './views/sites.js';
 import { renderSiteDetail } from './views/site/index.js';
@@ -229,12 +230,23 @@ function connectSSE() {
     // Route to state for inline chat question cards
     if (data?.payload) {
       state.set('questionAsked', { site_id: data.site_id, ...(data.payload || {}) });
+      // Increment pending question count for sidebar badge
+      const count = (state.get('pendingQuestions') || 0) + 1;
+      state.set('pendingQuestions', count);
+      // Show global toast regardless of current page
+      const siteId = data.site_id;
+      toast.show('IATAN needs your input — check Chat', 'warning', 10000, () => {
+        router.navigate(`/sites/${siteId}/home`);
+      });
     }
   });
 
   sse.on('question.answered', (data) => {
     if (data?.payload) {
       state.set('questionAnswered', { site_id: data.site_id, ...(data.payload || {}) });
+      // Decrement pending question count
+      const count = Math.max(0, (state.get('pendingQuestions') || 0) - 1);
+      state.set('pendingQuestions', count);
     }
   });
 
