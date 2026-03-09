@@ -41,14 +41,27 @@ export async function renderProvider(container, setupData, onNext) {
   clear(container);
 
   if (!providers || providers.length === 0) {
-    // No providers seeded — cannot proceed without one
     const content = h('div', {}, [
       h('div', { className: 'setup-card__header' }, [
         h('div', { className: 'setup-card__icon', innerHTML: icon('cpu') }),
         h('h2', { className: 'setup-card__title' }, 'No providers found'),
         h('p', { className: 'setup-card__desc' },
-          'Add providers to firstrun.json or set API key environment variables, then restart IATAN.'),
+          'No AI providers were configured. You can add them later from Global Settings.'),
       ]),
+      h('div', { className: 'setup-actions setup-actions--center' }, [
+        h('button', {
+          className: 'btn btn--primary btn--lg',
+          onClick: () => {
+            setupData.providerId = 0;
+            setupData.providerName = '';
+            setupData.modelId = '';
+            setupData.apiKey = '';
+            onNext();
+          },
+        }, 'Skip for now'),
+      ]),
+      h('p', { className: 'form-hint', style: 'text-align:center;margin-top:0.5rem' },
+        'You can configure providers in Global Settings after setup.'),
     ]);
     container.appendChild(content);
     return;
@@ -79,7 +92,7 @@ function buildForm(container, providers, setupData, onNext) {
     type: 'password',
     placeholder: 'Paste your API key',
   });
-  const apiKeyHint = h('p', { className: 'form-hint' }, 'Your key stays on this server. We never share it.');
+  const apiKeyHint = h('p', { className: 'form-hint' }, 'Your key stays on your server. We never share it.');
 
   function updateModels() {
     modelSelect.innerHTML = '';

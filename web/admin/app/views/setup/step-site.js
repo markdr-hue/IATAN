@@ -20,8 +20,8 @@ export function renderSite(container, setupData, onNext) {
 
   const domainInput = h('input', {
     className: 'input',
-    placeholder: 'example.com (optional)',
-    value: setupData.siteDomain || 'localhost',
+    placeholder: 'e.g. mysite.com (leave blank for local dev)',
+    value: setupData.siteDomain || '',
   });
 
   const directionInput = h('textarea', {

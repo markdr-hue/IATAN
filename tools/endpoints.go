@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"time"
 
 	"github.com/markdr-hue/IATAN/security"
@@ -19,14 +21,17 @@ import (
 // ---------------------------------------------------------------------------
 
 // EndpointsTool consolidates API endpoint and auth endpoint management into a
-// single tool with seven actions: create_api, list_api, delete_api,
-// create_auth, list_auth, delete_auth, verify_password.
+// single tool with ten actions: create_api, list_api, delete_api,
+// create_auth, list_auth, delete_auth, create_upload, create_stream, verify_password, test.
 type EndpointsTool struct{}
 
 func (t *EndpointsTool) Name() string { return "manage_endpoints" }
 func (t *EndpointsTool) Description() string {
-	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, verify_password. " +
-		"API endpoints serve CRUD at /api/{path}. Auth endpoints create /register, /login, /me routes using JWT."
+	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, verify_password, test. " +
+		"API endpoints serve CRUD at /api/{path}. Auth endpoints create /register, /login, /me routes using JWT. " +
+		"Upload endpoints accept multipart file uploads at /api/{path}/upload. " +
+		"Stream endpoints provide real-time SSE at /api/{path}/stream for live data updates. " +
+		"Use 'test' with a path to verify an endpoint works and see sample data."
 }
 
 func (t *EndpointsTool) Parameters() map[string]interface{} {
@@ -36,7 +41,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"action": map[string]interface{}{
 				"type":        "string",
 				"description": "Action to perform",
-				"enum":        []string{"create_api", "list_api", "delete_api", "create_auth", "list_auth", "delete_auth", "verify_password"},
+				"enum":        []string{"create_api", "list_api", "delete_api", "create_auth", "list_auth", "delete_auth", "create_upload", "create_stream", "verify_password", "test"},
 			},
 			"path": map[string]interface{}{
 				"type":        "string",
@@ -71,6 +76,20 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"password_column": map[string]interface{}{
 				"type":        "string",
 				"description": "Column with PASSWORD type (default: 'password'). For create_auth and verify_password.",
+			},
+			"allowed_types": map[string]interface{}{
+				"type":        "array",
+				"items":       map[string]interface{}{"type": "string"},
+				"description": "Allowed MIME types for uploads (e.g. [\"image/*\", \"application/pdf\"]). Glob patterns supported. Only for create_upload.",
+			},
+			"event_types": map[string]interface{}{
+				"type":        "array",
+				"items":       map[string]interface{}{"type": "string"},
+				"description": "Event types to stream (e.g. [\"data.insert\", \"data.update\", \"data.delete\"]). Only for create_stream.",
+			},
+			"max_size_mb": map[string]interface{}{
+				"type":        "number",
+				"description": "Max file size in MB (default: 5). Only for create_upload.",
 			},
 			"id": map[string]interface{}{
 				"type":        "number",
@@ -111,10 +130,16 @@ func (t *EndpointsTool) Execute(ctx *ToolContext, args map[string]interface{}) (
 		return t.listAuth(ctx, args)
 	case "delete_auth":
 		return t.deleteAuth(ctx, args)
+	case "create_upload":
+		return t.createUpload(ctx, args)
+	case "create_stream":
+		return t.createStream(ctx, args)
 	case "verify_password":
 		return t.verifyPassword(ctx, args)
+	case "test":
+		return t.testEndpoint(ctx, args)
 	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use create_api, list_api, delete_api, create_auth, list_auth, delete_auth, verify_password)", action)}, nil
+		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, verify_password, test)", action)}, nil
 	}
 }
 
@@ -441,4 +466,184 @@ func (t *EndpointsTool) verifyPassword(ctx *ToolContext, args map[string]interfa
 // checkPasswordHash compares a plaintext password against a bcrypt hash.
 func checkPasswordHash(password, hash string) bool {
 	return security.CheckPassword(password, hash)
+}
+
+// ---------------------------------------------------------------------------
+// Upload endpoint action
+// ---------------------------------------------------------------------------
+
+func (t *EndpointsTool) createUpload(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return &Result{Success: false, Error: "path is required"}, nil
+	}
+
+	// Parse allowed_types (default: image/*, application/pdf).
+	allowedTypes := []string{"image/*", "application/pdf"}
+	if typesRaw, ok := args["allowed_types"].([]interface{}); ok && len(typesRaw) > 0 {
+		allowedTypes = nil
+		for _, t := range typesRaw {
+			if ts, ok := t.(string); ok {
+				allowedTypes = append(allowedTypes, ts)
+			}
+		}
+	}
+	allowedTypesJSON, _ := json.Marshal(allowedTypes)
+
+	maxSizeMB := 5
+	if ms, ok := args["max_size_mb"].(float64); ok && ms > 0 {
+		maxSizeMB = int(ms)
+	}
+
+	requiresAuth := false
+	if ra, ok := args["requires_auth"].(bool); ok {
+		requiresAuth = ra
+	}
+
+	// Optional: link to a table to store file metadata.
+	tableName, _ := args["table_name"].(string)
+
+	// Ensure upload_endpoints table exists.
+	ctx.DB.Exec(`CREATE TABLE IF NOT EXISTS upload_endpoints (
+		id INTEGER PRIMARY KEY,
+		path TEXT UNIQUE NOT NULL,
+		allowed_types TEXT,
+		max_size_mb INTEGER DEFAULT 5,
+		requires_auth BOOLEAN DEFAULT 0,
+		table_name TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`)
+
+	_, err := ctx.DB.Exec(
+		`INSERT INTO upload_endpoints (path, allowed_types, max_size_mb, requires_auth, table_name)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(path) DO UPDATE SET
+		   allowed_types = excluded.allowed_types,
+		   max_size_mb = excluded.max_size_mb,
+		   requires_auth = excluded.requires_auth,
+		   table_name = excluded.table_name`,
+		path, string(allowedTypesJSON), maxSizeMB, requiresAuth, tableName,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating upload endpoint: %w", err)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"path":          path,
+		"route":         fmt.Sprintf("POST /api/%s/upload", path),
+		"allowed_types": allowedTypes,
+		"max_size_mb":   maxSizeMB,
+		"requires_auth": requiresAuth,
+		"table_name":    tableName,
+	}}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stream endpoint action
+// ---------------------------------------------------------------------------
+
+func (t *EndpointsTool) createStream(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return &Result{Success: false, Error: "path is required"}, nil
+	}
+
+	// Parse event_types (default: all data events).
+	eventTypes := []string{"data.insert", "data.update", "data.delete"}
+	if typesRaw, ok := args["event_types"].([]interface{}); ok && len(typesRaw) > 0 {
+		eventTypes = nil
+		for _, et := range typesRaw {
+			if ets, ok := et.(string); ok {
+				eventTypes = append(eventTypes, ets)
+			}
+		}
+	}
+	eventTypesJSON, _ := json.Marshal(eventTypes)
+
+	requiresAuth := false
+	if ra, ok := args["requires_auth"].(bool); ok {
+		requiresAuth = ra
+	}
+
+	// Ensure stream_endpoints table exists.
+	ctx.DB.Exec(`CREATE TABLE IF NOT EXISTS stream_endpoints (
+		id INTEGER PRIMARY KEY,
+		path TEXT UNIQUE NOT NULL,
+		event_types TEXT,
+		requires_auth BOOLEAN DEFAULT 0,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`)
+
+	_, err := ctx.DB.Exec(
+		`INSERT INTO stream_endpoints (path, event_types, requires_auth)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(path) DO UPDATE SET
+		   event_types = excluded.event_types,
+		   requires_auth = excluded.requires_auth`,
+		path, string(eventTypesJSON), requiresAuth,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating stream endpoint: %w", err)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"path":          path,
+		"route":         fmt.Sprintf("GET /api/%s/stream", path),
+		"event_types":   eventTypes,
+		"requires_auth": requiresAuth,
+		"usage":         "const source = new EventSource('/api/" + path + "/stream'); source.addEventListener('data.insert', (e) => { const data = JSON.parse(e.data); ... });",
+	}}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Test action
+// ---------------------------------------------------------------------------
+
+func (t *EndpointsTool) testEndpoint(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return &Result{Success: false, Error: "path is required"}, nil
+	}
+
+	url := resolveLocalURL(ctx, "/api/"+path+"?limit=1")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("endpoint unreachable: %v", err)}, nil
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode != http.StatusOK {
+		return &Result{Success: false, Data: map[string]interface{}{
+			"status_code": resp.StatusCode,
+			"body":        string(body),
+		}, Error: fmt.Sprintf("endpoint returned status %d", resp.StatusCode)}, nil
+	}
+
+	// Try to parse as JSON to extract column names.
+	var parsed interface{}
+	var columns []string
+	if json.Unmarshal(body, &parsed) == nil {
+		// Extract column names from first record if it's an array of objects.
+		if arr, ok := parsed.([]interface{}); ok && len(arr) > 0 {
+			if obj, ok := arr[0].(map[string]interface{}); ok {
+				for k := range obj {
+					columns = append(columns, k)
+				}
+			}
+		}
+	}
+
+	result := map[string]interface{}{
+		"status_code": resp.StatusCode,
+		"data_sample": string(body),
+	}
+	if len(columns) > 0 {
+		result["columns"] = columns
+	}
+
+	return &Result{Success: true, Data: result}, nil
 }

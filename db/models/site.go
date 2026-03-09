@@ -152,17 +152,3 @@ func DeleteSite(db *sql.DB, id int) error {
 	_, err := db.Exec("DELETE FROM sites WHERE id = ?", id)
 	return err
 }
-
-// IncrementTickCount atomically increments the tick counter and returns the new value.
-func IncrementTickCount(db *sql.DB, siteID int) (int, error) {
-	_, err := db.Exec(
-		"UPDATE sites SET tick_count = tick_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-		siteID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	var count int
-	db.QueryRow("SELECT tick_count FROM sites WHERE id = ?", siteID).Scan(&count)
-	return count, nil
-}

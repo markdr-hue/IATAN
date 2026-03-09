@@ -35,7 +35,7 @@ func (t *WebhooksTool) Parameters() map[string]interface{} {
 			"webhook_name": map[string]interface{}{"type": "string", "description": "Webhook name (for subscribe)"},
 			"event_types": map[string]interface{}{
 				"type":        "array",
-				"description": "Event types to subscribe to (e.g. page.created, page.updated, brain.tick)",
+				"description": "Event types to subscribe to (e.g. site.updated, brain.started, tool.executed)",
 				"items":       map[string]interface{}{"type": "string"},
 			},
 		},

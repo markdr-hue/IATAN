@@ -27,6 +27,11 @@ import { renderSiteSettings } from './settings.js';
 import { renderSiteLogs } from './logs.js';
 import { renderSiteQuestions } from './questions.js';
 import { renderSiteWebhooks } from './webhooks.js';
+import { renderSiteSecrets } from './secrets.js';
+import { renderSiteMemory } from './memory.js';
+import { renderSiteLayouts } from './layouts.js';
+import { renderSiteAnalytics } from './analytics.js';
+import { renderSiteDiagnostics } from './diagnostics.js';
 
 // Track cleanup functions
 let _headerUnwatchers = [];
@@ -243,6 +248,21 @@ function renderContextPanel(container, panel, siteId, site) {
       break;
     case 'logs':
       cleanup = renderSiteLogs(container, siteId);
+      break;
+    case 'secrets':
+      cleanup = renderSiteSecrets(container, siteId);
+      break;
+    case 'memory':
+      cleanup = renderSiteMemory(container, siteId);
+      break;
+    case 'layouts':
+      cleanup = renderSiteLayouts(container, siteId);
+      break;
+    case 'analytics':
+      cleanup = renderSiteAnalytics(container, siteId);
+      break;
+    case 'diagnostics':
+      cleanup = renderSiteDiagnostics(container, siteId);
       break;
     case 'settings':
       cleanup = renderSiteSettings(container, siteId, site);

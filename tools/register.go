@@ -52,4 +52,10 @@ func RegisterAll(r *Registry) {
 
 	// Diagnostics (unified: health, errors, integrity)
 	r.Register(&DiagnosticsTool{})
+
+	// Email (unified: configure, send, save_template, list_templates)
+	r.Register(&EmailTool{})
+
+	// Payments (unified: configure, create_checkout, check_status, list, handle_webhook)
+	r.Register(&PaymentsTool{})
 }

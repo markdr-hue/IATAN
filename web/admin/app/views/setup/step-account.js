@@ -38,7 +38,7 @@ export function renderAccount(container, setupData, onNext) {
 
   const requirements = h('div', {
     className: 'text-xs mt-2',
-    style: { color: 'var(--text-tertiary)' },
+    style: { color: 'var(--text-secondary)' },
   }, '8+ characters, uppercase, number, special character');
 
   function checkStrength(pwd) {
@@ -125,7 +125,7 @@ export function renderAccount(container, setupData, onNext) {
   confirmInput.addEventListener('keydown', onKey);
 
   const greeting = setupData.displayName
-    ? `Nice to meet you, ${setupData.displayName}`
+    ? `Nice to meet you ${setupData.displayName}`
     : 'Create your admin account';
 
   const content = h('div', {}, [

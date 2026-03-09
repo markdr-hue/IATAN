@@ -60,6 +60,11 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 	siteFilesH := &SiteFilesHandler{deps: deps}
 	siteWebhooksH := &SiteWebhooksHandler{deps: deps}
 	siteAuthEndpointsH := &SiteAuthEndpointsHandler{deps: deps}
+	siteSecretsH := &SiteSecretsHandler{deps: deps}
+	siteMemoryH := &SiteMemoryHandler{deps: deps}
+	siteLayoutsH := &SiteLayoutsHandler{deps: deps}
+	siteAnalyticsH := &SiteAnalyticsHandler{deps: deps}
+	siteDiagH := &SiteDiagnosticsHandler{deps: deps}
 	r.Route("/admin/api", func(r chi.Router) {
 		// Public endpoints (no JWT required).
 		r.Post("/auth/login", auth.HandleLogin)
@@ -110,6 +115,14 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 				r.Get("/questions", questions.ListBySite)
 				r.Get("/service-providers", svcProviders.List)
 				r.Get("/auth-endpoints", siteAuthEndpointsH.List)
+				r.Get("/secrets", siteSecretsH.List)
+				r.Get("/memory", siteMemoryH.List)
+				r.Get("/layouts", siteLayoutsH.List)
+				r.Get("/layouts/{layoutID}", siteLayoutsH.Get)
+				r.Get("/analytics/summary", siteAnalyticsH.Summary)
+				r.Get("/diagnostics/health", siteDiagH.Health)
+				r.Get("/diagnostics/integrity", siteDiagH.Integrity)
+				r.Get("/diagnostics/errors", siteDiagH.Errors)
 
 				// Admin-only — destructive site actions
 				r.Group(func(r chi.Router) {
@@ -134,6 +147,9 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 					r.Put("/pages/{pageID}", sitePagesH.Update)
 					r.Delete("/pages/{pageID}", sitePagesH.Delete)
 					r.Delete("/auth-endpoints/{endpointID}", siteAuthEndpointsH.Delete)
+					r.Delete("/secrets/{secretID}", siteSecretsH.Delete)
+					r.Delete("/memory/{memoryID}", siteMemoryH.Delete)
+					r.Delete("/layouts/{layoutID}", siteLayoutsH.Delete)
 					r.Post("/service-providers/{provID}/toggle", svcProviders.Toggle)
 					r.Delete("/service-providers/{provID}", svcProviders.Delete)
 				})

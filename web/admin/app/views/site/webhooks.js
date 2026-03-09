@@ -156,7 +156,7 @@ async function showWebhookDetail(siteId, wh) {
   -H "Content-Type: application/json" \\
   -H "X-Webhook-Signature: sha256=<hmac>" \\
   -d '{"event":"test"}' \\
-  https://your-domain/webhooks/${detail.name}`),
+  ${window.location.protocol}//${window.location.hostname}/webhooks/${detail.name}`),
       ]));
     }
   } catch (err) {

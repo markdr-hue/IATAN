@@ -10,6 +10,8 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,9 @@ var (
 		"manage_endpoints",
 		"manage_data",
 		"manage_secrets",
+		"manage_providers",
+		"manage_email",
+		"manage_payments",
 	}
 
 	buildPageTools = []string{
@@ -260,7 +265,8 @@ func (w *PipelineWorker) runDataLayer(ctx context.Context) (PipelineStage, error
 		return StageDataLayer, err
 	}
 
-	prompt := buildDataLayerPrompt(plan)
+	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+	prompt := buildDataLayerPrompt(plan, site)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: "Create the data tables, API endpoints, and seed data based on the plan."}}
 	w.saveChatMessageOnce(messages[0])
 
@@ -286,16 +292,10 @@ func (w *PipelineWorker) runDataLayer(ctx context.Context) (PipelineStage, error
 		}
 		w.logger.Warn("data layer fix-up needed", "attempt", fixAttempt+1, "issues", issues)
 
-		var fixMsg strings.Builder
-		fixMsg.WriteString("The data layer is ALMOST complete but these items are still missing:\n\n")
-		for _, issue := range issues {
-			fixMsg.WriteString("- " + issue + "\n")
-		}
-		fixMsg.WriteString("\nFix ONLY the missing items listed above. Do NOT recreate tables or endpoints that already exist.\n")
-		fixMsg.WriteString("For missing auth endpoints, use manage_endpoints(action=\"create_auth\") with the appropriate username_column and password_column.\n")
-		fixMessages := []llm.Message{{Role: llm.RoleUser, Content: fixMsg.String()}}
+		fixPrompt := buildDataLayerFixupPrompt(issues)
+		fixMessages := []llm.Message{{Role: llm.RoleUser, Content: "Fix the missing data layer items."}}
 
-		_, _, fixTokens, fixCalls, fixErr := w.runToolLoop(ctx, provider, modelID, prompt, fixMessages, toolDefs, 5, 4096)
+		_, _, fixTokens, fixCalls, fixErr := w.runToolLoop(ctx, provider, modelID, fixPrompt, fixMessages, toolDefs, 5, 4096)
 		totalTokens += fixTokens
 		toolCalls += fixCalls
 		if fixErr != nil {
@@ -326,15 +326,50 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 	// Pre-load shared read-only context ONCE (avoids redundant disk I/O).
 	layoutSummary := w.getLayoutSummary()
 	cssContent := w.getGlobalCSS()
+	cssClassMap := extractCSSClassMap(cssContent)
 
-	// Build pages concurrently with a worker pool.
+	// Load site description for content context.
+	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+	var siteDescription string
+	if site != nil && site.Description != nil {
+		siteDescription = *site.Description
+	}
+
+	// Build homepage first to establish tone, then build remaining pages concurrently.
+	// This lets us collect warnings and extract key content terms from the homepage.
+	var previousWarnings []string
+	var contentTerms []string
+	var remainingPages []PagePlan
+
+	for _, page := range plan.Pages {
+		if page.Path == "/" {
+			// Skip if already built (crash recovery).
+			var exists int
+			w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = '/' AND is_deleted = 0").Scan(&exists)
+			if exists > 0 {
+				w.logger.Info("homepage already exists, skipping", "path", "/")
+			} else {
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil); err != nil {
+					return StageBuildPages, err
+				}
+				w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
+			}
+			// Collect warnings and content terms from homepage for other pages.
+			previousWarnings = w.collectPageWarnings("/")
+			contentTerms = w.extractContentTerms("/", siteDescription)
+		} else {
+			remainingPages = append(remainingPages, page)
+		}
+	}
+
+	// Build remaining pages concurrently with a worker pool.
 	const maxParallel = 3
 	sem := make(chan struct{}, maxParallel)
 	var mu sync.Mutex
 	var firstErr error
 	var wg sync.WaitGroup
 
-	for _, page := range plan.Pages {
+	for _, page := range remainingPages {
 		if ctx.Err() != nil {
 			break
 		}
@@ -346,7 +381,6 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		}
 
 		// Skip already-built pages (crash recovery).
-		// Use writer pool for WAL visibility (pages written by parallel workers).
 		var exists int
 		w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
 		if exists > 0 {
@@ -360,7 +394,7 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 			defer wg.Done()
 			defer func() { <-sem }() // release slot
 
-			err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssContent)
+			err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, contentTerms, previousWarnings)
 			if err != nil {
 				w.logger.Error("page build failed", "path", page.Path, "error", err)
 				// If page was created despite the error, don't propagate.
@@ -388,7 +422,7 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 	return StageReview, nil
 }
 
-func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssContent string) error {
+func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription string, contentTerms, previousWarnings []string) error {
 	start := time.Now()
 	logID, _ := LogStageStart(w.siteDB, StageBuildPages)
 
@@ -412,17 +446,43 @@ func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, pa
 			} else {
 				entry.WriteString(fmt.Sprintf("Table: %s", tableName))
 			}
+			// Query API endpoint path + auth requirement.
 			var apiPath sql.NullString
-			w.siteDB.Writer().QueryRow("SELECT path FROM api_endpoints WHERE table_name = ?", tableName).Scan(&apiPath)
+			var requiresAuth bool
+			w.siteDB.Writer().QueryRow(
+				"SELECT path, requires_auth FROM api_endpoints WHERE table_name = ?", tableName,
+			).Scan(&apiPath, &requiresAuth)
 			if apiPath.Valid {
 				entry.WriteString(fmt.Sprintf("\nAPI endpoint: /api/%s", apiPath.String))
+				if requiresAuth {
+					entry.WriteString(" (REQUIRES AUTH — include Authorization header)")
+				}
 			}
 			parts = append(parts, entry.String())
 		}
 		tableSchema = strings.Join(parts, "\n\n")
+
+		// Find the auth endpoint (login/register path) for this site so the
+		// LLM knows how to obtain and use JWT tokens.
+		var authPath, usernameCol sql.NullString
+		w.siteDB.Writer().QueryRow("SELECT path, username_column FROM auth_endpoints LIMIT 1").Scan(&authPath, &usernameCol)
+		if authPath.Valid {
+			loginField := "username"
+			if usernameCol.Valid && usernameCol.String != "" {
+				loginField = usernameCol.String
+			}
+			tableSchema += fmt.Sprintf("\n\nAuth endpoint: POST /api/%s/login -> returns {\"token\": \"jwt...\"}", authPath.String)
+			tableSchema += fmt.Sprintf("\nRegister: POST /api/%s/register", authPath.String)
+			tableSchema += fmt.Sprintf("\nLogin/register JSON field: \"%s\" (use this exact key in the request body)", loginField)
+			tableSchema += fmt.Sprintf("\nExample body: {\"%s\": \"...\", \"password\": \"...\"}", loginField)
+			tableSchema += "\nUse: fetch(url, {headers: {'Authorization': 'Bearer ' + token}})"
+		}
 	}
 
-	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssContent, tableSchema, nil)
+	// List available SVG assets for page content.
+	svgAssets := w.getSVGAssetList()
+
+	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets, contentTerms, previousWarnings)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: fmt.Sprintf("Build the page: %s (%s)", page.Title, page.Path)}}
 	w.saveChatMessageOnce(messages[0])
 
@@ -461,7 +521,13 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			allPaths[i] = p.Path
 		}
 		layoutSummary := w.getLayoutSummary()
-		cssContent := w.getGlobalCSS()
+		cssClassMap := extractCSSClassMap(w.getGlobalCSS())
+
+		site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+		var siteDescription string
+		if site != nil && site.Description != nil {
+			siteDescription = *site.Description
+		}
 
 		for _, page := range plan.Pages {
 			var exists int
@@ -470,7 +536,7 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			if exists == 0 {
 				w.logger.Warn("review: rebuilding missing planned page", "path", page.Path)
 				w.publishBrainMessage(fmt.Sprintf("Rebuilding missing page: %s", page.Path))
-				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssContent); err != nil {
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil); err != nil {
 					w.logger.Error("review: failed to rebuild page", "path", page.Path, "error", err)
 				}
 			}
@@ -478,8 +544,9 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 	}
 
 	// Run Go-based validation (zero tokens).
-	// Use writer pool so we see all tool writes (read pool may lag in WAL mode).
-	issues := validateSite(w.siteDB.Writer())
+	// Use read pool — WAL mode provides immediate visibility of committed writes,
+	// and the read pool allows concurrent queries (writer pool deadlocks on nested queries).
+	issues := validateSite(w.siteDB.DB)
 	totalTokens := 0
 
 	if len(issues) > 0 {
@@ -488,19 +555,21 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 		// Try to fix issues with a targeted LLM call.
 		provider, modelID, err := w.getProvider()
 		if err == nil {
-			prompt := buildReviewPrompt(issues, w.siteDB.DB)
+			prompt := buildReviewPrompt(issues, w.siteDB.DB, plan)
 			messages := []llm.Message{{Role: llm.RoleUser, Content: "Fix the following issues:\n" + strings.Join(issues, "\n")}}
 			w.saveChatMessageOnce(messages[0])
 
 			// Give review access to page + layout + file tools for fixes.
 			toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(reviewTools))
 
-			_, _, tokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 10, 8192)
+			_, _, tokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 4, 8192)
 			totalTokens += tokens
 		}
 
+		w.publishBrainMessage("Review fix cycle complete, re-validating...")
+
 		// Re-validate after fixes.
-		remainingIssues := validateSite(w.siteDB.Writer())
+		remainingIssues := validateSite(w.siteDB.DB)
 		if len(remainingIssues) > 0 {
 			w.publishBrainMessage(fmt.Sprintf("Review: %d issues remain after fixes: %s", len(remainingIssues), strings.Join(remainingIssues, "; ")))
 		}
@@ -705,6 +774,96 @@ func (w *PipelineWorker) ownerName() string {
 	return name
 }
 
+// getSVGAssetList returns a formatted list of available SVG assets for page prompts.
+func (w *PipelineWorker) getSVGAssetList() string {
+	rows, err := w.siteDB.Writer().Query("SELECT filename FROM assets WHERE filename LIKE '%.svg'")
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var svgs []string
+	for rows.Next() {
+		var filename string
+		if rows.Scan(&filename) == nil {
+			svgs = append(svgs, "/assets/"+filename)
+		}
+	}
+	if len(svgs) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for _, svg := range svgs {
+		b.WriteString("- " + svg + "\n")
+	}
+	return b.String()
+}
+
+// headingContentRe extracts text content from h1 and h2 tags.
+var headingContentRe = regexp.MustCompile(`(?i)<h[12][^>]*>(.*?)</h[12]>`)
+// extractContentTerms reads a built page and extracts key terms (headings,
+// taglines) for content consistency across pages.
+func (w *PipelineWorker) extractContentTerms(pagePath, siteDescription string) []string {
+	var content sql.NullString
+	w.siteDB.Writer().QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", pagePath).Scan(&content)
+	if !content.Valid || content.String == "" {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var terms []string
+
+	// Extract headings (h1, h2) as key content terms.
+	for _, m := range headingContentRe.FindAllStringSubmatch(content.String, 5) {
+		if len(m) > 1 {
+			text := strings.TrimSpace(htmlTagStripRe.ReplaceAllString(m[1], ""))
+			if text != "" && len(text) > 2 && len(text) < 80 && !seen[text] {
+				seen[text] = true
+				terms = append(terms, text)
+			}
+		}
+	}
+
+	// Cap at 5 terms to avoid prompt bloat.
+	if len(terms) > 5 {
+		terms = terms[:5]
+	}
+
+	return terms
+}
+
+// collectPageWarnings reads a built page from DB and runs basic validation
+// to collect warnings that can be passed to subsequent page builds.
+func (w *PipelineWorker) collectPageWarnings(pagePath string) []string {
+	var content sql.NullString
+	w.siteDB.Writer().QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", pagePath).Scan(&content)
+	if !content.Valid || content.String == "" {
+		return nil
+	}
+
+	var warnings []string
+	lower := strings.ToLower(content.String)
+
+	if strings.Contains(lower, "<nav") {
+		warnings = append(warnings, "Do NOT include <nav> in pages — navigation belongs in the layout")
+	}
+	if strings.Contains(lower, "<footer") {
+		warnings = append(warnings, "Do NOT include <footer> in pages — footer belongs in the layout")
+	}
+	if strings.Contains(lower, "style=\"") {
+		warnings = append(warnings, "Do NOT use inline styles — use CSS classes from the global stylesheet")
+	}
+	if strings.Contains(lower, "<style>") || strings.Contains(lower, "<style ") {
+		warnings = append(warnings, "Do NOT include <style> blocks — add styles to the shared CSS file instead")
+	}
+	if strings.Contains(lower, `rel="stylesheet"`) && strings.Contains(lower, "/assets/") {
+		warnings = append(warnings, "Do NOT add <link> tags for shared CSS — they are auto-injected by the server")
+	}
+
+	return warnings
+}
+
 func (w *PipelineWorker) getLayoutSummary() string {
 	var before, after sql.NullString
 	w.siteDB.Writer().QueryRow("SELECT body_before_main, body_after_main FROM layouts WHERE name = 'default'").Scan(&before, &after)
@@ -743,30 +902,153 @@ func (w *PipelineWorker) getGlobalCSS() string {
 	return string(data)
 }
 
-// validatePageHTML runs basic HTML checks on page content. This is the
-// pipeline version of validatePageContent from tools/pages.go.
-func validatePageHTML(content string, db *sql.DB) []string {
-	var warnings []string
-	lower := strings.ToLower(content)
+// cssCustomPropRe matches CSS custom property declarations like --primary: #hex;
+var cssCustomPropRe = regexp.MustCompile(`(--[\w-]+)\s*:`)
 
-	if strings.Contains(lower, "<nav") {
-		warnings = append(warnings, "Page contains <nav> — belongs in layout")
-	}
-	if strings.Contains(lower, "<footer") {
-		warnings = append(warnings, "Page contains <footer> — belongs in layout")
-	}
-	if strings.Contains(lower, `rel="stylesheet"`) && strings.Contains(lower, "/assets/") {
-		warnings = append(warnings, "Page contains shared asset link tags — auto-injected by server")
-	}
-	if strings.Contains(lower, `<script`) && strings.Contains(lower, `src="`) && strings.Contains(lower, "/assets/") {
-		warnings = append(warnings, "Page contains shared script tags — auto-injected by server")
-	}
-	if strings.Contains(lower, "style=\"") {
-		warnings = append(warnings, "Page contains inline styles — use CSS classes")
-	}
+// cssRuleBlockRe matches a CSS selector and its declaration block.
+var cssRuleBlockRe = regexp.MustCompile(`\.([a-zA-Z_][\w-]*)\s*(?:,\s*\.[a-zA-Z_][\w-]*\s*)*\{([^}]*)\}`)
 
-	return warnings
+// signatureProps are CSS properties worth surfacing in the class signature.
+var signatureProps = map[string]bool{
+	"display": true, "flex-direction": true, "grid-template-columns": true,
+	"min-height": true, "max-width": true, "position": true,
+	"background": true, "background-color": true, "gap": true,
+	"padding": true, "text-align": true, "font-size": true,
 }
+
+// extractClassSignature returns a short parenthetical describing the class,
+// e.g. "(grid, 3col)" or "(flex, column)".
+func extractClassSignature(declarations string) string {
+	var parts []string
+	for _, line := range strings.Split(declarations, ";") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		prop := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+
+		if !signatureProps[prop] {
+			continue
+		}
+
+		switch prop {
+		case "display":
+			parts = append(parts, val)
+		case "grid-template-columns":
+			cols := strings.Count(val, "fr") + strings.Count(val, "auto") + strings.Count(val, "px")
+			if strings.Contains(val, "repeat") {
+				// Extract repeat count: repeat(3, 1fr) → 3col
+				if ri := strings.Index(val, "("); ri >= 0 {
+					if ci := strings.Index(val[ri+1:], ","); ci >= 0 {
+						parts = append(parts, strings.TrimSpace(val[ri+1:ri+1+ci])+"col")
+					}
+				}
+			} else if cols > 0 {
+				parts = append(parts, fmt.Sprintf("%dcol", cols))
+			}
+		case "flex-direction":
+			parts = append(parts, val)
+		case "min-height":
+			parts = append(parts, "min-h:"+val)
+		case "max-width":
+			parts = append(parts, "max-w:"+val)
+		case "position":
+			if val != "relative" { // only surface non-default
+				parts = append(parts, val)
+			}
+		case "background", "background-color":
+			if strings.Contains(val, "var(") {
+				// Extract custom property name.
+				if si := strings.Index(val, "--"); si >= 0 {
+					end := strings.IndexAny(val[si:], " ),")
+					if end < 0 {
+						end = len(val[si:])
+					}
+					parts = append(parts, "bg:"+val[si:si+end])
+				}
+			}
+		case "text-align":
+			parts = append(parts, "text:"+val)
+		}
+
+		if len(parts) >= 2 {
+			break // keep signatures short
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// extractCSSClassMap extracts class names with property signatures and custom
+// properties from CSS content. Returns a compact reference string (~70% smaller
+// than full CSS) that tells the LLM what each class does.
+func extractCSSClassMap(cssContent string) string {
+	if cssContent == "" {
+		return ""
+	}
+
+	// Extract class names with their declaration blocks for signatures.
+	classSignatures := make(map[string]string) // class → signature
+	for _, m := range cssRuleBlockRe.FindAllStringSubmatch(cssContent, -1) {
+		if len(m) > 2 {
+			cls := m[1]
+			if _, exists := classSignatures[cls]; !exists {
+				classSignatures[cls] = extractClassSignature(m[2])
+			}
+		}
+	}
+
+	// Also pick up classes from the existing selector regex that the rule block regex might miss
+	// (e.g. classes in complex selectors, pseudo-classes).
+	for _, m := range cssSelectorRe.FindAllStringSubmatch(cssContent, -1) {
+		if len(m) > 1 {
+			if _, exists := classSignatures[m[1]]; !exists {
+				classSignatures[m[1]] = ""
+			}
+		}
+	}
+
+	// Extract custom properties.
+	propSet := make(map[string]bool)
+	for _, m := range cssCustomPropRe.FindAllStringSubmatch(cssContent, -1) {
+		if len(m) > 1 {
+			propSet[m[1]] = true
+		}
+	}
+
+	var b strings.Builder
+	if len(classSignatures) > 0 {
+		classes := make([]string, 0, len(classSignatures))
+		for cls := range classSignatures {
+			classes = append(classes, cls)
+		}
+		sort.Strings(classes)
+		b.WriteString("Available CSS classes:\n")
+		for _, cls := range classes {
+			sig := classSignatures[cls]
+			b.WriteString("  " + cls + sig + "\n")
+		}
+	}
+	if len(propSet) > 0 {
+		props := make([]string, 0, len(propSet))
+		for prop := range propSet {
+			props = append(props, prop)
+		}
+		sort.Strings(props)
+		b.WriteString("Custom properties: ")
+		b.WriteString(strings.Join(props, ", "))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 
 // validateDesign checks that the DESIGN stage produced required artifacts.
 func validateDesign(db *sql.DB, plan *SitePlan) []string {
@@ -798,7 +1080,75 @@ func validateDesign(db *sql.DB, plan *SitePlan) []string {
 		}
 	}
 
+	// Check that all referenced custom layouts exist.
+	for _, page := range plan.Pages {
+		layout := page.Layout
+		if layout == "" || layout == "default" || layout == "none" {
+			continue
+		}
+		var layoutExists int
+		db.QueryRow("SELECT COUNT(*) FROM layouts WHERE name = ?", layout).Scan(&layoutExists)
+		if layoutExists == 0 {
+			issues = append(issues, fmt.Sprintf("Page %s references layout %q but it was not created", page.Path, layout))
+		}
+	}
+
+	// Design token enforcement: verify CSS custom properties match the plan's color scheme.
+	var storagePath sql.NullString
+	db.QueryRow("SELECT storage_path FROM assets WHERE scope = 'global' AND filename LIKE '%.css' ORDER BY filename LIMIT 1").Scan(&storagePath)
+	if storagePath.Valid && storagePath.String != "" {
+		cssData, err := os.ReadFile(storagePath.String)
+		if err == nil {
+			cssText := string(cssData)
+			issues = append(issues, validateDesignTokens(cssText, plan)...)
+		}
+	}
+
 	return issues
+}
+
+// cssCustomPropValueRe matches CSS custom property declarations with their values.
+var cssCustomPropValueRe = regexp.MustCompile(`(--[\w-]+)\s*:\s*([^;}\n]+)`)
+
+// validateDesignTokens checks that CSS custom properties match the plan's color scheme.
+func validateDesignTokens(cssContent string, plan *SitePlan) []string {
+	// Extract all custom property values from CSS.
+	propValues := make(map[string]string)
+	for _, m := range cssCustomPropValueRe.FindAllStringSubmatch(cssContent, -1) {
+		if len(m) > 2 {
+			propValues[m[1]] = strings.TrimSpace(m[2])
+		}
+	}
+
+	var issues []string
+	expected := map[string]string{
+		"--primary":   plan.ColorScheme.Primary,
+		"--secondary": plan.ColorScheme.Secondary,
+		"--accent":    plan.ColorScheme.Accent,
+		"--bg":        plan.ColorScheme.Background,
+		"--text":      plan.ColorScheme.Text,
+	}
+
+	for prop, expectedVal := range expected {
+		if expectedVal == "" {
+			continue
+		}
+		actual, exists := propValues[prop]
+		if !exists {
+			issues = append(issues, fmt.Sprintf("CSS missing custom property %s (expected %s from plan)", prop, expectedVal))
+			continue
+		}
+		if !colorsMatch(actual, expectedVal) {
+			issues = append(issues, fmt.Sprintf("CSS %s is %s but plan specifies %s", prop, actual, expectedVal))
+		}
+	}
+
+	return issues
+}
+
+// colorsMatch compares two CSS color values, normalizing hex case.
+func colorsMatch(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
 // validateDataLayer checks that all planned tables and endpoints exist.

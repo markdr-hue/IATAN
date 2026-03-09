@@ -122,7 +122,7 @@ function showDisclaimer(wrapper, onAccept) {
     h('div', { className: 'setup-actions' }, [
       h('button', {
         className: 'btn btn--ghost',
-        onClick: () => { window.location.href = 'https://google.com'; },
+        onClick: () => { window.location.reload(); },
       }, 'Decline'),
       acceptBtn,
     ]),

@@ -81,9 +81,5 @@ export function createChatInput(onSend) {
       textarea.value = '';
       autoResize();
     },
-    setValue(text) {
-      textarea.value = text;
-      autoResize();
-    },
   };
 }

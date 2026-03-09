@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,7 +24,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/markdr-hue/IATAN/db"
 	"github.com/markdr-hue/IATAN/db/models"
+	"github.com/markdr-hue/IATAN/events"
 	"github.com/markdr-hue/IATAN/security"
 	"github.com/markdr-hue/IATAN/server/middleware"
 )
@@ -52,15 +56,23 @@ func (h *Handler) SiteResolver(next http.Handler) http.Handler {
 			// as a fallback for single-site setups.
 			sites, listErr := models.ListActiveSites(h.deps.DB.DB)
 			if listErr != nil || len(sites) == 0 {
-				writePublicError(w, http.StatusNotFound, "site not found")
+				if wantsHTML(r) {
+					serveErrorPage(w, http.StatusNotFound, "Site Not Found", "There is no site configured for this domain.")
+				} else {
+					writePublicError(w, http.StatusNotFound, "site not found")
+				}
 				return
 			}
 			site = &sites[0]
 		}
 
-		// Block inactive sites — return 404 so disabled sites are hidden.
+		// Block inactive sites — serve a branded page for browsers, JSON for API clients.
 		if site.Status != "active" {
-			writePublicError(w, http.StatusNotFound, "site not found")
+			if wantsHTML(r) {
+				serveErrorPage(w, http.StatusNotFound, "Site Unavailable", "This site is currently unavailable. Please check back later.")
+			} else {
+				writePublicError(w, http.StatusNotFound, "site not found")
+			}
 			return
 		}
 
@@ -219,9 +231,7 @@ func (h *Handler) serve404(w http.ResponseWriter, site *models.Site) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusNotFound)
-	w.Write([]byte("<!DOCTYPE html><html><head><title>Page Not Found</title></head><body><h1>404 — Page Not Found</h1></body></html>"))
+	serveErrorPage(w, http.StatusNotFound, "Page Not Found", "The page you're looking for doesn't exist or has been moved.")
 }
 
 // layoutData holds a loaded layout from the layouts table.
@@ -1001,14 +1011,33 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Split into endpoint path and optional ID.
+	// Split into endpoint path and optional ID or sub-route.
 	// e.g. "contacts" → path="contacts", id=""
 	// e.g. "contacts/5" → path="contacts", id="5"
+	// e.g. "contacts/_stats" → path="contacts", handle stats
 	parts := strings.SplitN(fullPath, "/", 2)
 	endpointPath := parts[0]
 	var rowID string
 	if len(parts) > 1 {
 		rowID = parts[1]
+	}
+
+	// Handle /_stats aggregation route before regular CRUD.
+	if rowID == "_stats" && r.Method == http.MethodGet {
+		h.apiStats(w, r, siteDB.DB, endpointPath)
+		return
+	}
+
+	// Handle /upload file upload route.
+	if rowID == "upload" && r.Method == http.MethodPost {
+		h.apiUpload(w, r, site.ID, siteDB, endpointPath)
+		return
+	}
+
+	// Handle /stream SSE route.
+	if rowID == "stream" && r.Method == http.MethodGet {
+		h.apiStream(w, r, site.ID, siteDB.DB)
+		return
 	}
 
 	// Look up the endpoint config.
@@ -1044,19 +1073,19 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 			h.apiList(w, r, siteDB.DB, physTable, ep)
 		}
 	case http.MethodPost:
-		h.apiInsert(w, r, siteDB.Writer(), physTable, ep)
+		h.apiInsert(w, r, siteDB.Writer(), physTable, ep, site.ID, endpointPath)
 	case http.MethodPut:
 		if rowID == "" {
 			writePublicError(w, http.StatusBadRequest, "ID required for PUT")
 			return
 		}
-		h.apiUpdate(w, r, siteDB.Writer(), physTable, rowID, ep)
+		h.apiUpdate(w, r, siteDB.Writer(), physTable, rowID, ep, site.ID, endpointPath)
 	case http.MethodDelete:
 		if rowID == "" {
 			writePublicError(w, http.StatusBadRequest, "ID required for DELETE")
 			return
 		}
-		h.apiDelete(w, siteDB.Writer(), physTable, rowID, ep)
+		h.apiDelete(w, siteDB.Writer(), physTable, rowID, ep, site.ID, endpointPath)
 	default:
 		writePublicError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -1226,7 +1255,7 @@ func (h *Handler) apiGetOne(w http.ResponseWriter, r *http.Request, siteDB *sql.
 }
 
 // apiInsert handles POST /api/{path} — insert a row.
-func (h *Handler) apiInsert(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable string, ep *apiEndpoint) {
+func (h *Handler) apiInsert(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable string, ep *apiEndpoint, siteID int, endpointPath string) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writePublicError(w, http.StatusBadRequest, "invalid JSON body")
@@ -1275,6 +1304,14 @@ func (h *Handler) apiInsert(w http.ResponseWriter, r *http.Request, siteDB *sql.
 	}
 
 	id, _ := result.LastInsertId()
+
+	// Publish data.insert event for real-time streams.
+	if h.deps.Bus != nil {
+		h.deps.Bus.Publish(events.NewEvent(events.EventDataInsert, siteID, map[string]interface{}{
+			"table": endpointPath, "id": id,
+		}))
+	}
+
 	writePublicJSON(w, http.StatusCreated, map[string]interface{}{
 		"id":      id,
 		"success": true,
@@ -1282,7 +1319,7 @@ func (h *Handler) apiInsert(w http.ResponseWriter, r *http.Request, siteDB *sql.
 }
 
 // apiUpdate handles PUT /api/{path}/{id} — update a row.
-func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
+func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint, siteID int, endpointPath string) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writePublicError(w, http.StatusBadRequest, "invalid JSON body")
@@ -1334,11 +1371,18 @@ func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.
 		return
 	}
 
+	// Publish data.update event for real-time streams.
+	if h.deps.Bus != nil {
+		h.deps.Bus.Publish(events.NewEvent(events.EventDataUpdate, siteID, map[string]interface{}{
+			"table": endpointPath, "id": rowID,
+		}))
+	}
+
 	writePublicJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
 // apiDelete handles DELETE /api/{path}/{id} — delete a row.
-func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
+func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint, siteID int, endpointPath string) {
 	query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", physTable)
 	result, err := siteDB.Exec(query, rowID)
 	if err != nil {
@@ -1350,6 +1394,13 @@ func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, ro
 	if n == 0 {
 		writePublicError(w, http.StatusNotFound, "not found")
 		return
+	}
+
+	// Publish data.delete event for real-time streams.
+	if h.deps.Bus != nil {
+		h.deps.Bus.Publish(events.NewEvent(events.EventDataDelete, siteID, map[string]interface{}{
+			"table": endpointPath, "id": rowID,
+		}))
 	}
 
 	writePublicJSON(w, http.StatusOK, map[string]interface{}{"success": true})
@@ -1432,6 +1483,438 @@ func processPublicSecureValue(kind string, value interface{}, enc *security.Encr
 }
 
 // ---------------------------------------------------------------------------
+// File Upload handler
+// ---------------------------------------------------------------------------
+
+type uploadEndpointConfig struct {
+	Path         string
+	AllowedTypes []string
+	MaxSizeMB    int
+	RequiresAuth bool
+	TableName    string
+}
+
+func (h *Handler) loadUploadEndpoint(siteDB *sql.DB, path string) (*uploadEndpointConfig, error) {
+	var ue uploadEndpointConfig
+	var allowedTypesJSON string
+	var tableName sql.NullString
+	err := siteDB.QueryRow(
+		"SELECT path, allowed_types, max_size_mb, requires_auth, table_name FROM upload_endpoints WHERE path = ?",
+		path,
+	).Scan(&ue.Path, &allowedTypesJSON, &ue.MaxSizeMB, &ue.RequiresAuth, &tableName)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(allowedTypesJSON), &ue.AllowedTypes)
+	if ue.MaxSizeMB == 0 {
+		ue.MaxSizeMB = 5
+	}
+	ue.TableName = tableName.String
+	return &ue, nil
+}
+
+// mimeTypeMatches checks if a content type matches a glob pattern (e.g. "image/*").
+func mimeTypeMatches(contentType string, pattern string) bool {
+	if pattern == "*/*" || pattern == "*" {
+		return true
+	}
+	// Try exact match first.
+	if strings.EqualFold(contentType, pattern) {
+		return true
+	}
+	// Glob match: "image/*" matches "image/png".
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := pattern[:len(pattern)-1] // "image/"
+		return strings.HasPrefix(strings.ToLower(contentType), strings.ToLower(prefix))
+	}
+	return false
+}
+
+// apiUpload handles POST /api/{path}/upload — multipart file uploads.
+func (h *Handler) apiUpload(w http.ResponseWriter, r *http.Request, siteID int, siteDB *db.SiteDB, endpointPath string) {
+	ue, err := h.loadUploadEndpoint(siteDB.DB, endpointPath)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "upload endpoint not found")
+		return
+	}
+
+	// Check auth if required.
+	if ue.RequiresAuth {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !h.validateSiteToken(siteID, token) {
+			writePublicError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+
+	// Parse multipart form (limit to max_size_mb + some overhead).
+	maxBytes := int64(ue.MaxSizeMB) * 1024 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+1024) // small overhead for form fields
+	if err := r.ParseMultipartForm(maxBytes); err != nil {
+		writePublicError(w, http.StatusBadRequest, fmt.Sprintf("file too large (max %d MB)", ue.MaxSizeMB))
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writePublicError(w, http.StatusBadRequest, "file field is required (use multipart form with field name 'file')")
+		return
+	}
+	defer file.Close()
+
+	// Validate content type.
+	ct := header.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	typeAllowed := false
+	for _, pattern := range ue.AllowedTypes {
+		if mimeTypeMatches(ct, pattern) {
+			typeAllowed = true
+			break
+		}
+	}
+	if !typeAllowed {
+		writePublicError(w, http.StatusBadRequest, fmt.Sprintf("file type %q not allowed", ct))
+		return
+	}
+
+	// Read file data.
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil || int64(len(data)) > maxBytes {
+		writePublicError(w, http.StatusBadRequest, fmt.Sprintf("file too large (max %d MB)", ue.MaxSizeMB))
+		return
+	}
+
+	// Generate unique filename.
+	ext := filepath.Ext(header.Filename)
+	if ext == "" {
+		// Try to get extension from content type.
+		exts, _ := mime.ExtensionsByType(ct)
+		if len(exts) > 0 {
+			ext = exts[0]
+		}
+	}
+	uniqueName := fmt.Sprintf("%d_%s%s", time.Now().UnixNano(), strings.TrimSuffix(filepath.Base(header.Filename), ext), ext)
+	storageName := "uploads/" + uniqueName
+
+	// Write to disk.
+	dir := filepath.Join("data", "sites", fmt.Sprintf("%d", siteID), "files", "uploads")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		writePublicError(w, http.StatusInternalServerError, "storage error")
+		return
+	}
+	storagePath := filepath.Join(dir, uniqueName)
+	if err := os.WriteFile(storagePath, data, 0o644); err != nil {
+		writePublicError(w, http.StatusInternalServerError, "storage error")
+		return
+	}
+
+	// Insert metadata into files table.
+	_, err = siteDB.Writer().Exec(
+		`INSERT INTO files (filename, content_type, size, storage_path) VALUES (?, ?, ?, ?)`,
+		storageName, ct, len(data), storagePath,
+	)
+	if err != nil {
+		slog.Error("upload: failed to insert file metadata", "error", err)
+	}
+
+	// If linked to a table, also insert a row there.
+	fileURL := "/files/" + storageName
+	if ue.TableName != "" {
+		siteDB.Writer().Exec(
+			fmt.Sprintf("INSERT INTO %s (filename, url, content_type, size) VALUES (?, ?, ?, ?)", ue.TableName),
+			header.Filename, fileURL, ct, len(data),
+		)
+	}
+
+	writePublicJSON(w, http.StatusCreated, map[string]interface{}{
+		"url":      fileURL,
+		"filename": header.Filename,
+		"size":     len(data),
+		"type":     ct,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// SSE Stream handler
+// ---------------------------------------------------------------------------
+
+type streamEndpointConfig struct {
+	Path         string
+	EventTypes   []string
+	RequiresAuth bool
+}
+
+func (h *Handler) loadStreamEndpoint(siteDB *sql.DB, path string) (*streamEndpointConfig, error) {
+	var se streamEndpointConfig
+	var eventTypesJSON string
+	err := siteDB.QueryRow(
+		"SELECT path, event_types, requires_auth FROM stream_endpoints WHERE path = ?",
+		path,
+	).Scan(&se.Path, &eventTypesJSON, &se.RequiresAuth)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(eventTypesJSON), &se.EventTypes)
+	return &se, nil
+}
+
+// apiStream handles GET /api/{path}/stream — SSE for real-time data changes.
+func (h *Handler) apiStream(w http.ResponseWriter, r *http.Request, siteID int, siteDB *sql.DB) {
+	// Extract the endpoint path from the URL.
+	fullPath := strings.TrimPrefix(r.URL.Path, "/api/")
+	parts := strings.SplitN(fullPath, "/", 2)
+	endpointPath := parts[0]
+
+	se, err := h.loadStreamEndpoint(siteDB, endpointPath)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "stream endpoint not found")
+		return
+	}
+
+	// Check auth if required.
+	if se.RequiresAuth {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" {
+			// Also check query param for EventSource (which can't set headers).
+			token = r.URL.Query().Get("token")
+		}
+		if !h.validateSiteToken(siteID, token) {
+			writePublicError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writePublicError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	// Disable write deadline for this long-lived SSE connection.
+	rc := http.NewResponseController(w)
+	rc.SetWriteDeadline(time.Time{})
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// Build a set of allowed event types for fast lookup.
+	allowedTypes := make(map[events.EventType]bool)
+	for _, et := range se.EventTypes {
+		allowedTypes[events.EventType(et)] = true
+	}
+
+	eventCh := make(chan events.Event, 64)
+	subID := h.deps.Bus.SubscribeAll(func(e events.Event) {
+		// Filter by site and event type.
+		if e.SiteID != siteID {
+			return
+		}
+		if !allowedTypes[e.Type] {
+			return
+		}
+		select {
+		case eventCh <- e:
+		default:
+			// Drop event if channel full.
+		}
+	})
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			h.deps.Bus.Unsubscribe(subID)
+			return
+		case e := <-eventCh:
+			data, err := json.Marshal(e.Payload)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data)
+			flusher.Flush()
+		case <-ticker.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation (/_stats) handler
+// ---------------------------------------------------------------------------
+
+// allowedAggFuncsPublic is the whitelist of aggregate functions for the public API.
+var allowedAggFuncsPublic = map[string]bool{
+	"count": true, "sum": true, "avg": true, "min": true, "max": true,
+}
+
+// apiStats handles GET /api/{path}/_stats — aggregation queries.
+// Query params: fn (required), column (required for sum/avg/min/max), group_by (comma-separated).
+// Also supports same column=value filters as apiList.
+func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, endpointPath string) {
+	// Look up the endpoint to get table name and auth requirements.
+	ep, err := h.loadEndpoint(siteDB, endpointPath)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+
+	// Check auth if required.
+	if ep.RequiresAuth {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !h.validateSiteToken(getSite(r).ID, token) {
+			writePublicError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+
+	q := r.URL.Query()
+	fn := strings.ToLower(strings.TrimSpace(q.Get("fn")))
+	if !allowedAggFuncsPublic[fn] {
+		writePublicError(w, http.StatusBadRequest, "fn is required: count, sum, avg, min, or max")
+		return
+	}
+
+	col := q.Get("column")
+	if fn != "count" && col == "" {
+		writePublicError(w, http.StatusBadRequest, fn+" requires a column parameter")
+		return
+	}
+	if col != "" {
+		if err := security.ValidateColumnName(col); err != nil {
+			writePublicError(w, http.StatusBadRequest, "invalid column name")
+			return
+		}
+		// Don't allow aggregation on secure columns.
+		if kind, ok := ep.SecureCols[col]; ok && kind == "hash" {
+			writePublicError(w, http.StatusBadRequest, "cannot aggregate on secure columns")
+			return
+		}
+	}
+
+	// Build aggregate expression.
+	aggExpr := "COUNT(*)"
+	if fn != "count" {
+		aggExpr = fmt.Sprintf("%s(%s)", strings.ToUpper(fn), col)
+	} else if col != "" {
+		aggExpr = fmt.Sprintf("COUNT(%s)", col)
+	}
+
+	// Parse group_by (comma-separated).
+	var groupCols []string
+	if gb := q.Get("group_by"); gb != "" {
+		for _, gc := range strings.Split(gb, ",") {
+			gc = strings.TrimSpace(gc)
+			if gc == "" {
+				continue
+			}
+			if err := security.ValidateColumnName(gc); err != nil {
+				writePublicError(w, http.StatusBadRequest, "invalid group_by column: "+gc)
+				return
+			}
+			if kind, ok := ep.SecureCols[gc]; ok && kind == "hash" {
+				writePublicError(w, http.StatusBadRequest, "cannot group by secure columns")
+				return
+			}
+			groupCols = append(groupCols, gc)
+		}
+	}
+
+	// Build SELECT.
+	physTable := ep.TableName
+	var selectParts []string
+	for _, gc := range groupCols {
+		selectParts = append(selectParts, gc)
+	}
+	selectParts = append(selectParts, aggExpr+" AS result")
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), physTable)
+
+	// Build WHERE from query params (same logic as apiList).
+	var whereClauses []string
+	var whereArgs []interface{}
+	statsReserved := map[string]bool{"fn": true, "column": true, "group_by": true}
+	for key, vals := range q {
+		if reservedParams[key] || statsReserved[key] || len(vals) == 0 {
+			continue
+		}
+		if err := security.ValidateColumnName(key); err != nil {
+			continue
+		}
+		if kind, ok := ep.SecureCols[key]; ok && kind == "hash" {
+			continue
+		}
+		whereClauses = append(whereClauses, key+" = ?")
+		whereArgs = append(whereArgs, vals[0])
+	}
+	if len(whereClauses) > 0 {
+		query += " WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	if len(groupCols) > 0 {
+		query += " GROUP BY " + strings.Join(groupCols, ", ")
+		query += " ORDER BY " + strings.Join(groupCols, ", ")
+	}
+
+	// Execute.
+	if len(groupCols) == 0 {
+		var result float64
+		err := siteDB.QueryRow(query, whereArgs...).Scan(&result)
+		if err != nil {
+			writePublicError(w, http.StatusInternalServerError, "aggregation query failed")
+			return
+		}
+		writePublicJSON(w, http.StatusOK, map[string]interface{}{
+			"function": fn,
+			"result":   result,
+		})
+		return
+	}
+
+	// Grouped results.
+	rows, err := siteDB.Query(query, whereArgs...)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "aggregation query failed")
+		return
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		scanTargets := make([]interface{}, len(groupCols)+1)
+		values := make([]interface{}, len(groupCols)+1)
+		for i := range scanTargets {
+			scanTargets[i] = &values[i]
+		}
+		if err := rows.Scan(scanTargets...); err != nil {
+			continue
+		}
+		row := make(map[string]interface{})
+		for i, gc := range groupCols {
+			if b, ok := values[i].([]byte); ok {
+				row[gc] = string(b)
+			} else {
+				row[gc] = values[i]
+			}
+		}
+		row["result"] = values[len(groupCols)]
+		results = append(results, row)
+	}
+
+	writePublicJSON(w, http.StatusOK, map[string]interface{}{
+		"function": fn,
+		"data":     results,
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1445,4 +1928,42 @@ func writePublicJSON(w http.ResponseWriter, status int, v interface{}) {
 // writePublicError writes a JSON error response.
 func writePublicError(w http.ResponseWriter, status int, msg string) {
 	writePublicJSON(w, status, map[string]string{"error": msg})
+}
+
+// wantsHTML returns true if the Accept header prefers HTML over JSON.
+func wantsHTML(r *http.Request) bool {
+	accept := r.Header.Get("Accept")
+	return strings.Contains(accept, "text/html")
+}
+
+// serveErrorPage writes a branded HTML error page with inline dark-themed styling.
+func serveErrorPage(w http.ResponseWriter, status int, title, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;
+  background:#0f1117;color:#e1e2e6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  text-align:center;padding:2rem}
+.code{font-size:6rem;font-weight:700;color:#c0562a;line-height:1}
+.title{font-size:1.5rem;margin:.75rem 0 .5rem;color:#fff}
+.message{font-size:1rem;color:#9ca3af;max-width:28rem;line-height:1.6}
+footer{position:fixed;bottom:0;width:100%%;padding:1.25rem;color:#6b7280;font-size:.8rem}
+footer a{color:#c0562a;text-decoration:none}
+footer a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="code">%d</div>
+<div class="title">%s</div>
+<div class="message">%s</div>
+<footer>Powered by <a href="https://github.com/markdr-hue/IATAN" target="_blank" rel="noopener">IATAN</a></footer>
+</body>
+</html>`, html.EscapeString(title), status, html.EscapeString(title), html.EscapeString(message))
 }

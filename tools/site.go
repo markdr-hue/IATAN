@@ -115,12 +115,6 @@ func (t *SiteTool) setMode(ctx *ToolContext, args map[string]interface{}) (*Resu
 		return &Result{Success: false, Error: "site not found"}, nil
 	}
 
-	if mode == "building" {
-		if _, err := ctx.GlobalDB.Exec("UPDATE sites SET tick_count = 0 WHERE id = ?", ctx.SiteID); err != nil {
-			return nil, fmt.Errorf("resetting tick count: %w", err)
-		}
-	}
-
 	return &Result{Success: true, Data: map[string]interface{}{
 		"site_id": ctx.SiteID,
 		"mode":    mode,

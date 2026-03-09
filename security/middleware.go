@@ -31,6 +31,9 @@ func (j *JWTManager) Authenticator(next http.Handler) http.Handler {
 		} else if cookie, err := r.Cookie(AuthCookieName); err == nil && cookie.Value != "" {
 			tokenString = cookie.Value
 		} else if qToken := r.URL.Query().Get("token"); qToken != "" {
+			// Query-param tokens are only intended for SSE/EventSource which
+			// cannot set custom headers. Browsers log query strings in history
+			// and referrer headers, so avoid using this for non-SSE requests.
 			tokenString = qToken
 		} else {
 			http.Error(w, `{"error":"missing authorization"}`, http.StatusUnauthorized)

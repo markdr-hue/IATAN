@@ -31,7 +31,7 @@ export function renderLaunching(container, setupData) {
   });
 
   const title = setupData.displayName
-    ? `Hang tight, ${setupData.displayName}`
+    ? `Hang tight ${setupData.displayName}`
     : 'Setting things up';
 
   const content = h('div', {}, [
@@ -83,6 +83,7 @@ export function renderLaunching(container, setupData) {
 
     try {
       // Step 1: Create admin account + optional provider
+      errorStep = 0;
       markActive(0);
       await delay(500);
 
@@ -104,6 +105,7 @@ export function renderLaunching(container, setupData) {
       markDone(0);
 
       // Step 2: Provider
+      errorStep = 1;
       markActive(1);
       await delay(600);
       if (setupData.providerId) {
@@ -113,6 +115,7 @@ export function renderLaunching(container, setupData) {
       }
 
       // Step 3: Create site
+      errorStep = 2;
       markActive(2);
       await delay(400);
 
@@ -129,6 +132,7 @@ export function renderLaunching(container, setupData) {
         markDone(2);
 
         // Step 4: Start brain
+        errorStep = 3;
         markActive(3);
         try {
           await authPost(`/admin/api/brain/${site.id}/start`, {});
@@ -143,6 +147,7 @@ export function renderLaunching(container, setupData) {
       }
 
       // Step 5: Ready
+      errorStep = 4;
       markActive(4);
       await delay(400);
       markDone(4);
@@ -152,8 +157,7 @@ export function renderLaunching(container, setupData) {
       window.location.hash = createdSiteId ? `#/sites/${createdSiteId}/home` : '#/dashboard';
       window.location.reload();
     } catch (err) {
-      if (errorStep >= 0) markError(errorStep);
-      else markError(0);
+      markError(errorStep >= 0 ? errorStep : 0);
       toast.error('Setup failed: ' + err.message);
     }
   }

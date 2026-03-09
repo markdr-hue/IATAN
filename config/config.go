@@ -50,7 +50,7 @@ func Load() (*Config, error) {
 	applyEnvOverrides(cfg)
 
 	// Ensure data directory exists
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
 		return nil, fmt.Errorf("creating data dir: %w", err)
 	}
 

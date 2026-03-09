@@ -543,7 +543,7 @@ type DataTool struct{}
 
 func (t *DataTool) Name() string { return "manage_data" }
 func (t *DataTool) Description() string {
-	return "Manage dynamic table data. Actions: query (select rows), insert (single row via 'data' or bulk via 'rows' array), update (by id), delete (by id), count. PASSWORD columns are auto-hashed, ENCRYPTED columns are auto-encrypted."
+	return "Manage dynamic table data. Actions: query (select rows), insert (single row via 'data' or bulk via 'rows' array), update (by id), delete (by id), count, aggregate (sum/avg/min/max with optional group_by). PASSWORD columns are auto-hashed, ENCRYPTED columns are auto-encrypted."
 }
 func (t *DataTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -551,7 +551,7 @@ func (t *DataTool) Parameters() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"action": map[string]interface{}{
 				"type":        "string",
-				"enum":        []string{"query", "insert", "update", "delete", "count"},
+				"enum":        []string{"query", "insert", "update", "delete", "count", "aggregate"},
 				"description": "Data operation to perform",
 			},
 			"table_name": map[string]interface{}{
@@ -589,6 +589,20 @@ func (t *DataTool) Parameters() map[string]interface{} {
 				"items":       map[string]interface{}{"type": "object"},
 			},
 			"id": map[string]interface{}{"type": "number", "description": "Row ID for update/delete"},
+			"function": map[string]interface{}{
+				"type":        "string",
+				"enum":        []string{"count", "sum", "avg", "min", "max"},
+				"description": "Aggregate function for 'aggregate' action",
+			},
+			"column": map[string]interface{}{
+				"type":        "string",
+				"description": "Column to aggregate (required for sum/avg/min/max, optional for count)",
+			},
+			"group_by": map[string]interface{}{
+				"type":        "array",
+				"items":       map[string]interface{}{"type": "string"},
+				"description": "Columns to group by for aggregate action",
+			},
 		},
 		"required": []string{"action", "table_name"},
 	}
@@ -620,8 +634,10 @@ func (t *DataTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Resu
 		return t.del(ctx, args)
 	case "count":
 		return t.count(ctx, args)
+	case "aggregate":
+		return t.aggregate(ctx, args)
 	default:
-		return &Result{Success: false, Error: "invalid action: must be query, insert, update, delete, or count"}, nil
+		return &Result{Success: false, Error: "invalid action: must be query, insert, update, delete, count, or aggregate"}, nil
 	}
 }
 
@@ -954,5 +970,130 @@ func (t *DataTool) count(ctx *ToolContext, args map[string]interface{}) (*Result
 	return &Result{Success: true, Data: map[string]interface{}{
 		"table": tableName,
 		"count": count,
+	}}, nil
+}
+
+// allowedAggFuncs is the whitelist of SQL aggregate functions.
+var allowedAggFuncs = map[string]bool{
+	"count": true, "sum": true, "avg": true, "min": true, "max": true,
+}
+
+func (t *DataTool) aggregate(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	tableName, _ := args["table_name"].(string)
+	if tableName == "" {
+		return &Result{Success: false, Error: "table_name is required"}, nil
+	}
+
+	physicalName, err := sanitizedTableName(tableName)
+	if err != nil {
+		return &Result{Success: false, Error: err.Error()}, nil
+	}
+
+	fn, _ := args["function"].(string)
+	fn = strings.ToLower(strings.TrimSpace(fn))
+	if !allowedAggFuncs[fn] {
+		return &Result{Success: false, Error: "function is required: count, sum, avg, min, or max"}, nil
+	}
+
+	col, _ := args["column"].(string)
+	if fn != "count" && col == "" {
+		return &Result{Success: false, Error: fmt.Sprintf("%s requires a column parameter", fn)}, nil
+	}
+	if col != "" && !validColumnName.MatchString(col) {
+		return &Result{Success: false, Error: fmt.Sprintf("invalid column name: %s", col)}, nil
+	}
+
+	// Build aggregate expression.
+	aggExpr := "COUNT(*)"
+	if fn != "count" {
+		aggExpr = fmt.Sprintf("%s(%s)", strings.ToUpper(fn), col)
+	} else if col != "" {
+		aggExpr = fmt.Sprintf("COUNT(%s)", col)
+	}
+
+	// Parse group_by columns.
+	var groupCols []string
+	if groupByRaw, ok := args["group_by"].([]interface{}); ok {
+		for _, g := range groupByRaw {
+			gc, _ := g.(string)
+			if gc == "" || !validColumnName.MatchString(gc) {
+				return &Result{Success: false, Error: fmt.Sprintf("invalid group_by column: %v", g)}, nil
+			}
+			groupCols = append(groupCols, gc)
+		}
+	}
+
+	// Build query.
+	var selectParts []string
+	for _, gc := range groupCols {
+		selectParts = append(selectParts, gc)
+	}
+	selectParts = append(selectParts, aggExpr+" AS result")
+
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), physicalName)
+	var queryParams []interface{}
+
+	// Apply filters.
+	if filtersRaw, ok := args["filters"].([]interface{}); ok && len(filtersRaw) > 0 {
+		whereClause, params, err := buildWhereClause(filtersRaw)
+		if err != nil {
+			return &Result{Success: false, Error: err.Error()}, nil
+		}
+		query += whereClause
+		queryParams = params
+	}
+
+	if len(groupCols) > 0 {
+		query += " GROUP BY " + strings.Join(groupCols, ", ")
+		query += " ORDER BY " + strings.Join(groupCols, ", ")
+	}
+
+	// Execute.
+	if len(groupCols) == 0 {
+		// Single result (no grouping).
+		var result float64
+		err := ctx.DB.QueryRow(query, queryParams...).Scan(&result)
+		if err != nil {
+			return nil, fmt.Errorf("aggregate query: %w", err)
+		}
+		return &Result{Success: true, Data: map[string]interface{}{
+			"table":    tableName,
+			"function": fn,
+			"result":   result,
+		}}, nil
+	}
+
+	// Grouped results.
+	rows, err := ctx.DB.Query(query, queryParams...)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate query: %w", err)
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		// Build scan targets: one per group_by column + the result.
+		scanTargets := make([]interface{}, len(groupCols)+1)
+		values := make([]interface{}, len(groupCols)+1)
+		for i := range scanTargets {
+			scanTargets[i] = &values[i]
+		}
+
+		if err := rows.Scan(scanTargets...); err != nil {
+			continue
+		}
+
+		row := make(map[string]interface{})
+		for i, gc := range groupCols {
+			row[gc] = values[i]
+		}
+		row["result"] = values[len(groupCols)]
+		results = append(results, row)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"table":    tableName,
+		"function": fn,
+		"data":     results,
 	}}, nil
 }

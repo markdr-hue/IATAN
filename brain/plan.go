@@ -54,6 +54,7 @@ type PagePlan struct {
 	NeedsData  bool     `json:"needs_data"`
 	DataTables []string `json:"data_tables,omitempty"`
 	PageAssets []string `json:"page_assets,omitempty"`
+	Layout     string   `json:"layout,omitempty"` // layout name: "default", "none", "blog", etc.
 }
 
 type ColumnDef struct {

@@ -26,6 +26,7 @@ const (
 	monitoringMaxDefault  = 15 * time.Minute
 	idleThreshold         = 3
 	maxGlobalErrors       = 5
+	maxStageRetries       = 3
 	llmTimeout            = 5 * time.Minute
 )
 
@@ -144,6 +145,7 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 
 	// Execute stages sequentially from current stage.
 	stage := state.Stage
+	stageRetries := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -182,6 +184,15 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 		if stageErr != nil {
 			w.logger.Error("stage failed", "stage", stage, "error", stageErr)
 			errCount, _ := IncrementErrorCount(w.siteDB, stageErr.Error())
+			stageRetries++
+
+			if stageRetries >= maxStageRetries {
+				PausePipeline(w.siteDB, fmt.Sprintf("stage %s failed %d times", stage, stageRetries))
+				w.publishBrainError(fmt.Sprintf("Pipeline paused: stage **%s** failed %d consecutive times. Last error: %v", stage, stageRetries, stageErr))
+				w.setState(StatePaused)
+				w.runPausedLoop(ctx)
+				return
+			}
 
 			if errCount >= maxGlobalErrors {
 				PausePipeline(w.siteDB, fmt.Sprintf("too many errors (%d)", errCount))
@@ -220,6 +231,7 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 		// Reset error count on success.
 		w.siteDB.ExecWrite("UPDATE pipeline_state SET error_count = 0 WHERE id = 1")
 		stage = nextStage
+		stageRetries = 0
 	}
 }
 
@@ -601,7 +613,7 @@ func (w *PipelineWorker) handleChatWake(ctx context.Context, userMessage string)
 	}
 
 	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
-	prompt := buildChatWakePrompt(site, w.siteDB.DB)
+	prompt := buildChatWakePrompt(site, w.siteDB.DB, userMessage)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
 	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(chatWakeTools))
 

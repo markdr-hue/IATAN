@@ -20,6 +20,24 @@ It works out of the box (fingers crossed :).
 
 To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the brain creates and maintains this as we speak.
 
+## Capabilities
+
+- **Autonomous site/app building** : Describe what you want, the AI plans, designs, codes, and deploys it
+- **Dynamic REST APIs** : Auto-generated CRUD endpoints with filtering, sorting, and pagination
+- **User authentication** : JWT-based auth flows with role support, built by the AI on demand
+- **File uploads** : Public upload endpoints with MIME type validation, size limits, and metadata tracking
+- **Real-time updates (SSE)** : Live data streaming to the browser via Server-Sent Events
+- **Email sending** : Provider-agnostic email with template support (SendGrid, Mailgun, Resend, SES, or any REST API)
+- **Payment flows** : Generic checkout integration (Stripe, PayPal, Mollie, Square, or any provider)
+- **Aggregation queries** : COUNT, SUM, AVG, MIN, MAX with GROUP BY through the public API
+- **Webhooks** : Incoming and outgoing, 20+ event types, HMAC signature verification
+- **Scheduled tasks** : Cron-based automation the AI sets up and manages itself
+- **Service providers** : Connect any external API with stored credentials and automatic auth injection
+- **Encrypted secrets** : AES-256-GCM storage for API keys and sensitive credentials
+- **Multi-site/app** : Run unlimited sites from a single instance, each with its own database
+- **Free HTTPS** : Embedded Caddy with automatic Let's Encrypt certificates
+- **Self-healing monitoring** : Adaptive health checks that detect and fix issues autonomously
+
 ## Simple Setup
 
 ![Get Going in No Time!](docs/demo.gif)
@@ -27,16 +45,16 @@ To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the bra
 ## Testimonials
 
 > "I showed my grandma IATAN. She asked me what a website is. I said 'just click.' She now has 86 websites and a newsletter with 200,000 subscribers. She thinks she's emailing her friends."
-> — Marcus, grandson
+> : Marcus, grandson
 
 > "My cat walked across my keyboard and clicked IATAN. He now has 12 websites, a SaaS platform, and investor meetings on Tuesday."
-> — Lisa, cat owner / now cat employee
+> : Lisa, cat owner / now cat employee
 
 > "My husband spent 2 years building his startup. I clicked IATAN once and built a better version in front of him. We are now divorced. I got the website."
-> — Angela, winner
+> : Angela, winner
 
 > "I used IATAN for my daughter's lemonade stand website. She now has a multinational beverage distribution platform across 40 countries. She's 9. I need a lawyer."
-> — Sandra, lemonade mom
+> : Sandra, lemonade mom
 
 
 
@@ -52,7 +70,7 @@ chmod +x ./iatan && ./iatan
 .\iatan.exe
 ```
 
-Open `http://localhost:5001` — the setup wizard handles the rest in about 2 minutes.
+Open `http://localhost:5001` : the setup wizard handles the rest in about 2 minutes.
 
 Your site is served at `http://localhost:5000`.
 
@@ -62,7 +80,7 @@ Your site is served at `http://localhost:5000`.
 
 Grab the latest release:
 
-- **[IATAN_VX.X.X.zip](https://github.com/markdr-hue/IATAN/releases)** — contains `iatan.exe`, `config.json`, and `firstrun.json`
+- **[IATAN_VX.X.X.zip](https://github.com/markdr-hue/IATAN/releases)** : contains `iatan.exe`, `config.json`, and `firstrun.json`
 
 Unzip somewhere convenient, run `iatan.exe`, open `http://localhost:5001`.
 
@@ -71,24 +89,24 @@ Unzip somewhere convenient, run `iatan.exe`, open `http://localhost:5001`.
 ## Features
 
 **Core**
-- **Single binary** — Web server, database, reverse proxy, admin panel, all in one
-- **Zero config** — Works out of the box with sane defaults
-- **Multi-site** — Run "unlimited" sites from a single instance
-- **Self-hosted** — Your data stays on your machine, always
+- **Single binary** : Web server, database, reverse proxy, admin panel, all in one
+- **Zero config** : Works out of the box with sane defaults
+- **Multi-site** : Run "unlimited" sites from a single instance
+- **Self-hosted** : Your data stays on your machine, always
 
 **AI**
-- **Pipeline brain** — Deterministic build stages, not random guessing loops
-- **5 providers** — Anthropic Claude, OpenAI, Google Gemini, Ollama (local/free), Z.ai
-- **16 unified tools** — Pages, files, schemas, APIs, webhooks, secrets, scheduling, analytics, and more
-- **Streaming chat** — Talk to the brain in real time, ask questions, give directions
+- **Pipeline brain** : Deterministic build stages, not random guessing loops
+- **5 providers** : Anthropic Claude, OpenAI, Google Gemini, Ollama (local/free), Z.ai
+- **18 unified tools** : Pages, files, schemas, APIs, webhooks, secrets, email, payments, scheduling, analytics, and more
+- **Streaming chat** : Talk to the brain in real time, ask questions, give directions
 
 **Infrastructure**
-- **Free HTTPS** — Embedded [Caddy](https://caddyserver.com) + [Let's Encrypt](https://letsencrypt.org), zero effort
-- **Per-site databases** — Each site gets its own SQLite DB, managed automatically
-- **Dynamic APIs** — AI creates REST endpoints, auth flows, and database tables on the fly
-- **Webhooks** — Incoming and outgoing, 20+ event types
-- **Scheduled tasks** — Cron-based automation the AI can set up itself
-- **Encrypted secrets** — AES-256-GCM storage for API keys and credentials
+- **Free HTTPS** : Embedded [Caddy](https://caddyserver.com) + [Let's Encrypt](https://letsencrypt.org), zero effort
+- **Per-site databases** : Each site gets its own SQLite DB, managed automatically
+- **Dynamic APIs** : AI creates REST endpoints, auth flows, and database tables on the fly
+- **Webhooks** : Incoming and outgoing, 20+ event types
+- **Scheduled tasks** : Cron-based automation the AI can set up itself
+- **Encrypted secrets** : AES-256-GCM storage for API keys and credentials
 
 ---
 
@@ -206,15 +224,15 @@ make build-all      # Cross-compile everything
                   Visitors
 ```
 
-- **Admin** (`:5001`) — Manage sites, chat with the brain, view logs and analytics
-- **Public** (`:5000`) — Your generated sites, served to visitors
-- **Brain** — One goroutine per site, channel-based commands, crash recovery
-- **Database** — Main DB + per-site DBs
+- **Admin** (`:5001`) : Manage sites, chat with the brain, view logs and analytics
+- **Public** (`:5000`) : Your generated sites, served to visitors
+- **Brain** : One goroutine per site, channel-based commands, crash recovery
+- **Database** : Main DB + per-site DBs
 ---
 
 ## Requirements
 
-- An LLM API key (Anthropic, Google, z-AI or whatever you like) — or [Ollama](https://ollama.com) for fully local/free operations
+- An LLM API key (Anthropic, Google, z-AI or whatever you like) : or [Ollama](https://ollama.com) for fully local/free operations
 - That's it
 
 ---
@@ -243,7 +261,7 @@ Then access admin remotely through an SSH tunnel:
 ssh -L 5001:localhost:5001 user@yourserver
 ```
 
-Open `http://localhost:5001` on your local machine — the traffic is encrypted through SSH and the port stays closed to the outside world.
+Open `http://localhost:5001` on your local machine : the traffic is encrypted through SSH and the port stays closed to the outside world.
 
 ---
 
@@ -267,7 +285,7 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 ```
 
-Also check your hosting provider's control panel — many VPS providers have a separate firewall/security group that needs ports 80 and 443 allowed.
+Also check your hosting provider's control panel : many VPS providers have a separate firewall/security group that needs ports 80 and 443 allowed.
 
 Once the ports are open, restart IATAN and Caddy will automatically retry and get the certificate.
 
@@ -286,8 +304,8 @@ Once the ports are open, restart IATAN and Caddy will automatically retry and ge
 
 ## Community
 
-- **Discord** — [Join the server](https://discord.gg/VRdYgDQ2qr)
-- **X / Twitter** — [@GO_IATAN](https://x.com/GO_IATAN)
+- **Discord** : [Join the server](https://discord.gg/VRdYgDQ2qr)
+- **X / Twitter** : [@GO_IATAN](https://x.com/GO_IATAN)
 
 ---
 

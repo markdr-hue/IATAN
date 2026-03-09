@@ -85,6 +85,7 @@ export function createSidebar() {
       const siteLinks = [
         { id: 'home', icon: 'home', label: 'Home' },
         { id: 'pages', icon: 'file-text', label: 'Pages' },
+        { id: 'layouts', icon: 'layers', label: 'Layouts' },
         { id: 'assets', icon: 'image', label: 'Assets' },
         { id: 'tables', icon: 'database', label: 'Tables' },
         { id: 'endpoints', icon: 'zap', label: 'Endpoints' },
@@ -92,7 +93,11 @@ export function createSidebar() {
         { id: 'webhooks', icon: 'link', label: 'Webhooks' },
         { id: 'tasks', icon: 'clock', label: 'Tasks' },
         { id: 'questions', icon: 'help-circle', label: 'Questions' },
+        { id: 'memory', icon: 'brain', label: 'Memory' },
+        { id: 'secrets', icon: 'lock', label: 'Secrets' },
         { id: 'providers', icon: 'shield', label: 'Service Providers' },
+        { id: 'analytics', icon: 'bar-chart', label: 'Analytics' },
+        { id: 'diagnostics', icon: 'activity', label: 'Diagnostics' },
         { id: 'logs', icon: 'file-text', label: 'Logs' },
         { id: 'settings', icon: 'settings', label: 'Settings' },
       ];

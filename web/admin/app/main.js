@@ -273,10 +273,6 @@ function connectSSE() {
     });
   });
 
-  sse.on('brain.tick', (data) => {
-    state.set('brainTick', { site_id: data.site_id, ...(data.payload || {}) });
-  });
-
   sse.connect('/admin/api/events/stream');
 }
 

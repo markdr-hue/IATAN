@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -33,6 +34,11 @@ func validateSite(db *sql.DB) []string {
 	issues = append(issues, validateStructure(db)...)
 	issues = append(issues, validateEssentialPages(db)...)
 	issues = append(issues, validateCSSAlignment(db)...)
+	issues = append(issues, validateEndpoints(db)...)
+	issues = append(issues, validateHeadings(db)...)
+	issues = append(issues, validateContentLength(db)...)
+	issues = append(issues, validateMetadata(db)...)
+	issues = append(issues, validateSections(db)...)
 
 	return issues
 }
@@ -291,16 +297,24 @@ func validateCSSAlignment(db *sql.DB) []string {
 			continue
 		}
 
+		// Common utility/state classes toggled by JS — don't need CSS definitions.
+		skipClasses := map[string]bool{
+			"active": true, "hidden": true, "open": true, "closed": true,
+			"disabled": true, "loading": true, "error": true, "selected": true,
+			"visible": true, "collapsed": true, "expanded": true, "show": true,
+			"fade-in": true, "fade-out": true,
+		}
+
 		// Find classes used in HTML that aren't in CSS.
 		var undefined []string
 		for cls := range pageClasses {
-			if !cssClasses[cls] {
+			if !cssClasses[cls] && !skipClasses[cls] {
 				undefined = append(undefined, cls)
 			}
 		}
 
-		// Report if >40% of classes are undefined (allows some semantic/utility classes).
-		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.4 {
+		// Report if >60% of classes are undefined (allows some semantic/utility classes).
+		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.6 {
 			// Limit to 5 example classes to keep issue text compact.
 			examples := undefined
 			if len(examples) > 5 {
@@ -310,6 +324,239 @@ func validateCSSAlignment(db *sql.DB) []string {
 				"Page %s uses %d CSS classes not defined in stylesheet (e.g. %s) — update HTML to use classes from the global CSS",
 				path, len(undefined), strings.Join(examples, ", "),
 			))
+		}
+	}
+
+	return issues
+}
+
+// validateEndpoints checks that API endpoints reference tables that still exist.
+func validateEndpoints(db *sql.DB) []string {
+	var issues []string
+
+	rows, err := db.Query("SELECT path, table_name FROM api_endpoints")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path, tableName string
+		if rows.Scan(&path, &tableName) != nil {
+			continue
+		}
+		var exists int
+		db.QueryRow("SELECT COUNT(*) FROM dynamic_tables WHERE table_name = ?", tableName).Scan(&exists)
+		if exists == 0 {
+			issues = append(issues, fmt.Sprintf("API endpoint /%s references table %q which no longer exists", path, tableName))
+		}
+	}
+
+	// Also check auth endpoints.
+	authRows, err := db.Query("SELECT path, table_name FROM auth_endpoints")
+	if err != nil {
+		return issues
+	}
+	defer authRows.Close()
+
+	for authRows.Next() {
+		var path, tableName string
+		if authRows.Scan(&path, &tableName) != nil {
+			continue
+		}
+		var exists int
+		db.QueryRow("SELECT COUNT(*) FROM dynamic_tables WHERE table_name = ?", tableName).Scan(&exists)
+		if exists == 0 {
+			issues = append(issues, fmt.Sprintf("Auth endpoint /%s references table %q which no longer exists", path, tableName))
+		}
+	}
+
+	return issues
+}
+
+// Heading tag regex for hierarchy validation.
+var headingTagRe = regexp.MustCompile(`(?i)<h([1-6])[\s>]`)
+
+// validateHeadings checks heading hierarchy in page content.
+// The layout typically provides h1, so we only flag multiple h1s and skipped levels.
+func validateHeadings(db *sql.DB) []string {
+	var issues []string
+
+	// Check if the layout already provides an h1.
+	var layoutHTML sql.NullString
+	db.QueryRow("SELECT body_before_main FROM layouts WHERE name = 'default'").Scan(&layoutHTML)
+	layoutHasH1 := layoutHTML.Valid && headingTagRe.MatchString(layoutHTML.String) &&
+		strings.Contains(strings.ToLower(layoutHTML.String), "<h1")
+
+	rows, err := db.Query("SELECT path, content FROM pages WHERE is_deleted = 0 AND content IS NOT NULL")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path, content string
+		if rows.Scan(&path, &content) != nil {
+			continue
+		}
+
+		clean := stripScripts(content)
+		matches := headingTagRe.FindAllStringSubmatch(clean, -1)
+		if len(matches) == 0 {
+			continue
+		}
+
+		h1Count := 0
+		var levels []int
+		for _, m := range matches {
+			level, _ := strconv.Atoi(m[1])
+			levels = append(levels, level)
+			if level == 1 {
+				h1Count++
+			}
+		}
+
+		// Only flag multiple h1s. Missing h1 is OK if layout provides one.
+		if h1Count > 1 {
+			issues = append(issues, fmt.Sprintf("Page %s has %d <h1> headings (should have exactly one)", path, h1Count))
+		} else if h1Count == 0 && !layoutHasH1 {
+			issues = append(issues, fmt.Sprintf("Page %s has no <h1> heading", path))
+		}
+
+		// Check for skipped levels (e.g. h2 → h4 without h3).
+		seen := make(map[int]bool)
+		for _, l := range levels {
+			seen[l] = true
+		}
+		minLevel := levels[0]
+		maxLevel := levels[0]
+		for _, l := range levels {
+			if l < minLevel {
+				minLevel = l
+			}
+			if l > maxLevel {
+				maxLevel = l
+			}
+		}
+		for l := minLevel + 1; l <= maxLevel; l++ {
+			if !seen[l] {
+				issues = append(issues, fmt.Sprintf("Page %s skips heading level h%d (has h%d and h%d)", path, l, l-1, l+1))
+				break
+			}
+		}
+	}
+
+	return issues
+}
+
+// htmlTagStripRe strips HTML tags for plain text extraction.
+var htmlTagStripRe = regexp.MustCompile(`<[^>]*>`)
+
+// validateContentLength warns about pages with very little visible text content.
+func validateContentLength(db *sql.DB) []string {
+	var issues []string
+
+	rows, err := db.Query("SELECT path, content FROM pages WHERE is_deleted = 0 AND content IS NOT NULL")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path, content string
+		if rows.Scan(&path, &content) != nil {
+			continue
+		}
+
+		// Skip pages that are intentionally short.
+		if path == "/404" || path == "/contact" || path == "/login" || path == "/register" {
+			continue
+		}
+
+		// Strip scripts, then all HTML tags, then collapse whitespace.
+		text := stripScripts(content)
+		text = htmlTagStripRe.ReplaceAllString(text, " ")
+		text = strings.Join(strings.Fields(text), " ")
+
+		if len(text) < 100 {
+			issues = append(issues, fmt.Sprintf("Page %s has very little content (%d chars of visible text)", path, len(text)))
+		}
+	}
+
+	return issues
+}
+
+// validateMetadata checks that pages have valid meta descriptions.
+// Only flags descriptions that exist but have wrong length. Missing descriptions
+// are common during initial build and would create too many issues.
+func validateMetadata(db *sql.DB) []string {
+	var issues []string
+
+	rows, err := db.Query("SELECT path, metadata FROM pages WHERE is_deleted = 0 AND metadata IS NOT NULL AND metadata != '' AND metadata != '{}'")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path, metadataJSON string
+		if rows.Scan(&path, &metadataJSON) != nil {
+			continue
+		}
+
+		var meta map[string]interface{}
+		if json.Unmarshal([]byte(metadataJSON), &meta) != nil {
+			continue
+		}
+
+		desc, _ := meta["description"].(string)
+		desc = strings.TrimSpace(desc)
+		if len(desc) > 0 && len(desc) < 50 {
+			issues = append(issues, fmt.Sprintf("Page %s meta description is too short (%d chars, recommend 50-160)", path, len(desc)))
+		} else if len(desc) > 160 {
+			issues = append(issues, fmt.Sprintf("Page %s meta description is too long (%d chars, recommend 50-160)", path, len(desc)))
+		}
+	}
+
+	return issues
+}
+
+// sectionTagRe matches <section> tags in HTML content.
+var sectionTagRe = regexp.MustCompile(`(?i)<section[\s>]`)
+
+// validateSections checks that pages contain roughly the number of sections
+// planned in the SitePlan. Loads the plan from pipeline_state.
+func validateSections(db *sql.DB) []string {
+	var planJSON sql.NullString
+	db.QueryRow("SELECT plan_json FROM pipeline_state WHERE id = 1").Scan(&planJSON)
+	if !planJSON.Valid || planJSON.String == "" {
+		return nil
+	}
+
+	var plan SitePlan
+	if json.Unmarshal([]byte(planJSON.String), &plan) != nil {
+		return nil
+	}
+
+	var issues []string
+	for _, pagePlan := range plan.Pages {
+		if len(pagePlan.Sections) < 2 {
+			continue // too few planned sections to validate meaningfully
+		}
+
+		var content sql.NullString
+		db.QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", pagePlan.Path).Scan(&content)
+		if !content.Valid || content.String == "" {
+			continue
+		}
+
+		sectionCount := len(sectionTagRe.FindAllString(content.String, -1))
+		planned := len(pagePlan.Sections)
+
+		// Allow flexibility: warn only if significantly fewer sections than planned.
+		if sectionCount < planned-1 {
+			issues = append(issues, fmt.Sprintf("Page %s has %d sections but %d were planned (%s)",
+				pagePlan.Path, sectionCount, planned, strings.Join(pagePlan.Sections, ", ")))
 		}
 	}
 
