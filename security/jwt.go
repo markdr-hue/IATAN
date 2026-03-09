@@ -6,6 +6,8 @@
 package security
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"time"
@@ -79,6 +81,13 @@ func ClearAuthCookie(w http.ResponseWriter) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
+}
+
+// HMAC computes HMAC-SHA256 of data using the JWT secret. Used for OAuth state signing.
+func (j *JWTManager) HMAC(data []byte) []byte {
+	mac := hmac.New(sha256.New, j.secret)
+	mac.Write(data)
+	return mac.Sum(nil)
 }
 
 func (j *JWTManager) Validate(tokenString string) (*Claims, error) {

@@ -364,7 +364,7 @@ func (t *EmailTool) saveTemplate(ctx *ToolContext, args map[string]interface{}) 
 	}}, nil
 }
 
-func (t *EmailTool) listTemplates(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *EmailTool) listTemplates(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	t.ensureTables(ctx.DB)
 
 	rows, err := ctx.DB.Query("SELECT name, subject, created_at FROM email_templates ORDER BY name")

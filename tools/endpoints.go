@@ -21,17 +21,21 @@ import (
 // ---------------------------------------------------------------------------
 
 // EndpointsTool consolidates API endpoint and auth endpoint management into a
-// single tool with ten actions: create_api, list_api, delete_api,
-// create_auth, list_auth, delete_auth, create_upload, create_stream, verify_password, test.
+// single tool with actions: create_api, list_api, delete_api,
+// create_auth, list_auth, delete_auth, create_upload, create_stream,
+// create_websocket, verify_password, test, create_oauth, list_oauth, delete_oauth.
 type EndpointsTool struct{}
 
 func (t *EndpointsTool) Name() string { return "manage_endpoints" }
 func (t *EndpointsTool) Description() string {
-	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, verify_password, test. " +
+	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, create_websocket, verify_password, test, create_oauth, list_oauth, delete_oauth. " +
 		"API endpoints serve CRUD at /api/{path}. Auth endpoints create /register, /login, /me routes using JWT. " +
+		"OAuth endpoints add social login via /api/{auth_path}/oauth/{provider} with automatic callback handling. " +
 		"Upload endpoints accept multipart file uploads at /api/{path}/upload. " +
-		"Stream endpoints provide real-time SSE at /api/{path}/stream for live data updates. " +
-		"Use 'test' with a path to verify an endpoint works and see sample data."
+		"Stream endpoints provide real-time SSE at /api/{path}/stream for live data updates (server→client). " +
+		"WebSocket endpoints provide bidirectional real-time communication at /api/{path}/ws (chat, collaboration). " +
+		"Use 'test' with a path to verify an endpoint works and see sample data. " +
+		"API endpoints support required_role for RBAC (e.g. required_role='admin'). Auth endpoints support default_role for new registrations."
 }
 
 func (t *EndpointsTool) Parameters() map[string]interface{} {
@@ -41,7 +45,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"action": map[string]interface{}{
 				"type":        "string",
 				"description": "Action to perform",
-				"enum":        []string{"create_api", "list_api", "delete_api", "create_auth", "list_auth", "delete_auth", "create_upload", "create_stream", "verify_password", "test"},
+				"enum":        []string{"create_api", "list_api", "delete_api", "create_auth", "list_auth", "delete_auth", "create_upload", "create_stream", "create_websocket", "verify_password", "test", "create_oauth", "list_oauth", "delete_oauth"},
 			},
 			"path": map[string]interface{}{
 				"type":        "string",
@@ -99,6 +103,66 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 				"type":        "string",
 				"description": "Plaintext password to verify. Required for verify_password.",
 			},
+			"required_role": map[string]interface{}{
+				"type":        "string",
+				"description": "Role required to access API endpoint (e.g. 'admin'). Implies requires_auth=true. Only for create_api.",
+			},
+			"default_role": map[string]interface{}{
+				"type":        "string",
+				"description": "Default role assigned to new users on registration (default: 'user'). Only for create_auth.",
+			},
+			"role_column": map[string]interface{}{
+				"type":        "string",
+				"description": "Column in user table storing the role (default: 'role'). Only for create_auth.",
+			},
+			"provider_name": map[string]interface{}{
+				"type":        "string",
+				"description": "OAuth provider identifier (e.g. 'google', 'github'). For create_oauth, delete_oauth.",
+			},
+			"display_name": map[string]interface{}{
+				"type":        "string",
+				"description": "Display name for OAuth button (e.g. 'Google'). For create_oauth.",
+			},
+			"client_id": map[string]interface{}{
+				"type":        "string",
+				"description": "OAuth client ID. For create_oauth.",
+			},
+			"client_secret": map[string]interface{}{
+				"type":        "string",
+				"description": "OAuth client secret (will be encrypted and stored). For create_oauth.",
+			},
+			"authorize_url": map[string]interface{}{
+				"type":        "string",
+				"description": "OAuth authorization endpoint URL. For create_oauth.",
+			},
+			"token_url": map[string]interface{}{
+				"type":        "string",
+				"description": "OAuth token exchange endpoint URL. For create_oauth.",
+			},
+			"userinfo_url": map[string]interface{}{
+				"type":        "string",
+				"description": "OAuth user info endpoint URL. For create_oauth.",
+			},
+			"scopes": map[string]interface{}{
+				"type":        "string",
+				"description": "Space-separated OAuth scopes (default: 'openid email profile'). For create_oauth.",
+			},
+			"username_field": map[string]interface{}{
+				"type":        "string",
+				"description": "Field from OAuth user info to use as username (default: 'email'). For create_oauth.",
+			},
+			"auth_path": map[string]interface{}{
+				"type":        "string",
+				"description": "Auth endpoint path this OAuth links to (must already exist). For create_oauth.",
+			},
+			"receive_event_type": map[string]interface{}{
+				"type":        "string",
+				"description": "Event type published when a client sends a WebSocket message (default: 'ws.message'). Only for create_websocket.",
+			},
+			"write_to_table": map[string]interface{}{
+				"type":        "string",
+				"description": "Table to auto-insert incoming WebSocket messages into (optional). Only for create_websocket.",
+			},
 		},
 		"required": []string{"action"},
 	}
@@ -108,10 +172,25 @@ func (t *EndpointsTool) Execute(ctx *ToolContext, args map[string]interface{}) (
 	action, errResult := RequireAction(args)
 	if errResult != nil {
 		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasPassword := args["password_column"]; hasPassword {
+		// Check most-specific params first to avoid ambiguity.
+		if _, has := args["password"]; has {
+			action = "verify_password"
+		} else if _, has := args["password_column"]; has {
 			action = "create_auth"
-		} else if _, hasTable := args["table_name"]; hasTable {
+		} else if _, has := args["allowed_types"]; has {
+			action = "create_upload"
+		} else if _, has := args["receive_event_type"]; has {
+			action = "create_websocket"
+		} else if _, has := args["write_to_table"]; has {
+			action = "create_websocket"
+		} else if _, has := args["event_types"]; has {
+			action = "create_stream"
+		} else if _, has := args["provider_name"]; has {
+			action = "create_oauth"
+		} else if _, has := args["table_name"]; has {
 			action = "create_api"
+		} else if _, has := args["path"]; has {
+			action = "test"
 		} else {
 			action = "list_api"
 		}
@@ -134,12 +213,20 @@ func (t *EndpointsTool) Execute(ctx *ToolContext, args map[string]interface{}) (
 		return t.createUpload(ctx, args)
 	case "create_stream":
 		return t.createStream(ctx, args)
+	case "create_websocket":
+		return t.createWebSocket(ctx, args)
 	case "verify_password":
 		return t.verifyPassword(ctx, args)
 	case "test":
 		return t.testEndpoint(ctx, args)
+	case "create_oauth":
+		return t.createOAuth(ctx, args)
+	case "list_oauth":
+		return t.listOAuth(ctx, args)
+	case "delete_oauth":
+		return t.deleteOAuth(ctx, args)
 	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, verify_password, test)", action)}, nil
+		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, create_websocket, verify_password, test, create_oauth, list_oauth, delete_oauth)", action)}, nil
 	}
 }
 
@@ -195,36 +282,48 @@ func (t *EndpointsTool) createAPI(ctx *ToolContext, args map[string]interface{})
 		requiresAuth = ra
 	}
 
+	// Role-based access control: if required_role is set, implies requires_auth.
+	var requiredRole *string
+	if rr, ok := args["required_role"].(string); ok && rr != "" {
+		requiredRole = &rr
+		requiresAuth = true
+	}
+
 	rateLimit := 60
 	if rl, ok := args["rate_limit"].(float64); ok && rl > 0 {
 		rateLimit = int(rl)
 	}
 
 	_, err = ctx.DB.Exec(
-		`INSERT INTO api_endpoints (path, table_name, methods, public_columns, requires_auth, rate_limit)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO api_endpoints (path, table_name, methods, public_columns, requires_auth, required_role, rate_limit)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   table_name = excluded.table_name,
 		   methods = excluded.methods,
 		   public_columns = excluded.public_columns,
 		   requires_auth = excluded.requires_auth,
+		   required_role = excluded.required_role,
 		   rate_limit = excluded.rate_limit`,
-		path, tableName, string(methodsJSON), publicColsJSON, requiresAuth, rateLimit,
+		path, tableName, string(methodsJSON), publicColsJSON, requiresAuth, requiredRole, rateLimit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating API endpoint: %w", err)
 	}
 
-	return &Result{Success: true, Data: map[string]interface{}{
+	data := map[string]interface{}{
 		"path":          path,
 		"table_name":    tableName,
 		"methods":       methods,
 		"requires_auth": requiresAuth,
 		"rate_limit":    rateLimit,
-	}}, nil
+	}
+	if requiredRole != nil {
+		data["required_role"] = *requiredRole
+	}
+	return &Result{Success: true, Data: data}, nil
 }
 
-func (t *EndpointsTool) listAPI(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *EndpointsTool) listAPI(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT id, path, table_name, methods, public_columns, requires_auth, rate_limit, created_at FROM api_endpoints ORDER BY path",
 	)
@@ -332,16 +431,31 @@ func (t *EndpointsTool) createAuth(ctx *ToolContext, args map[string]interface{}
 		publicColumnsJSON = string(data)
 	}
 
+	// RBAC: default role and role column.
+	defaultRole := "user"
+	if dr, ok := args["default_role"].(string); ok && dr != "" {
+		defaultRole = dr
+	}
+	roleColumn := "role"
+	if rc, ok := args["role_column"].(string); ok && rc != "" {
+		if !validColumnName.MatchString(rc) {
+			return &Result{Success: false, Error: fmt.Sprintf("invalid role_column name: %s", rc)}, nil
+		}
+		roleColumn = rc
+	}
+
 	// Insert into auth_endpoints table.
 	result, err := ctx.DB.Exec(
-		`INSERT INTO auth_endpoints (table_name, path, username_column, password_column, public_columns)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO auth_endpoints (table_name, path, username_column, password_column, public_columns, default_role, role_column)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   table_name = excluded.table_name,
 		   username_column = excluded.username_column,
 		   password_column = excluded.password_column,
-		   public_columns = excluded.public_columns`,
-		tableName, path, usernameCol, passwordCol, publicColumnsJSON,
+		   public_columns = excluded.public_columns,
+		   default_role = excluded.default_role,
+		   role_column = excluded.role_column`,
+		tableName, path, usernameCol, passwordCol, publicColumnsJSON, defaultRole, roleColumn,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating auth endpoint: %w", err)
@@ -359,10 +473,12 @@ func (t *EndpointsTool) createAuth(ctx *ToolContext, args map[string]interface{}
 		"table":           tableName,
 		"username_column": usernameCol,
 		"password_column": passwordCol,
+		"default_role":    defaultRole,
+		"role_column":     roleColumn,
 	}}, nil
 }
 
-func (t *EndpointsTool) listAuth(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *EndpointsTool) listAuth(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT id, path, table_name, username_column, password_column, public_columns, created_at FROM auth_endpoints ORDER BY path",
 	)
@@ -596,6 +712,85 @@ func (t *EndpointsTool) createStream(ctx *ToolContext, args map[string]interface
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket endpoint action
+// ---------------------------------------------------------------------------
+
+func (t *EndpointsTool) createWebSocket(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return &Result{Success: false, Error: "path is required"}, nil
+	}
+
+	// Parse event_types (default: all data events).
+	eventTypes := []string{"data.insert", "data.update", "data.delete"}
+	if typesRaw, ok := args["event_types"].([]interface{}); ok && len(typesRaw) > 0 {
+		eventTypes = nil
+		for _, et := range typesRaw {
+			if ets, ok := et.(string); ok {
+				eventTypes = append(eventTypes, ets)
+			}
+		}
+	}
+	eventTypesJSON, _ := json.Marshal(eventTypes)
+
+	receiveEventType := "ws.message"
+	if ret, ok := args["receive_event_type"].(string); ok && ret != "" {
+		receiveEventType = ret
+	}
+
+	writeToTable := ""
+	if wtt, ok := args["write_to_table"].(string); ok && wtt != "" {
+		if !validColumnName.MatchString(wtt) {
+			return &Result{Success: false, Error: fmt.Sprintf("invalid write_to_table name: %s", wtt)}, nil
+		}
+		writeToTable = wtt
+	}
+
+	requiresAuth := false
+	if ra, ok := args["requires_auth"].(bool); ok {
+		requiresAuth = ra
+	}
+
+	// Ensure ws_endpoints table exists.
+	ctx.DB.Exec(`CREATE TABLE IF NOT EXISTS ws_endpoints (
+		id INTEGER PRIMARY KEY,
+		path TEXT UNIQUE NOT NULL,
+		event_types TEXT,
+		receive_event_type TEXT DEFAULT 'ws.message',
+		write_to_table TEXT DEFAULT '',
+		requires_auth BOOLEAN DEFAULT 0,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`)
+
+	_, err := ctx.DB.Exec(
+		`INSERT INTO ws_endpoints (path, event_types, receive_event_type, write_to_table, requires_auth)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(path) DO UPDATE SET
+		   event_types = excluded.event_types,
+		   receive_event_type = excluded.receive_event_type,
+		   write_to_table = excluded.write_to_table,
+		   requires_auth = excluded.requires_auth`,
+		path, string(eventTypesJSON), receiveEventType, writeToTable, requiresAuth,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating websocket endpoint: %w", err)
+	}
+
+	result := map[string]interface{}{
+		"path":               path,
+		"route":              fmt.Sprintf("GET /api/%s/ws", path),
+		"event_types":        eventTypes,
+		"receive_event_type": receiveEventType,
+		"requires_auth":      requiresAuth,
+		"usage":              "const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/" + path + "/ws'); ws.onmessage = (e) => { const data = JSON.parse(e.data); ... }; ws.send(JSON.stringify({content: 'hello'}));",
+	}
+	if writeToTable != "" {
+		result["write_to_table"] = writeToTable
+	}
+	return &Result{Success: true, Data: result}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Test action
 // ---------------------------------------------------------------------------
 
@@ -646,4 +841,143 @@ func (t *EndpointsTool) testEndpoint(ctx *ToolContext, args map[string]interface
 	}
 
 	return &Result{Success: true, Data: result}, nil
+}
+
+// ---------------------------------------------------------------------------
+// OAuth endpoint actions
+// ---------------------------------------------------------------------------
+
+func (t *EndpointsTool) createOAuth(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	providerName, _ := args["provider_name"].(string)
+	displayName, _ := args["display_name"].(string)
+	clientID, _ := args["client_id"].(string)
+	clientSecret, _ := args["client_secret"].(string)
+	authorizeURL, _ := args["authorize_url"].(string)
+	tokenURL, _ := args["token_url"].(string)
+	userinfoURL, _ := args["userinfo_url"].(string)
+	authPath, _ := args["auth_path"].(string)
+
+	if providerName == "" || clientID == "" || clientSecret == "" || authorizeURL == "" || tokenURL == "" || userinfoURL == "" || authPath == "" {
+		return &Result{Success: false, Error: "provider_name, client_id, client_secret, authorize_url, token_url, userinfo_url, and auth_path are required"}, nil
+	}
+	if displayName == "" {
+		displayName = providerName
+	}
+
+	scopes := "openid email profile"
+	if s, ok := args["scopes"].(string); ok && s != "" {
+		scopes = s
+	}
+	usernameField := "email"
+	if uf, ok := args["username_field"].(string); ok && uf != "" {
+		usernameField = uf
+	}
+
+	// Verify the auth endpoint exists.
+	var authExists int
+	ctx.DB.QueryRow("SELECT COUNT(*) FROM auth_endpoints WHERE path = ?", authPath).Scan(&authExists)
+	if authExists == 0 {
+		return &Result{Success: false, Error: fmt.Sprintf("auth endpoint '%s' does not exist — create it first with create_auth", authPath)}, nil
+	}
+
+	// Encrypt and store the client secret.
+	secretName := "oauth_" + providerName + "_secret"
+	if ctx.Encryptor == nil {
+		return &Result{Success: false, Error: "encryption not available"}, nil
+	}
+	encrypted, err := ctx.Encryptor.Encrypt(clientSecret)
+	if err != nil {
+		return &Result{Success: false, Error: "failed to encrypt client secret"}, nil
+	}
+	ctx.DB.Exec(
+		`INSERT INTO secrets (name, value_encrypted) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value_encrypted = excluded.value_encrypted, updated_at = CURRENT_TIMESTAMP`,
+		secretName, encrypted,
+	)
+
+	// Insert OAuth provider.
+	_, err = ctx.DB.Exec(
+		`INSERT INTO oauth_providers (name, display_name, client_id, client_secret_name, authorize_url, token_url, userinfo_url, scopes, username_field, auth_endpoint_path)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET
+		   display_name = excluded.display_name,
+		   client_id = excluded.client_id,
+		   client_secret_name = excluded.client_secret_name,
+		   authorize_url = excluded.authorize_url,
+		   token_url = excluded.token_url,
+		   userinfo_url = excluded.userinfo_url,
+		   scopes = excluded.scopes,
+		   username_field = excluded.username_field,
+		   auth_endpoint_path = excluded.auth_endpoint_path`,
+		providerName, displayName, clientID, secretName, authorizeURL, tokenURL, userinfoURL, scopes, usernameField, authPath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating OAuth provider: %w", err)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"provider": providerName,
+		"routes": []string{
+			fmt.Sprintf("GET /api/%s/oauth/%s (redirect to provider)", authPath, providerName),
+			fmt.Sprintf("GET /api/%s/oauth/%s/callback (automatic)", authPath, providerName),
+		},
+		"display_name": displayName,
+		"auth_path":    authPath,
+	}}, nil
+}
+
+func (t *EndpointsTool) listOAuth(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
+	rows, err := ctx.DB.Query(
+		"SELECT id, name, display_name, client_id, authorize_url, token_url, userinfo_url, scopes, username_field, auth_endpoint_path, is_enabled, created_at FROM oauth_providers ORDER BY name",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing OAuth providers: %w", err)
+	}
+	defer rows.Close()
+
+	var providers []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var name, displayName, clientID, authorizeURL, tokenURL, userinfoURL, scopes, usernameField, authPath string
+		var isEnabled bool
+		var createdAt string
+		if err := rows.Scan(&id, &name, &displayName, &clientID, &authorizeURL, &tokenURL, &userinfoURL, &scopes, &usernameField, &authPath, &isEnabled, &createdAt); err != nil {
+			continue
+		}
+		providers = append(providers, map[string]interface{}{
+			"id":            id,
+			"name":          name,
+			"display_name":  displayName,
+			"client_id":     clientID,
+			"authorize_url": authorizeURL,
+			"scopes":        scopes,
+			"auth_path":     authPath,
+			"is_enabled":    isEnabled,
+			"created_at":    createdAt,
+		})
+	}
+	return &Result{Success: true, Data: providers}, nil
+}
+
+func (t *EndpointsTool) deleteOAuth(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	providerName, _ := args["provider_name"].(string)
+	if providerName == "" {
+		return &Result{Success: false, Error: "provider_name is required"}, nil
+	}
+
+	// Clean up the associated secret.
+	secretName := "oauth_" + providerName + "_secret"
+	ctx.DB.Exec("DELETE FROM secrets WHERE name = ?", secretName)
+
+	result, err := ctx.DB.Exec("DELETE FROM oauth_providers WHERE name = ?", providerName)
+	if err != nil {
+		return nil, fmt.Errorf("deleting OAuth provider: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return &Result{Success: false, Error: fmt.Sprintf("OAuth provider '%s' not found", providerName)}, nil
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"deleted": providerName,
+	}}, nil
 }

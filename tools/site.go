@@ -64,7 +64,7 @@ func (t *SiteTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Resu
 	}
 }
 
-func (t *SiteTool) info(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *SiteTool) info(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	var name, mode string
 	var domain, description, direction sql.NullString
 	var createdAt, updatedAt time.Time

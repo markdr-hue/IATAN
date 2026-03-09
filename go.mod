@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.1
+	github.com/coder/websocket v1.8.14
 	github.com/dop251/goja v0.0.0-20260226184354-913bd86fb70c
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/golang-jwt/jwt/v5 v5.3.1

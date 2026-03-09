@@ -98,7 +98,9 @@ func (h *SiteAssetsHandler) handleTextAsset(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *SiteAssetsHandler) handleAssetUpload(w http.ResponseWriter, r *http.Request, siteID int) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	const maxUploadSize = 32 << 20 // 32 MB
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
 		writeError(w, http.StatusBadRequest, "failed to parse form: "+err.Error())
 		return
 	}
@@ -135,11 +137,13 @@ func (h *SiteAssetsHandler) handleAssetUpload(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "failed to write file")
 		return
 	}
+	if written > maxUploadSize {
+		os.Remove(storagePath)
+		writeError(w, http.StatusBadRequest, "file too large (max 32 MB)")
+		return
+	}
 
 	ct := inferContentType(filename)
-	if header.Header.Get("Content-Type") != "" && header.Header.Get("Content-Type") != "application/octet-stream" {
-		ct = header.Header.Get("Content-Type")
-	}
 
 	siteDB, err := h.deps.SiteDBManager.Open(siteID)
 	if err != nil {

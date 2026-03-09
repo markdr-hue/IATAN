@@ -8,6 +8,7 @@ package tools
 import (
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -299,8 +300,12 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 		return &Result{Success: false, Error: fmt.Sprintf("file too large (%d bytes, max %d)", len(fileData), maxFileSize)}, nil
 	}
 
-	if contentType == "" {
-		contentType = inferContentType(filename)
+	// Always infer from extension for known types — LLMs sometimes pass
+	// content_type: "text/plain" for CSS/JS/SVG which breaks browser rendering.
+	if inferred := inferContentType(filename); inferred != "application/octet-stream" {
+		contentType = inferred
+	} else if contentType == "" {
+		contentType = inferred
 	}
 
 	// Before overwrite: capture existing text file into version history.
@@ -849,4 +854,31 @@ func validateCSSContent(filename string, content []byte) []string {
 	}
 
 	return warnings
+}
+
+func (t *FilesTool) MaxResultSize() int { return 16000 }
+
+func (t *FilesTool) Summarize(result string) string {
+	r, data, _, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if data == nil {
+		return summarizeTruncate(result, 300)
+	}
+	if content, ok := data["content"].(string); ok && content != "" {
+		filename, _ := data["filename"].(string)
+		return fmt.Sprintf(`{"success":true,"summary":"Read file %s (%d chars)"}`, filename, len(content))
+	}
+	if warnings, ok := data["warnings"]; ok {
+		filename, _ := data["filename"].(string)
+		wJSON, _ := json.Marshal(warnings)
+		return fmt.Sprintf(`{"success":true,"file":"%s","warnings":%s,"ACTION_REQUIRED":"Fix JS errors"}`, filename, wJSON)
+	}
+	filename, _ := data["filename"].(string)
+	size, _ := data["size"].(float64)
+	return fmt.Sprintf(`{"success":true,"summary":"File %s (%d bytes)"}`, filename, int(size))
 }

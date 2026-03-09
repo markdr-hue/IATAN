@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -112,7 +111,7 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 		// Auto-recover from crashes: reset error count and clear non-question pauses
 		// so the pipeline can resume instead of staying stuck in paused loop.
 		w.siteDB.ExecWrite(`UPDATE pipeline_state SET error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND error_count > 0`)
-		w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN ('awaiting_owner_answers', 'awaiting_approval')`)
+		w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN (?, ?)`, PauseReasonOwnerAnswers, PauseReasonApproval)
 		w.runBuildPipeline(ctx)
 	case "monitoring":
 		w.setState(StateMonitoring)
@@ -157,31 +156,55 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 		var nextStage PipelineStage
 		var stageErr error
 
-		switch stage {
-		case StagePlan:
-			nextStage, stageErr = w.runPlan(ctx)
-		case StageDesign:
-			nextStage, stageErr = w.runDesign(ctx)
-		case StageDataLayer:
-			nextStage, stageErr = w.runDataLayer(ctx)
-		case StageBuildPages:
-			nextStage, stageErr = w.runBuildPages(ctx)
-		case StageReview:
-			nextStage, stageErr = w.runReview(ctx)
-		case StageComplete:
-			nextStage, stageErr = w.runComplete(ctx)
-		case StageMonitoring:
+		// Terminal stages that exit the build loop.
+		if stage == StageMonitoring {
 			w.setState(StateMonitoring)
 			w.runMonitoringLoop(ctx)
 			return
-		case StageUpdatePlan:
-			nextStage, stageErr = w.runUpdatePlan(ctx)
-		default:
-			w.logger.Error("unknown pipeline stage", "stage", stage)
-			return
 		}
 
+		// Run the stage in a closure with panic recovery so a nil-pointer
+		// or index-out-of-bounds inside any stage doesn't kill the worker.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					stageErr = fmt.Errorf("panic in stage %s: %v", stage, r)
+					w.logger.Error("stage panic", "stage", stage, "panic", r)
+				}
+			}()
+			switch stage {
+			case StagePlan:
+				nextStage, stageErr = w.runPlan(ctx)
+			case StageDesign:
+				nextStage, stageErr = w.runDesign(ctx)
+			case StageBlueprintPages:
+				nextStage, stageErr = w.runBlueprintPages(ctx)
+			case StageDataLayer:
+				nextStage, stageErr = w.runDataLayer(ctx)
+			case StageBuildPages:
+				nextStage, stageErr = w.runBuildPages(ctx)
+			case StageReview:
+				nextStage, stageErr = w.runReview(ctx)
+			case StageComplete:
+				nextStage, stageErr = w.runComplete(ctx)
+			case StageUpdatePlan:
+				nextStage, stageErr = w.runUpdatePlan(ctx)
+			default:
+				stageErr = fmt.Errorf("unknown pipeline stage: %s", stage)
+			}
+		}()
+
 		if stageErr != nil {
+			// Check if the stage intentionally paused (e.g., awaiting owner answers).
+			// Don't count intentional pauses as errors.
+			ps, _ := LoadPipelineState(w.siteDB.DB)
+			if ps != nil && ps.Paused {
+				w.logger.Info("stage paused intentionally", "stage", stage, "reason", ps.PauseReason)
+				w.setState(StatePaused)
+				w.runPausedLoop(ctx)
+				return
+			}
+
 			w.logger.Error("stage failed", "stage", stage, "error", stageErr)
 			errCount, _ := IncrementErrorCount(w.siteDB, stageErr.Error())
 			stageRetries++
@@ -202,14 +225,6 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 				return
 			}
 
-			// Check if paused by stage (e.g. awaiting question answers).
-			ps, _ := LoadPipelineState(w.siteDB.DB)
-			if ps != nil && ps.Paused {
-				w.setState(StatePaused)
-				w.runPausedLoop(ctx)
-				return
-			}
-
 			// Backoff before retrying to prevent tight loops.
 			backoff := time.Duration(errCount) * 5 * time.Second
 			if backoff > 30*time.Second {
@@ -224,12 +239,10 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 			continue // retry same stage
 		}
 
-		// Stage succeeded — reset error count, advance.
+		// Stage succeeded — advance (also resets error count atomically).
 		if err := AdvanceStage(w.siteDB, nextStage); err != nil {
 			w.logger.Error("failed to advance stage", "error", err)
 		}
-		// Reset error count on success.
-		w.siteDB.ExecWrite("UPDATE pipeline_state SET error_count = 0 WHERE id = 1")
 		stage = nextStage
 		stageRetries = 0
 	}
@@ -282,11 +295,12 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 
 	switch cmd.Type {
 	case CommandWake:
+		w.mu.Lock()
+		w.idleTickCount = 0
 		if cmd.Payload != nil {
-			w.mu.Lock()
 			w.wakeContext = cmd.Payload
-			w.mu.Unlock()
 		}
+		w.mu.Unlock()
 		// If paused waiting for answers, resume the pipeline.
 		if w.State() == StatePaused {
 			ResumePipeline(w.siteDB)
@@ -314,26 +328,24 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 		}
 
 	case CommandUpdate:
-		// Trigger incremental update.
+		// Trigger incremental update with change description.
+		w.mu.Lock()
+		w.idleTickCount = 0
+		w.mu.Unlock()
 		w.setState(StateBuilding)
+		desc := ""
+		if d, ok := cmd.Payload["description"].(string); ok {
+			desc = d
+		}
+		w.siteDB.ExecWrite("UPDATE pipeline_state SET update_description = ? WHERE id = 1", desc)
 		if err := AdvanceStage(w.siteDB, StageUpdatePlan); err != nil {
 			w.logger.Error("failed to set update stage", "error", err)
 		}
 
 	case CommandScheduledTask:
 		if prompt, ok := cmd.Payload["prompt"].(string); ok {
-			var runID int64
-			if rid, ok := cmd.Payload["run_id"].(int64); ok {
-				runID = rid
-			} else if ridFloat, ok := cmd.Payload["run_id"].(float64); ok {
-				runID = int64(ridFloat)
-			}
-			var taskID int
-			if tid, ok := cmd.Payload["task_id"].(int); ok {
-				taskID = tid
-			} else if tidFloat, ok := cmd.Payload["task_id"].(float64); ok {
-				taskID = int(tidFloat)
-			}
+			runID := payloadInt64(cmd.Payload, "run_id")
+			taskID := int(payloadInt64(cmd.Payload, "task_id"))
 			w.executeScheduledTask(ctx, prompt, runID, taskID)
 		}
 
@@ -500,13 +512,32 @@ func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.T
 		w.logger.Info("tool call", "tool", tc.Name, "call_id", tc.ID)
 
 		if !w.deps.ToolRegistry.Has(tc.Name) {
-			w.logger.Debug("skipping unknown tool", "tool", tc.Name)
+			w.logger.Warn("unknown tool called by LLM", "tool", tc.Name)
+			messages = append(messages, llm.Message{
+				Role:       llm.RoleTool,
+				Content:    fmt.Sprintf(`{"error": "unknown tool '%s' — check available tool names"}`, tc.Name),
+				ToolCallID: tc.ID,
+			})
 			continue
 		}
 
 		var args map[string]interface{}
-		if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
-			args = map[string]interface{}{}
+		argBytes := []byte(tc.Arguments)
+		// Some LLMs wrap arguments in an array — unwrap single-element arrays.
+		if len(argBytes) > 0 && argBytes[0] == '[' {
+			var arr []json.RawMessage
+			if err := json.Unmarshal(argBytes, &arr); err == nil && len(arr) == 1 {
+				argBytes = arr[0]
+			}
+		}
+		if err := json.Unmarshal(argBytes, &args); err != nil {
+			w.logger.Warn("bad tool arguments", "tool", tc.Name, "error", err)
+			messages = append(messages, llm.Message{
+				Role:       llm.RoleTool,
+				Content:    fmt.Sprintf(`{"error": "invalid JSON arguments for tool %s: %s"}`, tc.Name, err.Error()),
+				ToolCallID: tc.ID,
+			})
+			continue
 		}
 
 		if w.deps.Bus != nil {
@@ -536,7 +567,7 @@ func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.T
 		// In-memory: truncated for token control.
 		toolResultMsg := llm.Message{
 			Role:       llm.RoleTool,
-			Content:    truncateToolResult(tc.Name, result),
+			Content:    w.truncateToolResult(tc.Name, result),
 			ToolCallID: tc.ID,
 		}
 		messages = append(messages, toolResultMsg)
@@ -544,7 +575,7 @@ func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.T
 		// DB: summarized for cross-stage history.
 		summaryMsg := llm.Message{
 			Role:       llm.RoleTool,
-			Content:    summarizeToolResult(tc.Name, result),
+			Content:    w.summarizeToolResult(tc.Name, result),
 			ToolCallID: tc.ID,
 		}
 		w.saveChatMessage(summaryMsg)
@@ -772,6 +803,21 @@ func isInteractiveTool(name string) bool {
 	return false
 }
 
+// payloadInt64 extracts an int64 from a payload map, handling int64, float64,
+// and int types (JSON numbers deserialize as float64 in Go's interface{}).
+func payloadInt64(payload map[string]interface{}, key string) int64 {
+	if v, ok := payload[key].(int64); ok {
+		return v
+	}
+	if v, ok := payload[key].(float64); ok {
+		return int64(v)
+	}
+	if v, ok := payload[key].(int); ok {
+		return int64(v)
+	}
+	return 0
+}
+
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -779,138 +825,21 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-func truncateToolResult(toolName string, result string) string {
-	// Cap all tool results at 4KB to prevent context bloat.
-	// The LLM rarely needs more than a confirmation after writes,
-	// and reads are summarized in summarizeToolResult for DB storage.
-	return truncate(result, 4000)
+func (w *PipelineWorker) truncateToolResult(toolName string, result string) string {
+	maxSize := 4000
+	if tool, err := w.deps.ToolRegistry.Get(toolName); err == nil {
+		if sizer, ok := tool.(tools.ResultSizer); ok {
+			maxSize = sizer.MaxResultSize()
+		}
+	}
+	return truncate(result, maxSize)
 }
 
-func summarizeToolResult(toolName string, result string) string {
-	var r struct {
-		Success bool        `json:"success"`
-		Data    interface{} `json:"data,omitempty"`
-		Error   string      `json:"error,omitempty"`
-	}
-	if err := json.Unmarshal([]byte(result), &r); err != nil {
-		return truncate(result, 200)
-	}
-
-	if !r.Success {
-		return fmt.Sprintf(`{"success":false,"error":"%s"}`, truncate(r.Error, 150))
-	}
-
-	if arr, ok := r.Data.([]interface{}); ok {
-		if toolName == "manage_data" {
-			return fmt.Sprintf(`{"success":true,"summary":"Queried: %d rows returned"}`, len(arr))
-		}
-		return fmt.Sprintf(`{"success":true,"summary":"Returned %d items"}`, len(arr))
-	}
-
-	data, ok := r.Data.(map[string]interface{})
-	if !ok {
-		return truncate(result, 200)
-	}
-
-	switch toolName {
-	case "manage_pages":
-		if content, ok := data["content"].(string); ok && content != "" {
-			path, _ := data["path"].(string)
-			fingerprint := pageStructureFingerprint(content)
-			return fmt.Sprintf(`{"success":true,"summary":"Read page %s (%d chars). %s"}`, path, len(content), fingerprint)
-		}
-		warnings, hasW := data["warnings"]
-		hints, hasH := data["hints"]
-		if hasW || hasH {
-			path, _ := data["path"].(string)
-			var parts []string
-			parts = append(parts, fmt.Sprintf(`"success":true,"path":"%s"`, path))
-			if hasW {
-				wJSON, _ := json.Marshal(warnings)
-				parts = append(parts, fmt.Sprintf(`"warnings":%s,"ACTION_REQUIRED":"Fix these warnings"`, wJSON))
-			}
-			if hasH {
-				hJSON, _ := json.Marshal(hints)
-				parts = append(parts, fmt.Sprintf(`"hints":%s`, hJSON))
-			}
-			return "{" + strings.Join(parts, ",") + "}"
-		}
-		return truncate(result, 300)
-	case "manage_files":
-		if content, ok := data["content"].(string); ok && content != "" {
-			filename, _ := data["filename"].(string)
-			return fmt.Sprintf(`{"success":true,"summary":"Read file %s (%d chars)"}`, filename, len(content))
-		}
-		if warnings, ok := data["warnings"]; ok {
-			filename, _ := data["filename"].(string)
-			wJSON, _ := json.Marshal(warnings)
-			return fmt.Sprintf(`{"success":true,"file":"%s","warnings":%s,"ACTION_REQUIRED":"Fix JS errors"}`, filename, wJSON)
-		}
-		filename, _ := data["filename"].(string)
-		size, _ := data["size"].(float64)
-		return fmt.Sprintf(`{"success":true,"summary":"File %s (%d bytes)"}`, filename, int(size))
-	case "make_http_request":
-		status, _ := data["status_code"].(float64)
-		body, _ := data["body"].(string)
-		return fmt.Sprintf(`{"success":true,"summary":"HTTP %d (%d chars)"}`, int(status), len(body))
-	case "manage_layout":
-		name, _ := data["name"].(string)
-		if warnings, ok := data["warnings"]; ok {
-			wJSON, _ := json.Marshal(warnings)
-			return fmt.Sprintf(`{"success":true,"layout":"%s","warnings":%s}`, name, wJSON)
-		}
-		return fmt.Sprintf(`{"success":true,"summary":"Layout '%s' saved"}`, name)
-	case "manage_memory":
-		return truncate(result, 300)
-	default:
-		return truncate(result, 300)
-	}
-}
-
-func pageStructureFingerprint(content string) string {
-	lower := strings.ToLower(content)
-	var elements []string
-	for _, tag := range []string{"nav", "header", "main", "section", "article", "aside", "footer"} {
-		if strings.Contains(lower, "<"+tag) {
-			elements = append(elements, tag)
+func (w *PipelineWorker) summarizeToolResult(toolName string, result string) string {
+	if tool, err := w.deps.ToolRegistry.Get(toolName); err == nil {
+		if summarizer, ok := tool.(tools.Summarizer); ok {
+			return summarizer.Summarize(result)
 		}
 	}
-	var assets []string
-	idx := 0
-	for {
-		pos := strings.Index(lower[idx:], "/assets/")
-		if pos == -1 {
-			break
-		}
-		start := idx + pos + len("/assets/")
-		end := start
-		for end < len(lower) && lower[end] != '"' && lower[end] != '\'' && lower[end] != ')' && lower[end] != ' ' && lower[end] != '>' {
-			end++
-		}
-		if end > start {
-			asset := content[start:end]
-			found := false
-			for _, a := range assets {
-				if a == asset {
-					found = true
-					break
-				}
-			}
-			if !found {
-				assets = append(assets, asset)
-			}
-		}
-		idx = end
-	}
-	parts := ""
-	if len(elements) > 0 {
-		parts += "Structure: " + strings.Join(elements, ",")
-	}
-	if len(assets) > 0 {
-		if parts != "" {
-			parts += ". "
-		}
-		parts += "Assets: " + strings.Join(assets, ",")
-	}
-	return parts
+	return tools.GenericSummarize(result)
 }

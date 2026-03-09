@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,15 +47,16 @@ type Typography struct {
 }
 
 type PagePlan struct {
-	Path       string   `json:"path"`
-	Title      string   `json:"title"`
-	Purpose    string   `json:"purpose"`
-	Sections   []string `json:"sections"`
-	LinksTo    []string `json:"links_to,omitempty"`
-	NeedsData  bool     `json:"needs_data"`
-	DataTables []string `json:"data_tables,omitempty"`
-	PageAssets []string `json:"page_assets,omitempty"`
-	Layout     string   `json:"layout,omitempty"` // layout name: "default", "none", "blog", etc.
+	Path           string   `json:"path"`
+	Title          string   `json:"title"`
+	Purpose        string   `json:"purpose"`
+	Sections       []string `json:"sections"`
+	LinksTo        []string `json:"links_to,omitempty"`
+	NeedsData      bool     `json:"needs_data"`
+	DataTables     []string `json:"data_tables,omitempty"`
+	PageAssets     []string `json:"page_assets,omitempty"`
+	Layout         string   `json:"layout,omitempty"`          // layout name: "default", "none", "blog", etc.
+	ComponentHints []string `json:"component_hints,omitempty"` // e.g. ["hero-cta", "feature-grid", "testimonial-cards"]
 }
 
 type ColumnDef struct {
@@ -69,12 +71,76 @@ type TablePlan struct {
 	Columns  []ColumnDef `json:"columns"`
 	HasAPI   bool        `json:"has_api"`
 	HasAuth  bool        `json:"has_auth"`
+	HasOAuth []string    `json:"has_oauth,omitempty"` // e.g. ["google", "github"]
+	Roles    []string    `json:"roles,omitempty"`     // e.g. ["user", "admin"]
 	SeedData bool        `json:"seed_data"`
 }
 
 type PlanQuestion struct {
 	Question string   `json:"question"`
 	Options  []string `json:"options,omitempty"`
+}
+
+// PageBlueprint is the BLUEPRINT stage output for a single page.
+type PageBlueprint struct {
+	Path              string   `json:"path"`
+	HTMLSkeleton      string   `json:"html_skeleton"`
+	ComponentPatterns []string `json:"component_patterns"`
+	ContentNotes      string   `json:"content_notes"`
+	DataDisplay       string   `json:"data_display,omitempty"`
+}
+
+// SiteBlueprint is the full BLUEPRINT stage output.
+type SiteBlueprint struct {
+	Pages          []PageBlueprint   `json:"pages"`
+	SharedPatterns map[string]string `json:"shared_patterns"`
+	ContentStyle   string            `json:"content_style"`
+}
+
+// ParseSiteBlueprint parses a SiteBlueprint from raw LLM output.
+func ParseSiteBlueprint(raw string) (*SiteBlueprint, error) {
+	raw = extractJSON(raw)
+	var bp SiteBlueprint
+	if err := json.Unmarshal([]byte(raw), &bp); err != nil {
+		return nil, fmt.Errorf("invalid blueprint JSON: %w", err)
+	}
+	return &bp, nil
+}
+
+// ValidateBlueprint checks a SiteBlueprint for completeness.
+func ValidateBlueprint(bp *SiteBlueprint, plan *SitePlan) []string {
+	var errs []string
+	if len(bp.Pages) == 0 {
+		errs = append(errs, "blueprint has no pages")
+		return errs
+	}
+
+	bpPaths := make(map[string]bool, len(bp.Pages))
+	for _, p := range bp.Pages {
+		bpPaths[p.Path] = true
+		if p.HTMLSkeleton == "" {
+			errs = append(errs, fmt.Sprintf("blueprint page %s has empty html_skeleton", p.Path))
+		}
+	}
+
+	// Every planned page should have a blueprint entry.
+	for _, p := range plan.Pages {
+		if !bpPaths[p.Path] {
+			errs = append(errs, fmt.Sprintf("blueprint missing page %s", p.Path))
+		}
+	}
+
+	return errs
+}
+
+// BlueprintForPage returns the blueprint entry for a given page path, or nil.
+func (bp *SiteBlueprint) BlueprintForPage(path string) *PageBlueprint {
+	for i := range bp.Pages {
+		if bp.Pages[i].Path == path {
+			return &bp.Pages[i]
+		}
+	}
+	return nil
 }
 
 // PlanPatch describes incremental changes for an UPDATE flow.
@@ -89,28 +155,54 @@ type PlanPatch struct {
 
 // PipelineState is the singleton row in pipeline_state tracking build progress.
 type PipelineState struct {
-	Stage            PipelineStage
-	PlanJSON         string
-	CurrentPageIndex int
-	ErrorCount       int
-	LastError        string
-	Paused           bool
-	PauseReason      string
-	StartedAt        time.Time
-	UpdatedAt        time.Time
+	Stage             PipelineStage
+	PlanJSON          string
+	BlueprintJSON     string // JSON-encoded SiteBlueprint from BLUEPRINT_PAGES stage
+	CurrentPageIndex  int
+	ErrorCount        int
+	LastError         string
+	Paused            bool
+	PauseReason       string
+	UpdateDescription string // what the owner wants changed (for UPDATE_PLAN)
+	StartedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 var jsonFenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)```")
 
-// ParseSitePlan parses a SitePlan from raw LLM output, stripping markdown fences.
-func ParseSitePlan(raw string) (*SitePlan, error) {
+// extractJSON strips markdown code fences and any leading/trailing non-JSON text
+// from raw LLM output, returning only the JSON object.
+func extractJSON(raw string) string {
 	raw = strings.TrimSpace(raw)
-
-	// Strip markdown code fences if present.
-	if matches := jsonFenceRe.FindStringSubmatch(raw); len(matches) > 1 {
-		raw = strings.TrimSpace(matches[1])
+	if len(raw) == 0 {
+		return raw
 	}
 
+	// Try regex first (handles clean markdown fences).
+	if matches := jsonFenceRe.FindStringSubmatch(raw); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+
+	// Already a JSON object or array — return as-is.
+	if raw[0] == '{' || raw[0] == '[' {
+		return raw
+	}
+
+	// Fallback: find the first { and last } to extract JSON object.
+	// Handles cases where the regex fails (backticks inside JSON strings)
+	// or the LLM adds prose before/after the JSON.
+	if start := strings.Index(raw, "{"); start >= 0 {
+		if end := strings.LastIndex(raw, "}"); end > start {
+			return raw[start : end+1]
+		}
+	}
+
+	return raw
+}
+
+// ParseSitePlan parses a SitePlan from raw LLM output, stripping markdown fences.
+func ParseSitePlan(raw string) (*SitePlan, error) {
+	raw = extractJSON(raw)
 	var plan SitePlan
 	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
 		return nil, fmt.Errorf("invalid plan JSON: %w", err)
@@ -120,10 +212,7 @@ func ParseSitePlan(raw string) (*SitePlan, error) {
 
 // ParsePlanPatch parses a PlanPatch from raw LLM output.
 func ParsePlanPatch(raw string) (*PlanPatch, error) {
-	raw = strings.TrimSpace(raw)
-	if matches := jsonFenceRe.FindStringSubmatch(raw); len(matches) > 1 {
-		raw = strings.TrimSpace(matches[1])
-	}
+	raw = extractJSON(raw)
 	var patch PlanPatch
 	if err := json.Unmarshal([]byte(raw), &patch); err != nil {
 		return nil, fmt.Errorf("invalid patch JSON: %w", err)
@@ -163,9 +252,21 @@ func ValidatePlan(plan *SitePlan) []string {
 	}
 
 	// Verify all links_to targets exist.
+	// Allow "/category" to match "/category/:id" (parameterised routes).
 	for _, p := range plan.Pages {
 		for _, link := range p.LinksTo {
-			if !paths[link] {
+			if paths[link] {
+				continue
+			}
+			// Check if any path is a parameterised version of this link.
+			found := false
+			for knownPath := range paths {
+				if strings.HasPrefix(knownPath, link+"/") {
+					found = true
+					break
+				}
+			}
+			if !found {
 				errs = append(errs, fmt.Sprintf("page %s links_to %s which is not in the plan", p.Path, link))
 			}
 		}
@@ -188,11 +289,37 @@ func ValidatePlan(plan *SitePlan) []string {
 	// Color scheme validation.
 	if plan.ColorScheme.Primary == "" || plan.ColorScheme.Background == "" || plan.ColorScheme.Text == "" {
 		errs = append(errs, "color_scheme must include at least primary, background, and text")
+	} else {
+		// WCAG contrast check at plan time (catch bad schemes early).
+		errs = append(errs, validateColorContrast(plan)...)
 	}
 
 	// Typography validation.
 	if plan.Typography.BodyFont == "" {
 		errs = append(errs, "typography must include at least body_font")
+	}
+	if plan.Typography.Scale != "" {
+		if s, err := strconv.ParseFloat(plan.Typography.Scale, 64); err != nil || s < 1.0 || s > 2.0 {
+			errs = append(errs, fmt.Sprintf("typography scale must be a number between 1.0 and 2.0, got %q", plan.Typography.Scale))
+		}
+	}
+
+	// Data table column validation.
+	for _, t := range plan.DataTables {
+		colNames := make(map[string]bool, len(t.Columns))
+		nonSystem := 0
+		for _, c := range t.Columns {
+			if colNames[c.Name] {
+				errs = append(errs, fmt.Sprintf("table %s has duplicate column name: %s", t.Name, c.Name))
+			}
+			colNames[c.Name] = true
+			if c.Name != "id" && c.Name != "created_at" && c.Name != "updated_at" {
+				nonSystem++
+			}
+		}
+		if nonSystem == 0 && len(t.Columns) > 0 {
+			errs = append(errs, fmt.Sprintf("table %s has no non-system columns", t.Name))
+		}
 	}
 
 	return errs
@@ -212,22 +339,24 @@ func MarshalPlan(plan *SitePlan) (string, error) {
 // LoadPipelineState loads the singleton pipeline_state row.
 func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
 	var s PipelineState
-	var planJSON, lastError, pauseReason sql.NullString
+	var planJSON, blueprintJSON, lastError, pauseReason, updateDesc sql.NullString
 	var startedAt, updatedAt sql.NullString
 
-	err := db.QueryRow(`SELECT stage, plan_json, current_page_index, error_count,
-		last_error, paused, pause_reason, started_at, updated_at
+	err := db.QueryRow(`SELECT stage, plan_json, COALESCE(blueprint_json, ''), current_page_index, error_count,
+		last_error, paused, pause_reason, COALESCE(update_description, ''), started_at, updated_at
 		FROM pipeline_state WHERE id = 1`).Scan(
-		&s.Stage, &planJSON, &s.CurrentPageIndex, &s.ErrorCount,
-		&lastError, &s.Paused, &pauseReason, &startedAt, &updatedAt,
+		&s.Stage, &planJSON, &blueprintJSON, &s.CurrentPageIndex, &s.ErrorCount,
+		&lastError, &s.Paused, &pauseReason, &updateDesc, &startedAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load pipeline state: %w", err)
 	}
 
 	s.PlanJSON = planJSON.String
+	s.BlueprintJSON = blueprintJSON.String
 	s.LastError = lastError.String
 	s.PauseReason = pauseReason.String
+	s.UpdateDescription = updateDesc.String
 	if startedAt.Valid {
 		s.StartedAt, _ = time.Parse("2006-01-02 15:04:05", startedAt.String)
 	}
@@ -241,11 +370,11 @@ func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
 // SavePipelineState persists the full pipeline state.
 func SavePipelineState(sdb *db.SiteDB, s *PipelineState) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = ?, plan_json = ?, current_page_index = ?,
+		stage = ?, plan_json = ?, blueprint_json = ?, current_page_index = ?,
 		error_count = ?, last_error = ?, paused = ?,
 		pause_reason = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = 1`,
-		s.Stage, s.PlanJSON, s.CurrentPageIndex,
+		s.Stage, s.PlanJSON, s.BlueprintJSON, s.CurrentPageIndex,
 		s.ErrorCount, s.LastError, s.Paused, s.PauseReason,
 	)
 	return err
@@ -253,14 +382,14 @@ func SavePipelineState(sdb *db.SiteDB, s *PipelineState) error {
 
 // AdvanceStage moves the pipeline to the next stage.
 func AdvanceStage(sdb *db.SiteDB, stage PipelineStage) error {
-	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET stage = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1`, stage)
+	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET stage = ?, error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1`, stage)
 	return err
 }
 
 // ResetPipeline resets pipeline state for a fresh build.
 func ResetPipeline(sdb *db.SiteDB) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = 'PLAN', plan_json = NULL, current_page_index = 0,
+		stage = 'PLAN', plan_json = NULL, blueprint_json = NULL, current_page_index = 0,
 		error_count = 0, last_error = NULL, paused = 0,
 		pause_reason = NULL, started_at = CURRENT_TIMESTAMP,
 		updated_at = CURRENT_TIMESTAMP

@@ -24,6 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
 	"github.com/markdr-hue/IATAN/db"
 	"github.com/markdr-hue/IATAN/db/models"
 	"github.com/markdr-hue/IATAN/events"
@@ -88,7 +90,7 @@ func getSite(r *http.Request) *models.Site {
 }
 
 // ---------------------------------------------------------------------------
-// Page JSON API (kept for backward compat with any JS that uses it)
+// Page JSON API (used by SPA router for client-side navigation)
 // ---------------------------------------------------------------------------
 
 // Page serves page content as JSON for the given path query parameter.
@@ -205,7 +207,14 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Track analytics (fire-and-forget).
-	go h.trackPageView(site.ID, pagePath, r)
+	go func() {
+		defer func() {
+			if rv := recover(); rv != nil {
+				h.deps.Logger.Error("trackPageView panic", "error", rv, "site_id", site.ID)
+			}
+		}()
+		h.trackPageView(site.ID, pagePath, r)
+	}()
 
 	// Render the full HTML document with layout wrapping.
 	doc := h.renderDocument(site, siteDB.DB, pagePath, title.String, content.String, metadata.String, layoutName.String, pageAssets.String)
@@ -853,7 +862,12 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 
 	// Extract filename from path: /assets/{filename}
 	filename := strings.TrimPrefix(r.URL.Path, "/assets/")
-	if filename == "" || strings.Contains(filename, "..") {
+	if filename == "" {
+		http.NotFound(w, r)
+		return
+	}
+	cleaned := filepath.Clean(filename)
+	if cleaned != filename || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
 		http.NotFound(w, r)
 		return
 	}
@@ -876,9 +890,14 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Serve the file from disk.
+	expectedPrefix := filepath.Join("data", "sites", fmt.Sprintf("%d", site.ID))
 	fpath := storagePath.String
 	if fpath == "" {
-		fpath = filepath.Join("data", "sites", fmt.Sprintf("%d", site.ID), "assets", filename)
+		fpath = filepath.Join(expectedPrefix, "assets", filename)
+	}
+	if !strings.HasPrefix(filepath.Clean(fpath), expectedPrefix) {
+		http.NotFound(w, r)
+		return
 	}
 
 	data, err := os.ReadFile(fpath)
@@ -887,7 +906,11 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ct := contentType.String
+	// Prefer extension-based MIME type (LLMs sometimes store wrong content_type).
+	ct := mimeByExtension(filename)
+	if ct == "" {
+		ct = contentType.String
+	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
@@ -907,6 +930,53 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+// mimeByExtension returns the correct MIME type for common web file extensions.
+// This is the source of truth — the DB content_type may be wrong if the LLM set it incorrectly.
+func mimeByExtension(filename string) string {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "application/javascript"
+	case ".svg":
+		return "image/svg+xml"
+	case ".json":
+		return "application/json"
+	case ".html", ".htm":
+		return "text/html"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".ttf":
+		return "font/ttf"
+	case ".otf":
+		return "font/otf"
+	case ".ico":
+		return "image/x-icon"
+	case ".xml":
+		return "application/xml"
+	case ".pdf":
+		return "application/pdf"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mp3":
+		return "audio/mpeg"
+	default:
+		return ""
+	}
+}
+
 // ServeFile serves user-uploaded files from the files table.
 func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
 	site := getSite(r)
@@ -917,7 +987,12 @@ func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
 
 	// Extract filename from path: /files/{filename}
 	filename := strings.TrimPrefix(r.URL.Path, "/files/")
-	if filename == "" || strings.Contains(filename, "..") {
+	if filename == "" {
+		http.NotFound(w, r)
+		return
+	}
+	cleaned := filepath.Clean(filename)
+	if cleaned != filename || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
 		http.NotFound(w, r)
 		return
 	}
@@ -940,9 +1015,14 @@ func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Serve the file from disk.
+	expectedPrefix := filepath.Join("data", "sites", fmt.Sprintf("%d", site.ID))
 	fpath := storagePath.String
 	if fpath == "" {
-		fpath = filepath.Join("data", "sites", fmt.Sprintf("%d", site.ID), "files", filename)
+		fpath = filepath.Join(expectedPrefix, "files", filename)
+	}
+	if !strings.HasPrefix(filepath.Clean(fpath), expectedPrefix) {
+		http.NotFound(w, r)
+		return
 	}
 
 	data, err := os.ReadFile(fpath)
@@ -951,7 +1031,10 @@ func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ct := contentType.String
+	ct := mimeByExtension(filename)
+	if ct == "" {
+		ct = contentType.String
+	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
@@ -981,6 +1064,7 @@ type apiEndpoint struct {
 	Methods       []string
 	PublicColumns []string // nil means all non-secure
 	RequiresAuth  bool
+	RequiredRole  string // empty = any authenticated user, "admin" = admin only
 	RateLimit     int
 	SecureCols    map[string]string // column → "hash" or "encrypt"
 }
@@ -1040,6 +1124,12 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Handle /ws WebSocket route.
+	if rowID == "ws" {
+		h.apiWebSocket(w, r, site.ID, siteDB)
+		return
+	}
+
 	// Look up the endpoint config.
 	ep, err := h.loadEndpoint(siteDB.DB, endpointPath)
 	if err != nil {
@@ -1056,9 +1146,23 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 	// Check auth if required (accepts site API key or user JWT).
 	if ep.RequiresAuth {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !h.validateSiteTokenOrJWT(site.ID, token) {
-			writePublicError(w, http.StatusUnauthorized, "unauthorized")
-			return
+		// Site API keys bypass role checks (owner-level access).
+		if !h.validateSiteToken(site.ID, token) {
+			// Try user JWT.
+			if h.deps.JWTManager == nil {
+				writePublicError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+			claims, err := h.deps.JWTManager.Validate(token)
+			if err != nil {
+				writePublicError(w, http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
+			// Role check if endpoint requires a specific role.
+			if ep.RequiredRole != "" && claims.Role != ep.RequiredRole {
+				writePublicError(w, http.StatusForbidden, "insufficient permissions")
+				return
+			}
 		}
 	}
 
@@ -1094,15 +1198,16 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) loadEndpoint(siteDB *sql.DB, path string) (*apiEndpoint, error) {
 	var ep apiEndpoint
 	var methodsJSON string
-	var publicColsJSON sql.NullString
+	var publicColsJSON, requiredRole sql.NullString
 	err := siteDB.QueryRow(
-		"SELECT id, path, table_name, methods, public_columns, requires_auth, rate_limit FROM api_endpoints WHERE path = ?",
+		"SELECT id, path, table_name, methods, public_columns, requires_auth, required_role, rate_limit FROM api_endpoints WHERE path = ?",
 		path,
-	).Scan(&ep.ID, &ep.Path, &ep.TableName, &methodsJSON, &publicColsJSON, &ep.RequiresAuth, &ep.RateLimit)
+	).Scan(&ep.ID, &ep.Path, &ep.TableName, &methodsJSON, &publicColsJSON, &ep.RequiresAuth, &requiredRole, &ep.RateLimit)
 	if err != nil {
 		return nil, err
 	}
 
+	ep.RequiredRole = requiredRole.String
 	json.Unmarshal([]byte(methodsJSON), &ep.Methods)
 	if publicColsJSON.Valid && publicColsJSON.String != "" {
 		json.Unmarshal([]byte(publicColsJSON.String), &ep.PublicColumns)
@@ -1230,7 +1335,7 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB
 }
 
 // apiGetOne handles GET /api/{path}/{id} — get single row.
-func (h *Handler) apiGetOne(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
+func (h *Handler) apiGetOne(w http.ResponseWriter, _ *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
 	cols := h.visibleColumns(ep)
 	if cols == "" {
 		cols = "*"
@@ -1382,7 +1487,7 @@ func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.
 }
 
 // apiDelete handles DELETE /api/{path}/{id} — delete a row.
-func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint, siteID int, endpointPath string) {
+func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, rowID string, _ *apiEndpoint, siteID int, endpointPath string) {
 	query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", physTable)
 	result, err := siteDB.Exec(query, rowID)
 	if err != nil {
@@ -1409,7 +1514,7 @@ func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, ro
 // visibleColumns returns a SQL column list based on the endpoint's public_columns
 // and secure column configuration. PASSWORD columns are always excluded.
 func (h *Handler) visibleColumns(ep *apiEndpoint) string {
-	if ep.PublicColumns != nil && len(ep.PublicColumns) > 0 {
+	if len(ep.PublicColumns) > 0 {
 		// Filter out any password columns from the explicit public list.
 		var safe []string
 		for _, col := range ep.PublicColumns {
@@ -1681,7 +1786,7 @@ func (h *Handler) apiStream(w http.ResponseWriter, r *http.Request, siteID int, 
 			// Also check query param for EventSource (which can't set headers).
 			token = r.URL.Query().Get("token")
 		}
-		if !h.validateSiteToken(siteID, token) {
+		if !h.validateSiteTokenOrJWT(siteID, token) {
 			writePublicError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -1720,9 +1825,10 @@ func (h *Handler) apiStream(w http.ResponseWriter, r *http.Request, siteID int, 
 		select {
 		case eventCh <- e:
 		default:
-			// Drop event if channel full.
+			slog.Warn("SSE event dropped (channel full)", "site_id", siteID, "event", e.Type)
 		}
 	})
+	defer h.deps.Bus.Unsubscribe(subID)
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1731,18 +1837,186 @@ func (h *Handler) apiStream(w http.ResponseWriter, r *http.Request, siteID int, 
 	for {
 		select {
 		case <-ctx.Done():
-			h.deps.Bus.Unsubscribe(subID)
 			return
 		case e := <-eventCh:
 			data, err := json.Marshal(e.Payload)
 			if err != nil {
+				slog.Warn("SSE marshal error", "site_id", siteID, "event", e.Type, "error", err)
 				continue
 			}
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data)
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-ticker.C:
-			fmt.Fprintf(w, ": keepalive\n\n")
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket (/ws) handler
+// ---------------------------------------------------------------------------
+
+// validTableName matches safe table names for write_to_table.
+var validTableName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+
+type wsEndpointConfig struct {
+	Path             string
+	EventTypes       []string
+	ReceiveEventType string
+	WriteToTable     string
+	RequiresAuth     bool
+}
+
+func (h *Handler) loadWSEndpoint(siteDB *sql.DB, path string) (*wsEndpointConfig, error) {
+	var ws wsEndpointConfig
+	var eventTypesJSON string
+	var writeToTable sql.NullString
+	var receiveEventType sql.NullString
+	err := siteDB.QueryRow(
+		"SELECT path, event_types, receive_event_type, write_to_table, requires_auth FROM ws_endpoints WHERE path = ?",
+		path,
+	).Scan(&ws.Path, &eventTypesJSON, &receiveEventType, &writeToTable, &ws.RequiresAuth)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(eventTypesJSON), &ws.EventTypes)
+	if receiveEventType.Valid {
+		ws.ReceiveEventType = receiveEventType.String
+	} else {
+		ws.ReceiveEventType = string(events.EventWSMessage)
+	}
+	if writeToTable.Valid {
+		ws.WriteToTable = writeToTable.String
+	}
+	return &ws, nil
+}
+
+// apiWebSocket handles GET /api/{path}/ws — bidirectional real-time communication.
+func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID int, siteDB *db.SiteDB) {
+	// Extract the endpoint path from the URL.
+	fullPath := strings.TrimPrefix(r.URL.Path, "/api/")
+	parts := strings.SplitN(fullPath, "/", 2)
+	endpointPath := parts[0]
+
+	ws, err := h.loadWSEndpoint(siteDB.DB, endpointPath)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "websocket endpoint not found")
+		return
+	}
+
+	// Check auth if required.
+	if ws.RequiresAuth {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		if !h.validateSiteTokenOrJWT(siteID, token) {
+			writePublicError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+	}
+
+	// Accept the WebSocket connection.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true, // CORS handled by Caddy
+	})
+	if err != nil {
+		slog.Warn("websocket accept error", "site_id", siteID, "path", endpointPath, "error", err)
+		return
+	}
+	defer conn.CloseNow()
+
+	clientID := uuid.New().String()
+
+	// Build a set of allowed event types for outbound messages.
+	allowedTypes := make(map[events.EventType]bool)
+	for _, et := range ws.EventTypes {
+		allowedTypes[events.EventType(et)] = true
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	eventCh := make(chan events.Event, 64)
+	subID := h.deps.Bus.SubscribeAll(func(e events.Event) {
+		if e.SiteID != siteID {
+			return
+		}
+		if !allowedTypes[e.Type] {
+			return
+		}
+		select {
+		case eventCh <- e:
+		default:
+			slog.Warn("WS event dropped (channel full)", "site_id", siteID, "event", e.Type)
+		}
+	})
+	defer h.deps.Bus.Unsubscribe(subID)
+
+	// Read pump: reads incoming messages from the client.
+	go func() {
+		defer cancel()
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+
+			// Validate JSON.
+			var msgData interface{}
+			if err := json.Unmarshal(data, &msgData); err != nil {
+				continue // skip non-JSON messages
+			}
+
+			// Publish to event bus.
+			h.deps.Bus.Publish(events.NewEvent(
+				events.EventType(ws.ReceiveEventType),
+				siteID,
+				map[string]interface{}{
+					"path":      endpointPath,
+					"data":      msgData,
+					"client_id": clientID,
+				},
+			))
+
+			// Optional: write to table.
+			if ws.WriteToTable != "" && validTableName.MatchString(ws.WriteToTable) {
+				siteDB.ExecWrite(
+					fmt.Sprintf("INSERT INTO %s (data, created_at) VALUES (?, datetime('now'))", ws.WriteToTable),
+					string(data),
+				)
+			}
+		}
+	}()
+
+	// Write pump: sends events and keepalives to the client.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e := <-eventCh:
+			payload, err := json.Marshal(map[string]interface{}{
+				"type":    string(e.Type),
+				"payload": e.Payload,
+			})
+			if err != nil {
+				continue
+			}
+			if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := conn.Ping(ctx); err != nil {
+				return
+			}
 		}
 	}
 }

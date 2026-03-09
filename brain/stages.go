@@ -8,12 +8,14 @@ package brain
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/markdr-hue/IATAN/db/models"
@@ -27,6 +29,7 @@ var (
 		"manage_files",
 		"manage_layout",
 		"manage_memory",
+		"manage_communication",
 		"make_http_request",
 	}
 
@@ -38,17 +41,24 @@ var (
 		"manage_providers",
 		"manage_email",
 		"manage_payments",
+		"manage_webhooks",
+		"manage_memory",
+		"manage_communication",
 	}
 
 	buildPageTools = []string{
 		"manage_pages",
 		"manage_files",
+		"manage_memory",
+		"manage_data",
 	}
 
 	reviewTools = []string{
 		"manage_pages",
 		"manage_layout",
 		"manage_files",
+		"manage_communication",
+		"manage_data",
 	}
 
 	// Monitoring is read-only — diagnose issues, don't fix them.
@@ -74,6 +84,9 @@ var (
 		"manage_diagnostics",
 		"manage_memory",
 		"manage_communication",
+		"manage_scheduler",
+		"manage_site",
+		"make_http_request",
 	}
 )
 
@@ -130,9 +143,9 @@ func (w *PipelineWorker) runPlan(ctx context.Context) (PipelineStage, error) {
 
 	plan, err := ParseSitePlan(content)
 	if err != nil {
-		// Retry with stricter prompt.
+		// Retry with stricter prompt including the actual parse error.
 		w.logger.Warn("plan JSON parse failed, retrying", "error", err)
-		retryPrompt := prompt + "\n\nCRITICAL: Your previous response was not valid JSON. Respond with ONLY a JSON object, no markdown, no explanation."
+		retryPrompt := prompt + fmt.Sprintf("\n\nCRITICAL: Your previous response was not valid JSON. Parse error: %s\nRespond with ONLY a JSON object, no markdown, no explanation.", err.Error())
 		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, retryPrompt, "Respond with ONLY the JSON site plan.", 4096)
 		tokens += tokens2
 		if err2 != nil {
@@ -165,7 +178,7 @@ func (w *PipelineWorker) runPlan(ctx context.Context) (PipelineStage, error) {
 				}))
 			}
 		}
-		PausePipeline(w.siteDB, "awaiting_owner_answers")
+		PausePipeline(w.siteDB, PauseReasonOwnerAnswers)
 		LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
 		return StagePlan, fmt.Errorf("paused: awaiting owner answers")
 	}
@@ -236,6 +249,83 @@ func (w *PipelineWorker) runDesign(ctx context.Context) (PipelineStage, error) {
 	LogStageComplete(w.siteDB, logID, totalTokens, 0, toolCalls, time.Since(start))
 	_ = lastModel
 
+	return StageBlueprintPages, nil
+}
+
+// --- BLUEPRINT_PAGES stage ---
+
+func (w *PipelineWorker) runBlueprintPages(ctx context.Context) (PipelineStage, error) {
+	start := time.Now()
+	logID, _ := LogStageStart(w.siteDB, StageBlueprintPages)
+
+	plan, err := w.loadPlan()
+	if err != nil {
+		LogStageError(w.siteDB, logID, err.Error())
+		return StageBlueprintPages, err
+	}
+
+	provider, modelID, err := w.getProvider()
+	if err != nil {
+		LogStageError(w.siteDB, logID, err.Error())
+		return StageBlueprintPages, err
+	}
+
+	// Load CSS class map from the design stage output for blueprint context.
+	cssContent := w.getGlobalCSS()
+	cssClassMap := extractCSSClassMap(cssContent)
+	layoutSummary := w.getLayoutSummary()
+
+	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+	var siteDescription string
+	if site != nil && site.Description != nil {
+		siteDescription = *site.Description
+	}
+
+	prompt := buildBlueprintPrompt(plan, cssClassMap, layoutSummary, siteDescription)
+	userMsg := "Generate the page blueprints for every page in the plan."
+	w.saveChatMessageOnce(llm.Message{Role: llm.RoleUser, Content: userMsg})
+
+	// Single LLM call, no tools — like PLAN stage.
+	content, tokens, err := w.callLLM(ctx, provider, modelID, prompt, userMsg, 8192)
+	if err != nil {
+		LogStageError(w.siteDB, logID, err.Error())
+		return StageBlueprintPages, err
+	}
+
+	bp, err := ParseSiteBlueprint(content)
+	if err != nil {
+		// Retry once with stricter prompt.
+		w.logger.Warn("blueprint parse failed, retrying", "error", err)
+		retryPrompt := prompt + fmt.Sprintf("\n\nCRITICAL: Your previous response was not valid JSON. Parse error: %s\nRespond with ONLY a JSON object, no markdown, no explanation.", err.Error())
+		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, retryPrompt, "Respond with ONLY the JSON blueprint.", 8192)
+		tokens += tokens2
+		if err2 != nil {
+			LogStageError(w.siteDB, logID, err2.Error())
+			return StageBlueprintPages, err2
+		}
+		bp, err = ParseSiteBlueprint(content)
+		if err != nil {
+			LogStageError(w.siteDB, logID, err.Error())
+			return StageBlueprintPages, fmt.Errorf("blueprint parse failed after retry: %w", err)
+		}
+	}
+
+	// Validate blueprint completeness (non-fatal: missing pages get generic treatment).
+	if issues := ValidateBlueprint(bp, plan); len(issues) > 0 {
+		w.logger.Warn("blueprint validation issues", "issues", issues)
+	}
+
+	// Save blueprint JSON to pipeline_state.
+	bpJSON, _ := json.Marshal(bp)
+	_, err = w.siteDB.ExecWrite(`UPDATE pipeline_state SET blueprint_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1`, string(bpJSON))
+	if err != nil {
+		LogStageError(w.siteDB, logID, err.Error())
+		return StageBlueprintPages, err
+	}
+
+	w.publishBrainMessage("Page blueprints created.")
+	LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
+
 	if plan.NeedsDataLayer {
 		return StageDataLayer, nil
 	}
@@ -292,15 +382,15 @@ func (w *PipelineWorker) runDataLayer(ctx context.Context) (PipelineStage, error
 		}
 		w.logger.Warn("data layer fix-up needed", "attempt", fixAttempt+1, "issues", issues)
 
-		fixPrompt := buildDataLayerFixupPrompt(issues)
+		fixPrompt := buildDataLayerFixupPrompt(issues, plan)
 		fixMessages := []llm.Message{{Role: llm.RoleUser, Content: "Fix the missing data layer items."}}
 
 		_, _, fixTokens, fixCalls, fixErr := w.runToolLoop(ctx, provider, modelID, fixPrompt, fixMessages, toolDefs, 5, 4096)
 		totalTokens += fixTokens
 		toolCalls += fixCalls
 		if fixErr != nil {
-			LogStageError(w.siteDB, logID, fixErr.Error())
-			return StageDataLayer, fixErr
+			w.logger.Warn("fixup attempt failed, will retry", "attempt", fixAttempt+1, "error", fixErr)
+			continue // let the next attempt try rather than failing the stage
 		}
 	}
 
@@ -315,6 +405,17 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 	plan, err := w.loadPlan()
 	if err != nil {
 		return StageBuildPages, err
+	}
+
+	// Check current_page_index for incremental builds (set by UPDATE_PLAN).
+	// Pages before this index are already built; only new/modified pages
+	// need building. Modified pages were soft-deleted by UPDATE_PLAN so
+	// the "already built" check below will correctly rebuild them.
+	state, _ := LoadPipelineState(w.siteDB.DB)
+	startIdx := 0
+	if state != nil && state.CurrentPageIndex > 0 && state.CurrentPageIndex < len(plan.Pages) {
+		startIdx = state.CurrentPageIndex
+		w.logger.Info("incremental build", "start_index", startIdx, "total_pages", len(plan.Pages))
 	}
 
 	// Collect all page paths for link context.
@@ -335,13 +436,36 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		siteDescription = *site.Description
 	}
 
+	// Load blueprint from pipeline_state (created by BLUEPRINT_PAGES stage).
+	var blueprint *SiteBlueprint
+	if state != nil && state.BlueprintJSON != "" {
+		blueprint, _ = ParseSiteBlueprint(state.BlueprintJSON)
+	}
+
 	// Build homepage first to establish tone, then build remaining pages concurrently.
 	// This lets us collect warnings and extract key content terms from the homepage.
 	var previousWarnings []string
 	var contentTerms []string
 	var remainingPages []PagePlan
 
-	for _, page := range plan.Pages {
+	// Determine which pages to build. For incremental builds, only process
+	// new pages (at index >= startIdx) plus any earlier pages that were
+	// soft-deleted (modified pages needing rebuild).
+	pagesToBuild := plan.Pages
+	if startIdx > 0 {
+		pagesToBuild = plan.Pages[startIdx:]
+		// Also check if any pages before startIdx need rebuilding
+		// (soft-deleted by UPDATE_PLAN for modifications).
+		for _, page := range plan.Pages[:startIdx] {
+			var exists int
+			w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
+			if exists == 0 {
+				pagesToBuild = append(pagesToBuild, page)
+			}
+		}
+	}
+
+	for _, page := range pagesToBuild {
 		if page.Path == "/" {
 			// Skip if already built (crash recovery).
 			var exists int
@@ -349,7 +473,7 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 			if exists > 0 {
 				w.logger.Info("homepage already exists, skipping", "path", "/")
 			} else {
-				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil); err != nil {
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil, blueprint); err != nil {
 					return StageBuildPages, err
 				}
 				w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
@@ -362,21 +486,18 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		}
 	}
 
-	// Build remaining pages concurrently with a worker pool.
-	const maxParallel = 3
-	sem := make(chan struct{}, maxParallel)
-	var mu sync.Mutex
-	var firstErr error
-	var wg sync.WaitGroup
+	// For incremental builds, always collect homepage context if the homepage
+	// wasn't in pagesToBuild (it already exists and wasn't modified).
+	if startIdx > 0 && len(previousWarnings) == 0 {
+		previousWarnings = w.collectPageWarnings("/")
+		contentTerms = w.extractContentTerms("/", siteDescription)
+	}
 
+	// Build remaining pages sequentially. Each page benefits from accumulated
+	// content terms and warnings from all prior pages, ensuring coherence.
+	builtPaths := []string{"/"}
 	for _, page := range remainingPages {
 		if ctx.Err() != nil {
-			break
-		}
-		mu.Lock()
-		hasErr := firstErr != nil
-		mu.Unlock()
-		if hasErr {
 			break
 		}
 
@@ -385,44 +506,34 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&exists)
 		if exists > 0 {
 			w.logger.Info("page already exists, skipping", "path", page.Path)
+			builtPaths = append(builtPaths, page.Path)
 			continue
 		}
 
-		sem <- struct{}{} // acquire slot
-		wg.Add(1)
-		go func(page PagePlan) {
-			defer wg.Done()
-			defer func() { <-sem }() // release slot
+		// Accumulate context from all previously built pages.
+		contentTerms = w.extractContentTermsFromAll(builtPaths, siteDescription)
+		previousWarnings = w.collectWarningsFromAll(builtPaths)
 
-			err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, contentTerms, previousWarnings)
-			if err != nil {
-				w.logger.Error("page build failed", "path", page.Path, "error", err)
-				// If page was created despite the error, don't propagate.
-				var created int
-				w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&created)
-				if created == 0 {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					mu.Unlock()
-					return
-				}
+		err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, contentTerms, previousWarnings, blueprint)
+		if err != nil {
+			w.logger.Error("page build failed", "path", page.Path, "error", err)
+			var created int
+			w.siteDB.Writer().QueryRow("SELECT COUNT(*) FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&created)
+			if created == 0 {
+				return StageBuildPages, err
 			}
-			w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
-		}(page)
-	}
-	wg.Wait()
-
-	if firstErr != nil {
-		return StageBuildPages, firstErr
+			// Page exists but had errors — REVIEW validators will catch quality issues.
+			w.logger.Warn("page created with errors, REVIEW will validate", "path", page.Path, "error", err)
+		}
+		w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
+		builtPaths = append(builtPaths, page.Path)
 	}
 
 	// Missing pages (if any) are caught by the REVIEW stage.
 	return StageReview, nil
 }
 
-func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription string, contentTerms, previousWarnings []string) error {
+func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription string, contentTerms, previousWarnings []string, blueprint *SiteBlueprint) error {
 	start := time.Now()
 	logID, _ := LogStageStart(w.siteDB, StageBuildPages)
 
@@ -446,16 +557,19 @@ func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, pa
 			} else {
 				entry.WriteString(fmt.Sprintf("Table: %s", tableName))
 			}
-			// Query API endpoint path + auth requirement.
-			var apiPath sql.NullString
+			// Query API endpoint path, auth requirement, and public columns.
+			var apiPath, publicCols sql.NullString
 			var requiresAuth bool
 			w.siteDB.Writer().QueryRow(
-				"SELECT path, requires_auth FROM api_endpoints WHERE table_name = ?", tableName,
-			).Scan(&apiPath, &requiresAuth)
+				"SELECT path, requires_auth, public_columns FROM api_endpoints WHERE table_name = ?", tableName,
+			).Scan(&apiPath, &requiresAuth, &publicCols)
 			if apiPath.Valid {
 				entry.WriteString(fmt.Sprintf("\nAPI endpoint: /api/%s", apiPath.String))
 				if requiresAuth {
 					entry.WriteString(" (REQUIRES AUTH — include Authorization header)")
+				}
+				if publicCols.Valid && publicCols.String != "" && publicCols.String != "[]" {
+					entry.WriteString(fmt.Sprintf("\nPublic columns (only these are returned by GET): %s", publicCols.String))
 				}
 			}
 			parts = append(parts, entry.String())
@@ -476,13 +590,35 @@ func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, pa
 			tableSchema += fmt.Sprintf("\nLogin/register JSON field: \"%s\" (use this exact key in the request body)", loginField)
 			tableSchema += fmt.Sprintf("\nExample body: {\"%s\": \"...\", \"password\": \"...\"}", loginField)
 			tableSchema += "\nUse: fetch(url, {headers: {'Authorization': 'Bearer ' + token}})"
+
+			// OAuth providers for this auth endpoint.
+			oauthRows, _ := w.siteDB.Writer().Query("SELECT name, display_name FROM oauth_providers WHERE auth_endpoint_path = ? AND is_enabled = 1", authPath.String)
+			if oauthRows != nil {
+				var oauthProviders []string
+				for oauthRows.Next() {
+					var name, displayName string
+					oauthRows.Scan(&name, &displayName)
+					oauthProviders = append(oauthProviders, fmt.Sprintf("%s (/api/%s/oauth/%s)", displayName, authPath.String, name))
+				}
+				oauthRows.Close()
+				if len(oauthProviders) > 0 {
+					tableSchema += "\nOAuth: " + strings.Join(oauthProviders, ", ")
+				}
+			}
+
+			// Role info.
+			var defaultRole, roleCol sql.NullString
+			w.siteDB.Writer().QueryRow("SELECT default_role, role_column FROM auth_endpoints WHERE path = ?", authPath.String).Scan(&defaultRole, &roleCol)
+			if defaultRole.Valid && defaultRole.String != "" {
+				tableSchema += fmt.Sprintf("\nRoles: default=%s (stored in column: %s)", defaultRole.String, roleCol.String)
+			}
 		}
 	}
 
 	// List available SVG assets for page content.
 	svgAssets := w.getSVGAssetList()
 
-	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets, contentTerms, previousWarnings)
+	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets, contentTerms, previousWarnings, blueprint)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: fmt.Sprintf("Build the page: %s (%s)", page.Title, page.Path)}}
 	w.saveChatMessageOnce(messages[0])
 
@@ -529,6 +665,13 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			siteDescription = *site.Description
 		}
 
+		// Load blueprint for rebuilding context.
+		var blueprint *SiteBlueprint
+		reviewState, _ := LoadPipelineState(w.siteDB.DB)
+		if reviewState != nil && reviewState.BlueprintJSON != "" {
+			blueprint, _ = ParseSiteBlueprint(reviewState.BlueprintJSON)
+		}
+
 		for _, page := range plan.Pages {
 			var exists int
 			// Use writer pool so we see pages created during BUILD_PAGES (WAL visibility).
@@ -536,44 +679,51 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			if exists == 0 {
 				w.logger.Warn("review: rebuilding missing planned page", "path", page.Path)
 				w.publishBrainMessage(fmt.Sprintf("Rebuilding missing page: %s", page.Path))
-				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil); err != nil {
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil, blueprint); err != nil {
 					w.logger.Error("review: failed to rebuild page", "path", page.Path, "error", err)
 				}
 			}
 		}
 	}
 
-	// Run Go-based validation (zero tokens).
-	// Use read pool — WAL mode provides immediate visibility of committed writes,
-	// and the read pool allows concurrent queries (writer pool deadlocks on nested queries).
+	// Run Go-based validation (zero tokens) with a multi-pass fix loop
+	// (same pattern as DATA_LAYER fix-up at lines 287-308).
 	issues := validateSite(w.siteDB.DB)
+	issues = append(issues, validateColorContrast(plan)...)
 	totalTokens := 0
 
-	if len(issues) > 0 {
-		w.publishBrainMessage(fmt.Sprintf("Review found %d issues, attempting fixes...", len(issues)))
-
-		// Try to fix issues with a targeted LLM call.
-		provider, modelID, err := w.getProvider()
-		if err == nil {
-			prompt := buildReviewPrompt(issues, w.siteDB.DB, plan)
-			messages := []llm.Message{{Role: llm.RoleUser, Content: "Fix the following issues:\n" + strings.Join(issues, "\n")}}
-			w.saveChatMessageOnce(messages[0])
-
-			// Give review access to page + layout + file tools for fixes.
-			toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(reviewTools))
-
-			_, _, tokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 4, 8192)
-			totalTokens += tokens
+	for fixAttempt := 0; fixAttempt < 3; fixAttempt++ {
+		if len(issues) == 0 {
+			break
+		}
+		if fixAttempt == 2 {
+			// Final attempt still has issues — log and proceed (don't block deployment).
+			w.publishBrainMessage(fmt.Sprintf("Review: %d issues remain after %d fix attempts: %s", len(issues), fixAttempt+1, strings.Join(issues, "; ")))
+			break
 		}
 
-		w.publishBrainMessage("Review fix cycle complete, re-validating...")
+		w.publishBrainMessage(fmt.Sprintf("Review found %d issues (attempt %d/3), fixing...", len(issues), fixAttempt+1))
+
+		provider, modelID, err := w.getProvider()
+		if err != nil {
+			break
+		}
+
+		prompt := buildReviewPrompt(issues, w.siteDB.DB, plan)
+		messages := []llm.Message{{Role: llm.RoleUser, Content: "Fix the following issues:\n" + strings.Join(issues, "\n")}}
+		if fixAttempt == 0 {
+			w.saveChatMessageOnce(messages[0])
+		}
+
+		toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(reviewTools))
+		_, _, tokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 4, 8192)
+		totalTokens += tokens
 
 		// Re-validate after fixes.
-		remainingIssues := validateSite(w.siteDB.DB)
-		if len(remainingIssues) > 0 {
-			w.publishBrainMessage(fmt.Sprintf("Review: %d issues remain after fixes: %s", len(remainingIssues), strings.Join(remainingIssues, "; ")))
-		}
-	} else {
+		issues = validateSite(w.siteDB.DB)
+	}
+
+	if len(issues) == 0 {
 		w.publishBrainMessage("Review passed: all validation checks OK.")
 	}
 
@@ -616,12 +766,22 @@ func (w *PipelineWorker) runUpdatePlan(ctx context.Context) (PipelineStage, erro
 		return StageUpdatePlan, err
 	}
 
-	// Load existing plan for context.
+	// Load existing plan and update description for context.
 	existingPlan, _ := w.loadPlan()
 
+	// Load the change description stored by CommandUpdate.
+	state, _ := LoadPipelineState(w.siteDB.DB)
+	changeDesc := ""
+	if state != nil {
+		changeDesc = state.UpdateDescription
+	}
+
 	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
-	prompt := buildUpdatePlanPrompt(existingPlan, site)
+	prompt := buildUpdatePlanPrompt(existingPlan, site, changeDesc)
 	userMsg := "Create a PlanPatch JSON describing the changes needed."
+	if changeDesc != "" {
+		userMsg = fmt.Sprintf("The owner requested: %s\n\nCreate a PlanPatch JSON describing the changes needed.", changeDesc)
+	}
 	w.saveChatMessageOnce(llm.Message{Role: llm.RoleUser, Content: userMsg})
 
 	content, tokens, err := w.callLLM(ctx, provider, modelID, prompt, userMsg, 4096)
@@ -641,11 +801,13 @@ func (w *PipelineWorker) runUpdatePlan(ctx context.Context) (PipelineStage, erro
 		// Add new pages.
 		existingPlan.Pages = append(existingPlan.Pages, patch.AddPages...)
 
-		// Modify existing pages.
+		// Modify existing pages: update the plan and soft-delete the old
+		// page so BUILD_PAGES will rebuild it with the new spec.
 		for _, mod := range patch.ModifyPages {
 			for i, p := range existingPlan.Pages {
 				if p.Path == mod.Path {
 					existingPlan.Pages[i] = mod
+					w.siteDB.ExecWrite("UPDATE pages SET is_deleted = 1 WHERE path = ? AND is_deleted = 0", mod.Path)
 					break
 				}
 			}
@@ -677,16 +839,20 @@ func (w *PipelineWorker) runUpdatePlan(ctx context.Context) (PipelineStage, erro
 		w.siteDB.ExecWrite("UPDATE pipeline_state SET current_page_index = ? WHERE id = 1", newStartIdx)
 	}
 
+	// Clear the update description now that it's been consumed.
+	w.siteDB.ExecWrite("UPDATE pipeline_state SET update_description = NULL WHERE id = 1")
+
 	LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
 
 	// Route to appropriate next stage.
+	// Always regenerate blueprints for new/modified pages.
 	if patch.UpdateCSS {
-		return StageDesign, nil
+		return StageDesign, nil // DESIGN → BLUEPRINT_PAGES → DATA_LAYER? → BUILD_PAGES
 	}
 	if len(patch.AddTables) > 0 {
-		return StageDataLayer, nil
+		return StageBlueprintPages, nil // BLUEPRINT_PAGES → DATA_LAYER → BUILD_PAGES
 	}
-	return StageBuildPages, nil
+	return StageBlueprintPages, nil // BLUEPRINT_PAGES → BUILD_PAGES
 }
 
 // --- Monitoring tick ---
@@ -739,7 +905,7 @@ func (w *PipelineWorker) monitoringTick(ctx context.Context) {
 	messages := []llm.Message{{Role: llm.RoleUser, Content: contextMsg.String()}}
 	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(monitoringToolSet))
 
-	_, lastModel, totalTokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 5, 1024)
+	_, lastModel, totalTokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 5, 2048)
 
 	// Don't reset idleTickCount here — only external input (chat, commands)
 	// should reset it. This lets adaptive backoff work: after 3 idle ticks
@@ -836,8 +1002,8 @@ func (w *PipelineWorker) extractContentTerms(pagePath, siteDescription string) [
 // collectPageWarnings reads a built page from DB and runs basic validation
 // to collect warnings that can be passed to subsequent page builds.
 func (w *PipelineWorker) collectPageWarnings(pagePath string) []string {
-	var content sql.NullString
-	w.siteDB.Writer().QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", pagePath).Scan(&content)
+	var content, layout sql.NullString
+	w.siteDB.Writer().QueryRow("SELECT content, layout FROM pages WHERE path = ? AND is_deleted = 0", pagePath).Scan(&content, &layout)
 	if !content.Valid || content.String == "" {
 		return nil
 	}
@@ -845,11 +1011,15 @@ func (w *PipelineWorker) collectPageWarnings(pagePath string) []string {
 	var warnings []string
 	lower := strings.ToLower(content.String)
 
-	if strings.Contains(lower, "<nav") {
-		warnings = append(warnings, "Do NOT include <nav> in pages — navigation belongs in the layout")
-	}
-	if strings.Contains(lower, "<footer") {
-		warnings = append(warnings, "Do NOT include <footer> in pages — footer belongs in the layout")
+	// Skip nav/footer warnings for layout="none" pages (standalone pages with own nav).
+	isNoneLayout := layout.Valid && layout.String == "none"
+	if !isNoneLayout {
+		if strings.Contains(lower, "<nav") {
+			warnings = append(warnings, "Do NOT include <nav> in pages — navigation belongs in the layout")
+		}
+		if strings.Contains(lower, "<footer") {
+			warnings = append(warnings, "Do NOT include <footer> in pages — footer belongs in the layout")
+		}
 	}
 	if strings.Contains(lower, "style=\"") {
 		warnings = append(warnings, "Do NOT use inline styles — use CSS classes from the global stylesheet")
@@ -861,6 +1031,40 @@ func (w *PipelineWorker) collectPageWarnings(pagePath string) []string {
 		warnings = append(warnings, "Do NOT add <link> tags for shared CSS — they are auto-injected by the server")
 	}
 
+	return warnings
+}
+
+// extractContentTermsFromAll collects content terms from all built pages for context propagation.
+func (w *PipelineWorker) extractContentTermsFromAll(builtPaths []string, siteDescription string) []string {
+	seen := make(map[string]bool)
+	var terms []string
+	for _, path := range builtPaths {
+		for _, term := range w.extractContentTerms(path, siteDescription) {
+			if !seen[term] {
+				seen[term] = true
+				terms = append(terms, term)
+			}
+		}
+	}
+	// Cap at 10 terms from all pages to keep prompt compact.
+	if len(terms) > 10 {
+		terms = terms[:10]
+	}
+	return terms
+}
+
+// collectWarningsFromAll aggregates warnings from all built pages, deduplicating.
+func (w *PipelineWorker) collectWarningsFromAll(builtPaths []string) []string {
+	seen := make(map[string]bool)
+	var warnings []string
+	for _, path := range builtPaths {
+		for _, warn := range w.collectPageWarnings(path) {
+			if !seen[warn] {
+				seen[warn] = true
+				warnings = append(warnings, warn)
+			}
+		}
+	}
 	return warnings
 }
 
@@ -914,6 +1118,7 @@ var signatureProps = map[string]bool{
 	"min-height": true, "max-width": true, "position": true,
 	"background": true, "background-color": true, "gap": true,
 	"padding": true, "text-align": true, "font-size": true,
+	"color": true, "border-radius": true, "margin": true,
 }
 
 // extractClassSignature returns a short parenthetical describing the class,
@@ -974,10 +1179,30 @@ func extractClassSignature(declarations string) string {
 			}
 		case "text-align":
 			parts = append(parts, "text:"+val)
+		case "padding":
+			parts = append(parts, "pad:"+val)
+		case "gap":
+			parts = append(parts, "gap:"+val)
+		case "font-size":
+			parts = append(parts, "font:"+val)
+		case "color":
+			if strings.Contains(val, "var(") {
+				if si := strings.Index(val, "--"); si >= 0 {
+					end := strings.IndexAny(val[si:], " ),")
+					if end < 0 {
+						end = len(val[si:])
+					}
+					parts = append(parts, "color:"+val[si:si+end])
+				}
+			}
+		case "border-radius":
+			parts = append(parts, "radius:"+val)
+		case "margin":
+			parts = append(parts, "margin:"+val)
 		}
 
-		if len(parts) >= 2 {
-			break // keep signatures short
+		if len(parts) >= 3 {
+			break // keep signatures informative but compact
 		}
 	}
 	if len(parts) == 0 {
@@ -1093,62 +1318,70 @@ func validateDesign(db *sql.DB, plan *SitePlan) []string {
 		}
 	}
 
-	// Design token enforcement: verify CSS custom properties match the plan's color scheme.
-	var storagePath sql.NullString
-	db.QueryRow("SELECT storage_path FROM assets WHERE scope = 'global' AND filename LIKE '%.css' ORDER BY filename LIMIT 1").Scan(&storagePath)
-	if storagePath.Valid && storagePath.String != "" {
-		cssData, err := os.ReadFile(storagePath.String)
-		if err == nil {
-			cssText := string(cssData)
-			issues = append(issues, validateDesignTokens(cssText, plan)...)
-		}
-	}
-
 	return issues
 }
 
-// cssCustomPropValueRe matches CSS custom property declarations with their values.
-var cssCustomPropValueRe = regexp.MustCompile(`(--[\w-]+)\s*:\s*([^;}\n]+)`)
-
-// validateDesignTokens checks that CSS custom properties match the plan's color scheme.
-func validateDesignTokens(cssContent string, plan *SitePlan) []string {
-	// Extract all custom property values from CSS.
-	propValues := make(map[string]string)
-	for _, m := range cssCustomPropValueRe.FindAllStringSubmatch(cssContent, -1) {
-		if len(m) > 2 {
-			propValues[m[1]] = strings.TrimSpace(m[2])
-		}
+// hexToLuminance converts a hex color (#rrggbb or #rgb) to relative luminance (0-1).
+func hexToLuminance(hex string) (float64, bool) {
+	hex = strings.TrimSpace(strings.TrimPrefix(hex, "#"))
+	if len(hex) == 3 {
+		hex = string([]byte{hex[0], hex[0], hex[1], hex[1], hex[2], hex[2]})
 	}
+	if len(hex) != 6 {
+		return 0, false
+	}
+	r, err1 := strconv.ParseUint(hex[0:2], 16, 8)
+	g, err2 := strconv.ParseUint(hex[2:4], 16, 8)
+	b, err3 := strconv.ParseUint(hex[4:6], 16, 8)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return 0, false
+	}
+	// sRGB to linear conversion.
+	linearize := func(v uint64) float64 {
+		s := float64(v) / 255.0
+		if s <= 0.03928 {
+			return s / 12.92
+		}
+		return math.Pow((s+0.055)/1.055, 2.4)
+	}
+	return 0.2126*linearize(r) + 0.7152*linearize(g) + 0.0722*linearize(b), true
+}
 
+// contrastRatio computes the WCAG contrast ratio between two luminance values.
+func contrastRatio(l1, l2 float64) float64 {
+	if l1 < l2 {
+		l1, l2 = l2, l1
+	}
+	return (l1 + 0.05) / (l2 + 0.05)
+}
+
+// validateColorContrast checks that text/background colors have sufficient contrast (WCAG AA).
+func validateColorContrast(plan *SitePlan) []string {
 	var issues []string
-	expected := map[string]string{
-		"--primary":   plan.ColorScheme.Primary,
-		"--secondary": plan.ColorScheme.Secondary,
-		"--accent":    plan.ColorScheme.Accent,
-		"--bg":        plan.ColorScheme.Background,
-		"--text":      plan.ColorScheme.Text,
+
+	textLum, textOK := hexToLuminance(plan.ColorScheme.Text)
+	bgLum, bgOK := hexToLuminance(plan.ColorScheme.Background)
+	primaryLum, primaryOK := hexToLuminance(plan.ColorScheme.Primary)
+
+	if textOK && bgOK {
+		ratio := contrastRatio(textLum, bgLum)
+		if ratio < 4.5 {
+			issues = append(issues, fmt.Sprintf(
+				"Text color %s on background %s has low contrast (%.1f:1, WCAG AA requires 4.5:1)",
+				plan.ColorScheme.Text, plan.ColorScheme.Background, ratio))
+		}
 	}
 
-	for prop, expectedVal := range expected {
-		if expectedVal == "" {
-			continue
-		}
-		actual, exists := propValues[prop]
-		if !exists {
-			issues = append(issues, fmt.Sprintf("CSS missing custom property %s (expected %s from plan)", prop, expectedVal))
-			continue
-		}
-		if !colorsMatch(actual, expectedVal) {
-			issues = append(issues, fmt.Sprintf("CSS %s is %s but plan specifies %s", prop, actual, expectedVal))
+	if primaryOK && bgOK {
+		ratio := contrastRatio(primaryLum, bgLum)
+		if ratio < 3.0 {
+			issues = append(issues, fmt.Sprintf(
+				"Primary color %s on background %s has low contrast (%.1f:1, minimum 3:1 for large text)",
+				plan.ColorScheme.Primary, plan.ColorScheme.Background, ratio))
 		}
 	}
 
 	return issues
-}
-
-// colorsMatch compares two CSS color values, normalizing hex case.
-func colorsMatch(a, b string) bool {
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
 // validateDataLayer checks that all planned tables and endpoints exist.

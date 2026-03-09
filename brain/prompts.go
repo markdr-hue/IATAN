@@ -59,8 +59,9 @@ Create a complete site plan as a JSON object with this exact structure:
     {
       "path": "/",
       "title": "Page Title",
-      "purpose": "Brief description of what this page does",
+      "purpose": "2-3 sentences: what this page shows, its layout pattern, and the user's goal",
       "sections": ["hero", "features", "cta"],
+      "component_hints": ["hero-cta", "feature-grid-3col", "cta-banner"],
       "links_to": ["/about", "/services"],
       "needs_data": false,
       "data_tables": [],
@@ -90,21 +91,33 @@ Create a complete site plan as a JSON object with this exact structure:
 ## Rules
 
 1. ALWAYS include a homepage at path "/" and a 404 page at "/404"
-2. Architecture: use "spa" for app-like sites, "multi-page" for content sites
-3. Choose colors that work well together — use analogous, complementary, or triadic schemes
-4. Choose 1-2 Google Fonts that complement each other
-5. "scale" is the modular type scale ratio (1.125=minor second, 1.25=major third, 1.333=perfect fourth)
+2. Architecture: use "spa" for app-like sites with navigation between views, "multi-page" for content/brochure sites
+3. Color scheme — choose light or dark theme based on the site's brand and audience:
+   - background and text must have strong contrast (WCAG AA ratio >= 4.5:1)
+   - primary: vibrant, stands out against background (buttons, links, accents)
+   - secondary: complementary to primary, used for less prominent elements
+   - accent: distinct from both primary and secondary (highlights, badges, hover states)
+   - surface: subtle offset from background for cards, panels, modals (slightly lighter for dark themes, slightly darker for light themes)
+   - text_muted: lower contrast than text but still readable against background (ratio >= 3:1)
+   - All colors as hex values (#rrggbb format)
+4. Choose 1-2 Google Fonts that complement each other (one for headings, one for body)
+5. "scale" is the modular type scale ratio: "1.125" (minor second), "1.2" (minor third), "1.25" (major third), "1.333" (perfect fourth). Use 1.2-1.25 for most sites.
 6. Each page should have 2-6 meaningful sections (not just "content")
-7. "links_to" should reference paths of other pages in the plan
-8. "nav_items" is the ordered list of page paths for the main navigation (exclude /404)
-9. If the site needs dynamic data (products, blog posts, user accounts), set "needs_data_layer": true and define tables
-10. For data_tables, each column is {"name": "col_name", "type": "TYPE"}. Types: TEXT, INTEGER, REAL, BOOLEAN, PASSWORD, ENCRYPTED. Optional: "primary": true, "required": true
-11. Set "data_tables": [] and "needs_data_layer": false if the site doesn't need dynamic data
-12. Each page's "data_tables" is an array of table names the page needs (e.g. ["articles", "comments"]). A page can use multiple tables.
-13. Each page can specify a "layout" name. Options: "default" (standard nav+footer), "none" (no layout — for landing pages), or a custom name like "blog" (with sidebar). Most pages should use "default". The DESIGN stage will create all referenced layouts.
-14. If the site needs payments (e-commerce, donations, subscriptions), set "needs_data_layer": true — the DATA_LAYER stage will configure the payment provider.
-15. If the site needs file uploads (profile pics, attachments, form submissions), set "needs_data_layer": true — the DATA_LAYER stage will create upload endpoints.
-16. If the site needs real-time updates (chat, live feeds, notifications), set "needs_data_layer": true — the DATA_LAYER stage will create SSE stream endpoints.
+7. "purpose" must be 2-3 sentences describing: what the page shows, the layout pattern (hero+grid, sidebar+content, full-width form), and the user's goal on this page
+8. "component_hints" suggests UI patterns for each page (e.g. "hero-cta", "feature-grid-3col", "pricing-table", "testimonial-cards", "contact-form", "blog-list", "sidebar-nav"). These guide the design stage.
+9. "links_to" should reference paths of other pages in the plan. For parameterised routes use the base path (e.g. "/thread" to link to "/thread/:id")
+10. "nav_items" is the ordered list of page paths for the main navigation (exclude /404)
+11. If the site needs dynamic data (products, blog posts, user accounts), set "needs_data_layer": true and define tables
+12. For data_tables, each column is {"name": "col_name", "type": "TYPE"}. Types: TEXT, INTEGER, REAL, BOOLEAN, PASSWORD, ENCRYPTED. Optional: "primary": true, "required": true
+13. Set "data_tables": [] and "needs_data_layer": false if the site doesn't need dynamic data
+14. Each page's "data_tables" is an array of table names the page needs (e.g. ["articles", "comments"]). A page can use multiple tables.
+15. Each page can specify a "layout" name. Options: "default" (standard nav+footer), "none" (no layout — for landing pages), or a custom name like "blog" (with sidebar). Most pages should use "default". The DESIGN stage will create all referenced layouts.
+16. If the site needs payments (e-commerce, donations, subscriptions), set "needs_data_layer": true — the DATA_LAYER stage will configure the payment provider.
+17. If the site needs file uploads (profile pics, attachments, form submissions), set "needs_data_layer": true — the DATA_LAYER stage will create upload endpoints.
+18. If the site needs real-time updates, set "needs_data_layer": true — the DATA_LAYER stage will create real-time endpoints. Use SSE for server→client updates (live feeds, notifications). Use WebSocket for bidirectional communication (chat, collaborative editing, interactive features).
+19. Pages with login, register, or sign-in forms MUST set "needs_data": true and include the user/auth table name in "data_tables". This ensures the page builder receives the auth endpoint URL and JSON field names.
+20. If the site needs social login (Google, GitHub, etc.), include "has_oauth": ["google", "github"] on the user table. The table MUST also have has_auth: true and a PASSWORD column. Set "needs_data_layer": true.
+21. If the site has different user roles (admin, editor, member), include "roles": ["user", "admin"] on the user table. The table should have a TEXT column named "role". For API endpoints only accessible to specific roles, note this in the page's purpose.
 
 ## Vague Descriptions
 
@@ -146,8 +159,12 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
    - Include a CSS reset/normalize
    - Base typography styles using the scale
    - Utility classes for common patterns (containers, grids, cards, buttons)
-   - Mobile-first responsive design with breakpoints
-   - Dark-first color scheme using the planned colors
+   - Mobile-first responsive design with these breakpoints:
+     @media (min-width: 640px) — sm (landscape phones)
+     @media (min-width: 768px) — md (tablets)
+     @media (min-width: 1024px) — lg (desktops)
+     @media (min-width: 1280px) — xl (wide screens)
+   - Color scheme using the planned colors (respect the theme — dark or light)
 
 2. CREATE LAYOUTS (manage_layout, action="save"):
    - Create the "default" layout (name="default"):
@@ -194,9 +211,13 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
    - Update document.title from response.title
    IMPORTANT: When dynamically loading page_js scripts, do NOT set script.defer = true.
    Dynamically appended scripts should execute immediately so page initialization runs.
+   ERROR HANDLING:
+   - On 404 response: fetch and display the /404 page content, update URL
+   - On network error: show a brief inline "Connection lost" message in main
+   - Add a loading indicator (CSS class 'page-loading' on main) during page transitions
 
    Include a global state manager at the TOP of router.js (before the router logic):
-   window.IATAN = {
+   window.AppState = {
      state: {},
      _listeners: {},
      set: function(key, value) { this.state[key] = value; this.emit(key, value); },
@@ -205,8 +226,8 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
      off: function(key, fn) { this._listeners[key] = (this._listeners[key]||[]).filter(function(f){return f!==fn;}); },
      emit: function(key, value) { (this._listeners[key]||[]).forEach(function(fn){ fn(value); }); }
    };
-   Pages use IATAN.set('auth:token', token) after login and IATAN.on('auth:token', fn) to react.
-   On navigation, emit IATAN.emit('navigate', newPath) so pages can clean up listeners.
+   Pages use AppState.set('auth:token', token) after login and AppState.on('auth:token', fn) to react.
+   On navigation, emit AppState.emit('navigate', newPath) so pages can clean up listeners.
 
 `)
 	}
@@ -217,13 +238,14 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
 		nextTask = 4
 	}
 
-	b.WriteString(fmt.Sprintf(`%d. CREATE DECORATIVE SVGs (manage_files, action="save", storage="assets", scope="page"):
-   - Create 2-3 simple, abstract SVG illustrations for hero sections and feature highlights
-   - Use CSS custom properties for colors so they match the theme: fill="var(--primary)", stroke="var(--accent)"
-   - Keep SVGs small (< 3KB each) — abstract shapes, geometric patterns, decorative icons
-   - Name them descriptively: svg/hero-decoration.svg, svg/feature-icon-1.svg
-   - Pages can reference these using inline SVG or <img src="/assets/svg/...">
-   - Focus on decorative, abstract designs (waves, circles, grid patterns, abstract shapes)
+	b.WriteString(fmt.Sprintf(`%d. OPTIONAL: CREATE DECORATIVE SVGs (manage_files, action="save", storage="assets"):
+   - Prefer CSS gradients, shapes, and borders over SVG illustrations when possible
+   - Only create SVGs if the design truly benefits from them (icons, simple decorations)
+   - If you do create SVGs, save each one via manage_files — pages can ONLY reference SVGs that were actually saved
+   - Keep SVGs small (< 3KB each) — abstract shapes, geometric patterns
+   - Use CSS custom properties: fill="var(--primary)", stroke="var(--accent)"
+   - Name them descriptively: svg/hero-decoration.svg, svg/feature-icon.svg
+   - Use scope="global" for SVGs reused across pages, scope="page" for single-use
 
 `, nextTask))
 	nextTask++
@@ -244,6 +266,109 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
 - Accessible: skip-to-content link, ARIA labels, focus styles, color contrast
 - No inline styles — everything in CSS files
 - Images: use inline SVGs or CSS shapes, no external hotlinks
+`)
+
+	return b.String()
+}
+
+// --- BLUEPRINT_PAGES stage prompt ---
+
+func buildBlueprintPrompt(plan *SitePlan, cssClassMap, layoutSummary, siteDescription string) string {
+	var b strings.Builder
+
+	b.WriteString("You are IATAN, an AI that creates detailed page blueprints. Respond with ONLY a JSON object — no markdown, no explanation, no code fences.\n\n")
+
+	b.WriteString("## Site Context\n")
+	if siteDescription != "" {
+		b.WriteString(fmt.Sprintf("- About: %s\n", siteDescription))
+	}
+	b.WriteString(fmt.Sprintf("- Architecture: %s\n", plan.Architecture))
+	if plan.DesignNotes != "" {
+		b.WriteString(fmt.Sprintf("- Design direction: %s\n", plan.DesignNotes))
+	}
+	b.WriteString(fmt.Sprintf("- Colors: primary=%s, secondary=%s, accent=%s, bg=%s, text=%s\n",
+		plan.ColorScheme.Primary, plan.ColorScheme.Secondary, plan.ColorScheme.Accent,
+		plan.ColorScheme.Background, plan.ColorScheme.Text))
+	b.WriteString(fmt.Sprintf("- Fonts: heading=%s, body=%s\n\n", plan.Typography.HeadingFont, plan.Typography.BodyFont))
+
+	b.WriteString("## Layout\n")
+	b.WriteString(layoutSummary + "\n\n")
+
+	if cssClassMap != "" {
+		b.WriteString("## Available CSS Classes\n")
+		b.WriteString(cssClassMap + "\n\n")
+	}
+
+	b.WriteString("## Pages to Blueprint\n")
+	for _, p := range plan.Pages {
+		b.WriteString(fmt.Sprintf("\n### %s — %s\n", p.Path, p.Title))
+		b.WriteString(fmt.Sprintf("- Purpose: %s\n", p.Purpose))
+		if len(p.Sections) > 0 {
+			b.WriteString(fmt.Sprintf("- Sections: %s\n", strings.Join(p.Sections, ", ")))
+		}
+		if len(p.ComponentHints) > 0 {
+			b.WriteString(fmt.Sprintf("- Component hints: %s\n", strings.Join(p.ComponentHints, ", ")))
+		}
+		if p.NeedsData && len(p.DataTables) > 0 {
+			b.WriteString(fmt.Sprintf("- Data tables: %s\n", strings.Join(p.DataTables, ", ")))
+		}
+		if len(p.LinksTo) > 0 {
+			b.WriteString(fmt.Sprintf("- Links to: %s\n", strings.Join(p.LinksTo, ", ")))
+		}
+		if p.Layout != "" && p.Layout != "default" {
+			b.WriteString(fmt.Sprintf("- Layout: %s\n", p.Layout))
+		}
+	}
+
+	b.WriteString(`
+
+## Output Format
+
+Respond with ONLY this JSON structure:
+{
+  "pages": [
+    {
+      "path": "/",
+      "html_skeleton": "<section class='hero'><!-- hero heading + CTA button --></section>\n<section class='features'><!-- 3-column grid of feature cards --></section>",
+      "component_patterns": ["hero-cta", "feature-grid-3col"],
+      "content_notes": "Professional tone, emphasize value propositions. Hero: bold headline + subtitle + primary CTA. Features: icon + title + short description per card.",
+      "data_display": "fetch /api/products, display as card grid with image, title, price"
+    }
+  ],
+  "shared_patterns": {
+    "card": "class='card' containing: optional img, h3.card-title, p.card-text, optional a.card-link",
+    "button-primary": "class='btn btn-primary' for main CTAs",
+    "button-secondary": "class='btn btn-secondary' for secondary actions",
+    "section-header": "h2 + p.section-subtitle centered above content"
+  },
+  "content_style": "Professional and approachable. Use active voice, specific details over generic statements. Paragraphs: 2-3 sentences. Section headings: action-oriented."
+}
+
+## Rules
+
+1. html_skeleton is a CONCISE structural outline using ONLY classes from the CSS reference above
+   - Use HTML comments for content descriptions, not actual content
+   - Show the section/container/grid structure, not every element
+   - Keep it under 500 chars per page — this is a skeleton, not the final HTML
+
+2. component_patterns lists the reusable UI patterns each page uses (e.g. "hero-cta", "card-grid", "form-contact")
+   - Use consistent names across pages — if page 1 uses "card-grid", page 3 should too
+   - This creates a shared vocabulary that BUILD_PAGES will follow
+
+3. content_notes describes tone, content approach, and specific guidance per page
+   - What should the hero say? What data to highlight? What calls-to-action?
+   - Be specific: "3 testimonials with name, role, quote" not just "testimonials"
+
+4. data_display (only for pages with data tables) describes how to fetch and render API data
+   - Include the exact API endpoint path
+   - Describe the display pattern (table, card grid, list, detail view)
+
+5. shared_patterns defines reusable component structures used across multiple pages
+   - Reference actual CSS classes from the stylesheet
+   - Keep definitions short — just the HTML structure pattern
+
+6. content_style sets the overall writing tone for ALL pages
+   - Be specific about voice, sentence length, heading style
 `)
 
 	return b.String()
@@ -296,6 +421,12 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
 				authProtectedTables = append(authProtectedTables, t.Name)
 			}
 		}
+		if len(t.HasOAuth) > 0 {
+			b.WriteString(fmt.Sprintf("**Needs OAuth (social login): %s** — create OAuth providers after auth endpoint\n", strings.Join(t.HasOAuth, ", ")))
+		}
+		if len(t.Roles) > 0 {
+			b.WriteString(fmt.Sprintf("**User roles: %s** — set default_role on auth endpoint, use required_role on protected API endpoints\n", strings.Join(t.Roles, ", ")))
+		}
 		if t.SeedData {
 			b.WriteString("Needs seed data: yes (use bulk insert with rows parameter)\n")
 		}
@@ -334,11 +465,20 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
    - Returns: {"url": "/files/uploads/...", "filename": "...", "size": 1234, "type": "image/png"}
    - Optional: set table_name to auto-store metadata, requires_auth for protected uploads
 
-5. Create stream endpoints if any page needs real-time updates (chat, live feeds, notifications):
-   - manage_endpoints(action="create_stream", path="messages", event_types=["data.insert", "data.update"])
-   - This creates GET /api/messages/stream (SSE endpoint)
-   - Frontend: const source = new EventSource('/api/messages/stream');
-   - source.addEventListener('data.insert', (e) => { const data = JSON.parse(e.data); ... });
+5. Create real-time endpoints based on the site's needs:
+   - For server→client updates (live feeds, notifications, dashboards):
+     manage_endpoints(action="create_stream", path="messages", event_types=["data.insert", "data.update"])
+     This creates GET /api/messages/stream (SSE endpoint)
+     Frontend: const source = new EventSource('/api/messages/stream');
+     source.addEventListener('data.insert', (e) => { const data = JSON.parse(e.data); ... });
+   - For bidirectional real-time (chat, collaborative features, interactive apps):
+     manage_endpoints(action="create_websocket", path="chat", event_types=["data.insert"], receive_event_type="chat.message", write_to_table="messages")
+     This creates GET /api/chat/ws (WebSocket endpoint)
+     Frontend: const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/chat/ws');
+     ws.onmessage = (e) => { const data = JSON.parse(e.data); ... };
+     ws.send(JSON.stringify({content: "hello"}));
+   - Choose SSE when clients only need to receive updates (simpler, auto-reconnect built in)
+   - Choose WebSocket when clients need to SEND data in real-time (chat messages, live collaboration)
 
 6. If the site needs to send emails (contact forms, notifications, welcome emails):
    - First ensure an email provider exists: manage_providers(action="add", name="email", base_url="https://api.sendgrid.com/v3", ...)
@@ -353,8 +493,30 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
    - The frontend will call a custom API endpoint that uses create_checkout to get a checkout URL and redirect
 
 8. Seed data using manage_data(action="insert", rows=[{...}, {...}]) if seed_data is true
-   - Use the rows parameter with an array of row objects for bulk insert (3-5 rows per table)
-   - Example: manage_data(action="insert", table_name="posts", rows=[{"title": "First Post", "body": "Hello"}, {"title": "Second Post", "body": "World"}])
+   - Use the rows parameter with an array of row objects for bulk insert (5-10 rows per table)
+   - Include diverse, realistic data: vary categories, dates, content lengths, and styles
+   - Example: manage_data(action="insert", table_name="posts", rows=[{"title": "Getting Started", "body": "A comprehensive guide...", "category": "tutorial"}, ...])
+   - For blog/article tables: vary post lengths (short, medium, long), include different authors/categories
+   - For product tables: vary prices, categories, and include realistic descriptions
+
+9. If the site needs to receive webhooks from external services (payment confirmations, form submissions):
+   - Create incoming webhooks: manage_webhooks(action="create", path="stripe-events", secret_name="stripe_webhook_secret")
+   - This creates POST /api/webhooks/{path} that validates the signature and stores events
+   - Only create webhooks if the site actually integrates with external services that send them
+
+10. For OAuth (social login), after creating the auth endpoint:
+   - Ask the site owner for client_id and client_secret: manage_communication(action="ask", question="Please provide OAuth client ID and secret for Google login. Register at https://console.cloud.google.com. Callback URL: /api/{auth_path}/oauth/google/callback", type="text")
+   - Then create: manage_endpoints(action="create_oauth", provider_name="google", display_name="Google", client_id="...", client_secret="...", authorize_url="https://accounts.google.com/o/oauth2/v2/auth", token_url="https://oauth2.googleapis.com/token", userinfo_url="https://www.googleapis.com/oauth2/v3/userinfo", scopes="openid email profile", username_field="email", auth_path="auth")
+   Common provider URLs:
+   - Google: authorize=https://accounts.google.com/o/oauth2/v2/auth, token=https://oauth2.googleapis.com/token, userinfo=https://www.googleapis.com/oauth2/v3/userinfo
+   - GitHub: authorize=https://github.com/login/oauth/authorize, token=https://github.com/login/oauth/access_token, userinfo=https://api.github.com/user, username_field="login"
+   - Discord: authorize=https://discord.com/api/oauth2/authorize, token=https://discord.com/api/oauth2/token, userinfo=https://discord.com/api/users/@me, scopes="identify email"
+
+11. For role-based access control (RBAC):
+   - Include a "role" TEXT column in the user table schema
+   - Set default_role on create_auth: manage_endpoints(action="create_auth", ..., default_role="user", role_column="role")
+   - For admin-only API endpoints: manage_endpoints(action="create_api", ..., requires_auth=true, required_role="admin")
+   - Role is embedded in the JWT token and checked automatically by the API middleware
 `)
 
 	return b.String()
@@ -362,7 +524,7 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
 
 // --- BUILD_PAGES (per-page) prompt ---
 
-func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets string, contentTerms, previousWarnings []string) string {
+func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets string, contentTerms, previousWarnings []string, blueprint *SiteBlueprint) string {
 	var b strings.Builder
 
 	b.WriteString("You are IATAN, an AI that builds web pages. Create ONE page using manage_pages.\n\n")
@@ -422,7 +584,41 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 	if svgAssets != "" {
 		b.WriteString("## Available SVG Illustrations\n")
 		b.WriteString(svgAssets)
-		b.WriteString("Use these in hero sections and feature areas via <img src=\"/assets/svg/...\"> or inline SVG.\n\n")
+		b.WriteString("Use these in hero sections and feature areas via <img src=\"/assets/svg/...\"> or inline SVG.\n")
+		b.WriteString("IMPORTANT: ONLY reference SVG filenames listed above. Do NOT invent new asset paths that don't exist.\n\n")
+	} else {
+		b.WriteString("No SVG assets are available. Use CSS gradients, borders, and shapes for decorative elements instead of <img> tags.\n\n")
+	}
+
+	// Blueprint context: detailed page spec from BLUEPRINT_PAGES stage.
+	if blueprint != nil {
+		pageBP := blueprint.BlueprintForPage(page.Path)
+		if pageBP != nil {
+			b.WriteString("## Page Blueprint (FOLLOW THIS STRUCTURE)\n")
+			if pageBP.HTMLSkeleton != "" {
+				b.WriteString("HTML skeleton:\n```\n" + pageBP.HTMLSkeleton + "\n```\n")
+			}
+			if len(pageBP.ComponentPatterns) > 0 {
+				b.WriteString("Components: " + strings.Join(pageBP.ComponentPatterns, ", ") + "\n")
+			}
+			if pageBP.ContentNotes != "" {
+				b.WriteString("Content guidance: " + pageBP.ContentNotes + "\n")
+			}
+			if pageBP.DataDisplay != "" {
+				b.WriteString("Data display: " + pageBP.DataDisplay + "\n")
+			}
+			b.WriteString("\n")
+		}
+		if len(blueprint.SharedPatterns) > 0 {
+			b.WriteString("## Shared Component Patterns (use consistently across all pages)\n")
+			for name, pattern := range blueprint.SharedPatterns {
+				b.WriteString(fmt.Sprintf("- **%s**: %s\n", name, pattern))
+			}
+			b.WriteString("\n")
+		}
+		if blueprint.ContentStyle != "" {
+			b.WriteString("## Content Style\n" + blueprint.ContentStyle + "\n\n")
+		}
 	}
 
 	if tableSchema != "" {
@@ -451,7 +647,7 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 1. Call manage_pages(action="save") with:
    - path, title, content (HTML for inside <main> only), status="published"
    - metadata: {"description": "...", "keywords": "..."}
-   - If you create page-scoped assets, list them in the assets param`)
+   - If you create page-scoped assets, list them in the assets param as a JSON array: ["js/page-chart.js", "css/page-gallery.css"]`)
 
 	if page.Layout != "" && page.Layout != "default" {
 		b.WriteString(fmt.Sprintf("\n   - layout: \"%s\"", page.Layout))
@@ -479,12 +675,14 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 		b.WriteString(`
 4. SPA Rules:
    - Inline <script> must be wrapped in an IIFE: (function(){ ... })();
+   - Add data-page-asset attribute to inline scripts: <script data-page-asset>(function(){ ... })();</script>
+     This allows the SPA router to clean them up during navigation.
    - The router handles navigation — just use normal <a href="/path"> links
-   - Use window.IATAN for shared state across pages:
-     - IATAN.set('auth:token', token) after login
-     - IATAN.get('auth:token') to check auth state
-     - IATAN.on('auth:token', function(token){ ... }) to react to auth changes
-     - IATAN.on('navigate', function(path){ /* cleanup */ }) for page teardown
+   - Use window.AppState for shared state across pages:
+     - AppState.set('auth:token', token) after login
+     - AppState.get('auth:token') to check auth state
+     - AppState.on('auth:token', function(token){ ... }) to react to auth changes
+     - AppState.on('navigate', function(path){ /* cleanup */ }) for page teardown
 `)
 	}
 
@@ -504,8 +702,13 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
    - Real-time SSE: const source = new EventSource('/api/{path}/stream');
      source.addEventListener('data.insert', (e) => { const data = JSON.parse(e.data); /* new row */ });
      Events: data.insert, data.update, data.delete — each has {table, id} payload
+   - Real-time WebSocket: const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/{path}/ws');
+     ws.onmessage = (e) => { const msg = JSON.parse(e.data); /* handle event */ };
+     ws.send(JSON.stringify({...}));  // send data to server
+     Use SSE for one-way feeds, WebSocket for bidirectional (chat, collaboration)
    - Example: fetch('/api/articles').then(r=>r.json()).then(res => { res.data.forEach(item => { ... }) })
    - Always handle loading states and empty states
+   - Pagination: fetch('/api/items?limit=10&offset=0'), then increment offset by res.data.length; hide "load more" when res.data.length < limit
    - If you create a JS asset file (via manage_files), it MUST use the real API endpoint — no placeholders or TODOs
 `)
 
@@ -522,6 +725,28 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
    - Registration: POST /api/{auth_path}/register with the same JSON body format
    - CRITICAL: The JSON key for login/register MUST match the field name shown above (e.g. "email" not "username", unless the field IS "username")
    - Check if user is logged in before showing protected content
+`)
+		}
+		if strings.Contains(tableSchema, "OAuth:") {
+			b.WriteString(`
+6b. OAuth / Social Login:
+   - Add OAuth buttons as simple <a> links (the server handles the redirect):
+     <a href="/api/{auth_path}/oauth/google" class="btn btn-oauth">Continue with Google</a>
+   - After OAuth callback, the server redirects to /?token={jwt}
+   - Capture the token from the URL on page load:
+     const params = new URLSearchParams(window.location.search);
+     const token = params.get('token');
+     if (token) { localStorage.setItem('auth_token', token); window.history.replaceState({}, '', '/'); }
+   - Place OAuth buttons above the regular login form with a divider ("or")
+`)
+		}
+		if strings.Contains(tableSchema, "Roles:") {
+			b.WriteString(`
+6c. Role-Based UI:
+   - Read the user's role from the JWT payload for conditional UI:
+     function getUserRole() { const t = localStorage.getItem('auth_token'); if (!t) return null; try { return JSON.parse(atob(t.split('.')[1])).role; } catch { return null; } }
+   - Show/hide admin sections based on role (display-only, API enforces the real check)
+   - Example: if (getUserRole() === 'admin') document.querySelector('.admin-panel')?.classList.remove('hidden');
 `)
 		}
 	}
@@ -701,10 +926,24 @@ func buildChatWakePrompt(site *models.Site, siteDB *sql.DB, userMessage string) 
 
 // --- UPDATE_PLAN prompt ---
 
-func buildUpdatePlanPrompt(existingPlan *SitePlan, site *models.Site) string {
+func buildUpdatePlanPrompt(existingPlan *SitePlan, site *models.Site, changeDescription string) string {
 	var b strings.Builder
 
 	b.WriteString("You are IATAN, planning incremental changes to an existing site. Respond with ONLY a JSON PlanPatch object.\n\n")
+
+	if site != nil {
+		b.WriteString("## Site\n")
+		b.WriteString(fmt.Sprintf("- Name: %s\n", site.Name))
+		if site.Description != nil && *site.Description != "" {
+			b.WriteString(fmt.Sprintf("- About: %s\n", *site.Description))
+		}
+		b.WriteString("\n")
+	}
+
+	if changeDescription != "" {
+		b.WriteString("## Requested Changes\n")
+		b.WriteString(changeDescription + "\n\n")
+	}
 
 	b.WriteString("## Current Site Plan\n```json\n")
 	if existingPlan != nil {
@@ -741,13 +980,29 @@ Rules:
 
 // --- DATA_LAYER fix-up prompt (lightweight) ---
 
-func buildDataLayerFixupPrompt(issues []string) string {
+func buildDataLayerFixupPrompt(issues []string, plan *SitePlan) string {
 	var b strings.Builder
 	b.WriteString("You are IATAN, fixing missing data layer items. Create ONLY the missing items listed below.\n\n")
 	b.WriteString("## Missing Items\n")
 	for _, issue := range issues {
 		b.WriteString("- " + issue + "\n")
 	}
+
+	// Include table schemas so the LLM knows column names/types.
+	if len(plan.DataTables) > 0 {
+		b.WriteString("\n## Table Schemas (from plan)\n")
+		for _, t := range plan.DataTables {
+			b.WriteString(fmt.Sprintf("### %s (has_api=%v, has_auth=%v)\n", t.Name, t.HasAPI, t.HasAuth))
+			for _, c := range t.Columns {
+				b.WriteString(fmt.Sprintf("  - %s %s", c.Name, c.Type))
+				if c.Required {
+					b.WriteString(" (required)")
+				}
+				b.WriteString("\n")
+			}
+		}
+	}
+
 	b.WriteString(`
 ## Rules
 - Do NOT recreate tables or endpoints that already exist
@@ -780,7 +1035,7 @@ func buildScheduledTaskPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 	return b.String()
 }
 
-// --- Context loaders (reused from old prompt.go) ---
+// --- Context loaders ---
 
 type siteContext struct {
 	name, domain, mode, description, direction string

@@ -92,7 +92,7 @@ func (t *SecretsTool) executeStore(ctx *ToolContext, args map[string]interface{}
 	}}, nil
 }
 
-func (t *SecretsTool) executeList(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *SecretsTool) executeList(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT id, name, created_at, updated_at FROM secrets ORDER BY name",
 	)

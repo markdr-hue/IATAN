@@ -18,6 +18,7 @@ import (
 	"github.com/markdr-hue/IATAN/events"
 	"github.com/markdr-hue/IATAN/llm"
 	"github.com/markdr-hue/IATAN/security"
+	"github.com/markdr-hue/IATAN/server/middleware"
 	"github.com/markdr-hue/IATAN/tools"
 )
 
@@ -65,13 +66,17 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 	siteLayoutsH := &SiteLayoutsHandler{deps: deps}
 	siteAnalyticsH := &SiteAnalyticsHandler{deps: deps}
 	siteDiagH := &SiteDiagnosticsHandler{deps: deps}
+	authLimiter := middleware.NewRateLimiter(5, 10)
 	r.Route("/admin/api", func(r chi.Router) {
 		// Public endpoints (no JWT required).
-		r.Post("/auth/login", auth.HandleLogin)
-		r.Post("/auth/logout", auth.HandleLogout)
 		r.Get("/setup/check", auth.HandleSetupCheck)
 		r.Get("/setup/providers", auth.HandleProviderCatalog)
-		r.Post("/setup", auth.HandleSetup)
+		r.Group(func(r chi.Router) {
+			r.Use(authLimiter.Handler)
+			r.Post("/auth/login", auth.HandleLogin)
+			r.Post("/auth/logout", auth.HandleLogout)
+			r.Post("/setup", auth.HandleSetup)
+		})
 
 		// Protected endpoints (JWT required).
 		r.Group(func(r chi.Router) {

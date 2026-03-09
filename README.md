@@ -23,10 +23,12 @@ To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the bra
 ## Features
 
 - **Autonomous site/app building** : Describe what you want, the AI plans, designs, codes, and deploys it
-- **Dynamic REST APIs** : Auto-generated CRUD endpoints with filtering, sorting, and pagination
-- **User authentication** : JWT-based auth flows with role support, built by the AI on demand
+- **Dynamic REST APIs** : Auto-generated CRUD endpoints with filtering, sorting, pagination, and role-based access control
+- **User authentication** : JWT-based auth with bcrypt password hashing, configurable roles, and secure token management
+- **OAuth / social login** : Google, GitHub, Discord, and any OAuth 2.0 provider, configured by the AI with HMAC-signed state and automatic user provisioning
+- **Role-based access control** : Per-endpoint role enforcement, default role assignment on registration, and role-aware API middleware
 - **File uploads** : Public upload endpoints with MIME type validation, size limits, and metadata tracking
-- **Real-time updates (SSE)** : Live data streaming to the browser via Server-Sent Events
+- **Real-time updates (SSE + WebSocket)** : SSE for live data feeds (server→client), WebSocket for bidirectional communication (chat, collaboration)
 - **Email sending** : Provider-agnostic email with template support (SendGrid, Mailgun, Resend, SES, or any REST API)
 - **Payment flows** : Generic checkout integration (Stripe, PayPal, Mollie, Square, or any provider)
 - **Aggregation queries** : COUNT, SUM, AVG, MIN, MAX with GROUP BY through the public API
@@ -34,9 +36,11 @@ To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the bra
 - **Scheduled tasks** : Cron-based automation the AI sets up and manages itself
 - **Service providers** : Connect any external API with stored credentials and automatic auth injection
 - **Encrypted secrets** : AES-256-GCM storage for API keys and sensitive credentials
-- **Multi-site/app** : Run unlimited sites from a single instance, each with its own database
+- **Secure data columns** : PASSWORD (bcrypt) and ENCRYPTED (AES-256) column types in dynamic tables
+- **Multi-site/app** : Run unlimited sites from a single instance, each with its own database and isolated storage
 - **Free HTTPS** : Embedded Caddy with automatic Let's Encrypt certificates
 - **Self-healing monitoring** : Adaptive health checks that detect and fix issues autonomously
+- **Version history** : Full page and file versioning with rollback support
 
 ## Simple Setup
 
@@ -92,14 +96,17 @@ Every site goes through the same deterministic build process:
 
 | Stage | What Happens |
 |---|---|
-| **PLAN** | Analyzes your description, produces a JSON blueprint |
-| **DESIGN** | Creates CSS, layout, SPA router |
-| **DATA LAYER** | Tables, schemas, API endpoints (skipped if not needed) |
-| **BUILD PAGES** | One focused LLM call per page |
-| **REVIEW** | Automated validation + LLM fix cycle |
-| **MONITORING** | Adaptive health checks, self-healing |
+| **PLAN** | Analyzes your description, produces a structured JSON site plan |
+| **DESIGN** | Creates CSS theme, layout system, SPA router |
+| **BLUEPRINT** | Generates detailed per-page specs (structure, components, data bindings) ensuring cross-page consistency |
+| **DATA LAYER** | Tables, schemas, auth, OAuth, API endpoints with RBAC (skipped if not needed) |
+| **BUILD PAGES** | One focused LLM call per page, built sequentially with shared context |
+| **REVIEW** | Go-based HTML/CSS/link validation + LLM fix cycle |
+| **MONITORING** | Adaptive health checks (5-15 min intervals), self-healing |
 
-Updates use an incremental path, only the affected pages and components get rebuilt.
+Updates use an incremental path (`UPDATE_PLAN`), only the affected pages and components get rebuilt.
+
+The brain uses **18 registered tools** with 100+ actions covering pages, files, schemas, data, endpoints, memory, communication, analytics, HTTP, webhooks, providers, secrets, site config, scheduling, layouts, diagnostics, email, and payments.
 
 ---
 
@@ -168,7 +175,7 @@ Priority: environment variables > `config.json` > defaults.
 ## Build From Source
 
 ```bash
-# Requires Go 1.25+
+# Requires Go 1.26+
 git clone https://github.com/markdr-hue/IATAN.git
 cd iatan-go
 
@@ -191,7 +198,7 @@ make build-all      # Cross-compile everything
             |    IATAN Core   |
             |                 |
             |  Pipeline Brain |
-            |  Chat (SSE)     |
+            |  Chat (SSE/WS)  |
             |  Per-site SQLite|
             +--------+--------+
                      |
@@ -202,8 +209,10 @@ make build-all      # Cross-compile everything
 
 - **Admin** (`:5001`) : Manage sites, chat with the brain, view logs and analytics
 - **Public** (`:5000`) : Your generated sites, served to visitors
-- **Brain** : One goroutine per site, channel-based commands, crash recovery
-- **Database** : Main DB + per-site DBs
+- **Brain** : One goroutine per site, channel-based commands, crash recovery via pipeline_state checkpoint
+- **Database** : Main DB + per-site SQLite DBs (pure Go, no CGO)
+- **Chat** : Streaming conversation via SSE, separate from the build pipeline
+- **Real-time** : SSE (`/api/{path}/stream`) for server→client feeds, WebSocket (`/api/{path}/ws`) for bidirectional — the AI brain decides which to use
 ---
 
 ## Requirements

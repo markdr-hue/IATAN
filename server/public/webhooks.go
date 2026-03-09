@@ -67,7 +67,7 @@ func (h *Handler) IncomingWebhook(w http.ResponseWriter, r *http.Request) {
 	// Validate HMAC-SHA256 signature.
 	signature := r.Header.Get("X-Webhook-Signature")
 	if signature == "" {
-		signature = r.Header.Get("X-Hub-Signature-256") // GitHub compatibility
+		signature = r.Header.Get("X-Hub-Signature-256") // GitHub webhook format support
 	}
 	if secret != "" && signature != "" {
 		// Strip "sha256=" prefix if present (GitHub format).

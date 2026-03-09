@@ -29,10 +29,9 @@ func (t *WebhooksTool) Parameters() map[string]interface{} {
 		"type": "object",
 		"properties": map[string]interface{}{
 			"action":       map[string]interface{}{"type": "string", "enum": []string{"create", "get", "list", "delete", "update", "subscribe"}, "description": "Action to perform"},
-			"name":         map[string]interface{}{"type": "string", "description": "Webhook name (for create, get, delete, update)"},
+			"name":         map[string]interface{}{"type": "string", "description": "Webhook name (for create, get, delete, update, subscribe)"},
 			"url":          map[string]interface{}{"type": "string", "description": "URL for outgoing webhooks (omit for incoming)"},
 			"is_enabled":   map[string]interface{}{"type": "boolean", "description": "Enable or disable the webhook"},
-			"webhook_name": map[string]interface{}{"type": "string", "description": "Webhook name (for subscribe)"},
 			"event_types": map[string]interface{}{
 				"type":        "array",
 				"description": "Event types to subscribe to (e.g. site.updated, brain.started, tool.executed)",
@@ -46,7 +45,19 @@ func (t *WebhooksTool) Parameters() map[string]interface{} {
 func (t *WebhooksTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
 	action, errResult := RequireAction(args)
 	if errResult != nil {
-		return errResult, nil
+		// Infer action from provided args — LLMs sometimes omit the action field.
+		if _, hasEventTypes := args["event_types"]; hasEventTypes {
+			action = "subscribe"
+		} else if _, hasURL := args["url"]; hasURL {
+			action = "create"
+		} else if _, hasEnabled := args["is_enabled"]; hasEnabled {
+			action = "update"
+		} else if _, hasName := args["name"]; hasName {
+			action = "get"
+		} else {
+			action = "list"
+		}
+		args["action"] = action
 	}
 	switch action {
 	case "create":
@@ -165,7 +176,7 @@ func (t *WebhooksTool) get(ctx *ToolContext, args map[string]interface{}) (*Resu
 	return &Result{Success: true, Data: wh}, nil
 }
 
-func (t *WebhooksTool) list(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *WebhooksTool) list(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT id, name, direction, url, is_enabled, last_triggered, created_at FROM webhooks ORDER BY name",
 	)
@@ -266,9 +277,12 @@ func (t *WebhooksTool) update(ctx *ToolContext, args map[string]interface{}) (*R
 }
 
 func (t *WebhooksTool) subscribe(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	name, _ := args["webhook_name"].(string)
+	name, _ := args["name"].(string)
 	if name == "" {
-		return &Result{Success: false, Error: "webhook_name is required"}, nil
+		name, _ = args["webhook_name"].(string) // backward compat
+	}
+	if name == "" {
+		return &Result{Success: false, Error: "name is required"}, nil
 	}
 
 	eventTypesRaw, _ := args["event_types"].([]interface{})

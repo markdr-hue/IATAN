@@ -160,3 +160,19 @@ func extractText(htmlBytes []byte) string {
 		}
 	}
 }
+
+func (t *MakeHTTPRequestTool) Summarize(result string) string {
+	r, data, _, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if data == nil {
+		return summarizeTruncate(result, 300)
+	}
+	status, _ := data["status_code"].(float64)
+	body, _ := data["body"].(string)
+	return fmt.Sprintf(`{"success":true,"summary":"HTTP %d (%d chars)"}`, int(status), len(body))
+}

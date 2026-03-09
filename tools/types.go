@@ -38,6 +38,18 @@ type Result struct {
 	Error   string      `json:"error,omitempty"`
 }
 
+// Summarizer is an optional interface tools can implement to provide
+// custom result summarization for cross-stage chat history.
+type Summarizer interface {
+	Summarize(result string) string
+}
+
+// ResultSizer is an optional interface tools can implement to override
+// the default result truncation limit (4KB).
+type ResultSizer interface {
+	MaxResultSize() int
+}
+
 // RequireAction extracts and validates the "action" arg. Returns the action
 // string on success, or an error Result if missing/empty.
 func RequireAction(args map[string]interface{}) (string, *Result) {

@@ -80,7 +80,9 @@ func New(deps *ServerDeps) *Server {
 	s.adminRouter.Use(middleware.SecurityHeaders)
 	s.adminRouter.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'")
+			// NOTE: 'unsafe-inline' in style-src is needed while the admin frontend uses inline styles.
+		// Tighten to 'self' only when inline styles are eliminated.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'")
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -107,6 +109,7 @@ func New(deps *ServerDeps) *Server {
 	s.publicRouter = chi.NewRouter()
 	s.publicRouter.Use(middleware.RequestID)
 	s.publicRouter.Use(middleware.Logging(logger.With("server", "public")))
+	// Wildcard CORS: public sites serve user-configured domains we can't predict.
 	s.publicRouter.Use(middleware.CORS([]string{"*"}))
 	s.publicRouter.Use(publicRateLimiter.Handler)
 	s.publicRouter.Use(middleware.SecurityHeaders)

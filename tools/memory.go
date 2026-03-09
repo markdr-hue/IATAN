@@ -142,7 +142,7 @@ func (t *MemoryTool) recall(ctx *ToolContext, args map[string]interface{}) (*Res
 	return &Result{Success: true, Data: memories}, nil
 }
 
-func (t *MemoryTool) list(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *MemoryTool) list(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT key, value, category, updated_at FROM memory ORDER BY category, key",
 	)

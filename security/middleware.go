@@ -25,7 +25,7 @@ func (j *JWTManager) Authenticator(next http.Handler) http.Handler {
 		if authHeader != "" {
 			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
 			if tokenString == authHeader {
-				http.Error(w, `{"error":"invalid authorization format"}`, http.StatusUnauthorized)
+				writeJSONError(w, http.StatusUnauthorized, "invalid authorization format")
 				return
 			}
 		} else if cookie, err := r.Cookie(AuthCookieName); err == nil && cookie.Value != "" {
@@ -36,13 +36,13 @@ func (j *JWTManager) Authenticator(next http.Handler) http.Handler {
 			// and referrer headers, so avoid using this for non-SSE requests.
 			tokenString = qToken
 		} else {
-			http.Error(w, `{"error":"missing authorization"}`, http.StatusUnauthorized)
+			writeJSONError(w, http.StatusUnauthorized, "missing authorization")
 			return
 		}
 
 		claims, err := j.Validate(tokenString)
 		if err != nil {
-			http.Error(w, `{"error":"invalid or expired token"}`, http.StatusUnauthorized)
+			writeJSONError(w, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
 
@@ -57,7 +57,7 @@ func RequireRole(role string) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims, ok := r.Context().Value(ClaimsKey).(*Claims)
 			if !ok || claims.Role != role {
-				http.Error(w, `{"error":"insufficient permissions"}`, http.StatusForbidden)
+				writeJSONError(w, http.StatusForbidden, "insufficient permissions")
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -69,4 +69,10 @@ func RequireRole(role string) func(http.Handler) http.Handler {
 func GetClaims(r *http.Request) *Claims {
 	claims, _ := r.Context().Value(ClaimsKey).(*Claims)
 	return claims
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write([]byte(`{"error":"` + msg + `"}`))
 }

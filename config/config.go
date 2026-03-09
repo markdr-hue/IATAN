@@ -30,10 +30,9 @@ type Config struct {
 	RateLimitRate  float64  `json:"rate_limit_rate"`
 	RateLimitBurst int      `json:"rate_limit_burst"`
 
-	// Brain tick intervals (seconds). Zero means use built-in defaults.
-	BrainBuildingIntervalSec int `json:"brain_building_interval_sec"`
-	BrainMonitoringBaseSec   int `json:"brain_monitoring_base_sec"`
-	BrainMonitoringMaxSec    int `json:"brain_monitoring_max_sec"`
+	// Brain monitoring intervals (seconds). Zero means use built-in defaults.
+	BrainMonitoringBaseSec int `json:"brain_monitoring_base_sec"`
+	BrainMonitoringMaxSec  int `json:"brain_monitoring_max_sec"`
 }
 
 func Load() (*Config, error) {
@@ -71,6 +70,9 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("jwt key: %w", err)
 		}
 		cfg.JWTSecret = secret
+	}
+	if len(cfg.JWTSecret) < 32 {
+		return nil, fmt.Errorf("JWT secret must be at least 32 characters (got %d)", len(cfg.JWTSecret))
 	}
 
 	if cfg.EncryptionKey == "" {

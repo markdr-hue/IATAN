@@ -424,9 +424,10 @@ func (t *SchemaTool) describe(ctx *ToolContext, args map[string]interface{}) (*R
 		}
 		if secureCols != nil {
 			if kind, ok := secureCols[name]; ok {
-				if kind == "hash" {
+				switch kind {
+				case "hash":
 					col["secure"] = "PASSWORD"
-				} else if kind == "encrypt" {
+				case "encrypt":
 					col["secure"] = "ENCRYPTED"
 				}
 			}
@@ -444,7 +445,7 @@ func (t *SchemaTool) describe(ctx *ToolContext, args map[string]interface{}) (*R
 	}}, nil
 }
 
-func (t *SchemaTool) list(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *SchemaTool) list(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT table_name, schema_def, created_at FROM dynamic_tables ORDER BY table_name",
 	)
@@ -614,9 +615,17 @@ func (t *DataTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Resu
 		// Infer action from provided args — LLMs sometimes omit the action field.
 		if _, hasRows := args["rows"]; hasRows {
 			action = "insert"
-		} else if _, hasValues := args["values"]; hasValues {
-			action = "update"
-		} else if _, hasWhere := args["where"]; hasWhere {
+		} else if _, hasID := args["id"]; hasID {
+			if _, hasData := args["data"]; hasData {
+				action = "update"
+			} else {
+				action = "delete"
+			}
+		} else if _, hasData := args["data"]; hasData {
+			action = "insert"
+		} else if _, hasFunction := args["function"]; hasFunction {
+			action = "aggregate"
+		} else if _, hasFilters := args["filters"]; hasFilters {
 			action = "query"
 		} else {
 			action = "query"
@@ -1096,4 +1105,18 @@ func (t *DataTool) aggregate(ctx *ToolContext, args map[string]interface{}) (*Re
 		"function": fn,
 		"data":     results,
 	}}, nil
+}
+
+func (t *DataTool) Summarize(result string) string {
+	r, _, dataArr, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if dataArr != nil {
+		return fmt.Sprintf(`{"success":true,"summary":"Queried: %d rows returned"}`, len(dataArr))
+	}
+	return summarizeTruncate(result, 300)
 }

@@ -443,7 +443,7 @@ func (t *PaymentsTool) checkStatus(ctx *ToolContext, args map[string]interface{}
 	}}, nil
 }
 
-func (t *PaymentsTool) list(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *PaymentsTool) list(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	t.ensureTables(ctx.DB)
 
 	rows, err := ctx.DB.Query(

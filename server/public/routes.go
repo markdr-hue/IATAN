@@ -42,7 +42,7 @@ func RegisterRoutes(r chi.Router, deps *Deps) {
 	// File serving (user uploads).
 	r.Get("/files/*", h.ServeFile)
 
-	// Page JSON API (backward compat).
+	// Page JSON API (SPA router navigation).
 	r.Get("/api/page", h.Page)
 
 	// Incoming webhooks.

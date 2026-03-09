@@ -6,6 +6,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -189,7 +190,7 @@ func (t *LayoutTool) get(ctx *ToolContext, args map[string]interface{}) (*Result
 	}}, nil
 }
 
-func (t *LayoutTool) list(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *LayoutTool) list(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query("SELECT name, length(body_before_main) + length(body_after_main) AS size, created_at, updated_at FROM layouts ORDER BY name")
 	if err != nil {
 		return nil, fmt.Errorf("listing layouts: %w", err)
@@ -213,4 +214,25 @@ func (t *LayoutTool) list(ctx *ToolContext, args map[string]interface{}) (*Resul
 		"layouts": layouts,
 		"count":   len(layouts),
 	}}, nil
+}
+
+func (t *LayoutTool) MaxResultSize() int { return 16000 }
+
+func (t *LayoutTool) Summarize(result string) string {
+	r, data, _, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if data == nil {
+		return summarizeTruncate(result, 300)
+	}
+	name, _ := data["name"].(string)
+	if warnings, ok := data["warnings"]; ok {
+		wJSON, _ := json.Marshal(warnings)
+		return fmt.Sprintf(`{"success":true,"layout":"%s","warnings":%s}`, name, wJSON)
+	}
+	return fmt.Sprintf(`{"success":true,"summary":"Layout '%s' saved"}`, name)
 }

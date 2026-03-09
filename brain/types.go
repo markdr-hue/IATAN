@@ -31,14 +31,21 @@ const (
 type PipelineStage string
 
 const (
-	StagePlan       PipelineStage = "PLAN"
-	StageDesign     PipelineStage = "DESIGN"
-	StageDataLayer  PipelineStage = "DATA_LAYER"
-	StageBuildPages PipelineStage = "BUILD_PAGES"
-	StageReview     PipelineStage = "REVIEW"
-	StageComplete   PipelineStage = "COMPLETE"
-	StageMonitoring PipelineStage = "MONITORING"
-	StageUpdatePlan PipelineStage = "UPDATE_PLAN"
+	StagePlan           PipelineStage = "PLAN"
+	StageDesign         PipelineStage = "DESIGN"
+	StageBlueprintPages PipelineStage = "BLUEPRINT_PAGES"
+	StageDataLayer      PipelineStage = "DATA_LAYER"
+	StageBuildPages     PipelineStage = "BUILD_PAGES"
+	StageReview         PipelineStage = "REVIEW"
+	StageComplete       PipelineStage = "COMPLETE"
+	StageMonitoring     PipelineStage = "MONITORING"
+	StageUpdatePlan     PipelineStage = "UPDATE_PLAN"
+)
+
+// Pause reasons — stored in pipeline_state.pause_reason.
+const (
+	PauseReasonOwnerAnswers = "awaiting_owner_answers"
+	PauseReasonApproval     = "awaiting_approval"
 )
 
 // BrainCommand is a message sent to a brain worker to trigger an action.

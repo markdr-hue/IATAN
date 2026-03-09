@@ -36,6 +36,7 @@ const (
 	EventDataDelete             EventType = "data.delete"
 	EventPaymentCompleted       EventType = "payment.completed"
 	EventPaymentFailed          EventType = "payment.failed"
+	EventWSMessage              EventType = "ws.message"
 )
 
 type Event struct {

@@ -71,7 +71,7 @@ func (h *SitesHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default: return all sites (backward compatible for dashboard, sidebar, etc.)
+	// Default: return all sites (used by dashboard, sidebar, etc.)
 	sites, err := models.ListSites(h.deps.DB.DB)
 	if err != nil {
 		h.deps.Logger.Error("failed to list sites", "error", err)

@@ -123,7 +123,7 @@ func (t *SchedulerTool) executeCreate(ctx *ToolContext, args map[string]interfac
 	return &Result{Success: true, Data: data}, nil
 }
 
-func (t *SchedulerTool) executeList(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *SchedulerTool) executeList(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT id, name, description, cron_expression, interval_seconds, prompt, is_enabled, last_run, next_run, created_at FROM scheduled_tasks ORDER BY name",
 	)

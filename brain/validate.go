@@ -160,8 +160,24 @@ func validateAssets(db *sql.DB) []string {
 }
 
 // validateStructure checks that page content doesn't contain layout-level elements.
+// Pages with layout="none" are exempt from nav/footer checks since they are
+// standalone pages that include their own navigation.
 func validateStructure(db *sql.DB) []string {
 	var issues []string
+
+	// Build set of pages that use layout="none" (from DB column or plan).
+	noneLayoutPages := make(map[string]bool)
+	layoutRows, err := db.Query("SELECT path, layout FROM pages WHERE is_deleted = 0 AND layout = 'none'")
+	if err == nil {
+		defer layoutRows.Close()
+		for layoutRows.Next() {
+			var path string
+			var layout sql.NullString
+			if layoutRows.Scan(&path, &layout) == nil {
+				noneLayoutPages[path] = true
+			}
+		}
+	}
 
 	rows, err := db.Query("SELECT path, content FROM pages WHERE is_deleted = 0 AND content IS NOT NULL")
 	if err != nil {
@@ -176,11 +192,17 @@ func validateStructure(db *sql.DB) []string {
 		}
 		lower := strings.ToLower(content)
 
+		// Document-level tags are never allowed in pages.
 		if strings.Contains(lower, "<!doctype") {
 			issues = append(issues, fmt.Sprintf("Page %s contains <!DOCTYPE> — pages should be main-content only", path))
 		}
 		if strings.Contains(lower, "<html") {
 			issues = append(issues, fmt.Sprintf("Page %s contains <html> tag — pages should be main-content only", path))
+		}
+
+		// Nav/footer are OK in layout="none" pages (standalone pages with own nav).
+		if noneLayoutPages[path] {
+			continue
 		}
 		if strings.Contains(lower, "<nav") {
 			issues = append(issues, fmt.Sprintf("Page %s contains <nav> — navigation belongs in the layout", path))
@@ -313,8 +335,13 @@ func validateCSSAlignment(db *sql.DB) []string {
 			}
 		}
 
-		// Report if >60% of classes are undefined (allows some semantic/utility classes).
-		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.6 {
+		// Flag pages with very few CSS classes (likely unstyled).
+		if len(pageClasses) < 3 && path != "/404" {
+			issues = append(issues, fmt.Sprintf("Page %s uses only %d CSS classes — likely unstyled", path, len(pageClasses)))
+		}
+
+		// Report if >40% of classes are undefined.
+		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.4 {
 			// Limit to 5 example classes to keep issue text compact.
 			examples := undefined
 			if len(examples) > 5 {
@@ -524,8 +551,11 @@ func validateMetadata(db *sql.DB) []string {
 // sectionTagRe matches <section> tags in HTML content.
 var sectionTagRe = regexp.MustCompile(`(?i)<section[\s>]`)
 
+// sectionNameRe matches section, article, or div elements with id or class attributes.
+var sectionNameRe = regexp.MustCompile(`(?i)<(?:section|article|div)\s+[^>]*(?:id|class)\s*=\s*["']([^"']+)["']`)
+
 // validateSections checks that pages contain roughly the number of sections
-// planned in the SitePlan. Loads the plan from pipeline_state.
+// planned in the SitePlan, and that section names roughly match the plan.
 func validateSections(db *sql.DB) []string {
 	var planJSON sql.NullString
 	db.QueryRow("SELECT plan_json FROM pipeline_state WHERE id = 1").Scan(&planJSON)
@@ -553,10 +583,42 @@ func validateSections(db *sql.DB) []string {
 		sectionCount := len(sectionTagRe.FindAllString(content.String, -1))
 		planned := len(pagePlan.Sections)
 
-		// Allow flexibility: warn only if significantly fewer sections than planned.
+		// Check section count.
 		if sectionCount < planned-1 {
 			issues = append(issues, fmt.Sprintf("Page %s has %d sections but %d were planned (%s)",
 				pagePlan.Path, sectionCount, planned, strings.Join(pagePlan.Sections, ", ")))
+		}
+
+		// Check section names via fuzzy matching on id/class attributes.
+		contentLower := strings.ToLower(content.String)
+		nameMatches := sectionNameRe.FindAllStringSubmatch(contentLower, -1)
+		foundNames := make(map[string]bool)
+		for _, m := range nameMatches {
+			if len(m) > 1 {
+				for _, cls := range strings.Fields(m[1]) {
+					foundNames[cls] = true
+				}
+			}
+		}
+		var missingSections []string
+		for _, section := range pagePlan.Sections {
+			sectionLower := strings.ToLower(section)
+			found := false
+			for name := range foundNames {
+				// Fuzzy: "features" matches "features-grid", "feature-cards", etc.
+				if strings.Contains(name, sectionLower) || strings.Contains(sectionLower, name) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				missingSections = append(missingSections, section)
+			}
+		}
+		// Only flag if multiple sections are missing (allow some flexibility).
+		if len(missingSections) > 1 {
+			issues = append(issues, fmt.Sprintf("Page %s is missing sections: %s",
+				pagePlan.Path, strings.Join(missingSections, ", ")))
 		}
 	}
 

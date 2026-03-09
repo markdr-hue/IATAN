@@ -6,11 +6,17 @@
 package public
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/markdr-hue/IATAN/security"
 )
@@ -24,6 +30,8 @@ type authEndpointConfig struct {
 	PasswordColumn string
 	PublicColumns  []string
 	JWTExpiryHours int
+	DefaultRole    string
+	RoleColumn     string
 }
 
 // loadAuthEndpoint loads an auth endpoint configuration from the per-site database.
@@ -31,15 +39,21 @@ func (h *Handler) loadAuthEndpoint(siteDB *sql.DB, path string) (*authEndpointCo
 	var ae authEndpointConfig
 	var publicColsJSON string
 	err := siteDB.QueryRow(
-		"SELECT id, table_name, path, username_column, password_column, public_columns, jwt_expiry_hours FROM auth_endpoints WHERE path = ?",
+		"SELECT id, table_name, path, username_column, password_column, public_columns, jwt_expiry_hours, default_role, role_column FROM auth_endpoints WHERE path = ?",
 		path,
-	).Scan(&ae.ID, &ae.TableName, &ae.Path, &ae.UsernameColumn, &ae.PasswordColumn, &publicColsJSON, &ae.JWTExpiryHours)
+	).Scan(&ae.ID, &ae.TableName, &ae.Path, &ae.UsernameColumn, &ae.PasswordColumn, &publicColsJSON, &ae.JWTExpiryHours, &ae.DefaultRole, &ae.RoleColumn)
 	if err != nil {
 		return nil, err
 	}
 	json.Unmarshal([]byte(publicColsJSON), &ae.PublicColumns)
 	if ae.JWTExpiryHours == 0 {
 		ae.JWTExpiryHours = 24
+	}
+	if ae.DefaultRole == "" {
+		ae.DefaultRole = "user"
+	}
+	if ae.RoleColumn == "" {
+		ae.RoleColumn = "role"
 	}
 
 	// Validate column names to prevent SQL injection via stored config.
@@ -51,6 +65,9 @@ func (h *Handler) loadAuthEndpoint(siteDB *sql.DB, path string) (*authEndpointCo
 	}
 	if err := security.ValidateColumnNames(ae.PublicColumns); err != nil {
 		return nil, fmt.Errorf("invalid public_columns in auth config: %w", err)
+	}
+	if err := security.ValidateColumnName(ae.RoleColumn); err != nil {
+		return nil, fmt.Errorf("invalid role_column in auth config: %w", err)
 	}
 
 	return &ae, nil
@@ -100,6 +117,18 @@ func (h *Handler) handleAuthRequest(w http.ResponseWriter, r *http.Request, site
 		return true
 	}
 
+	// OAuth routes: oauth/{provider} or oauth/{provider}/callback
+	if strings.HasPrefix(action, "oauth/") {
+		oauthParts := strings.SplitN(action[6:], "/", 2) // strip "oauth/" prefix
+		provider := oauthParts[0]
+		if len(oauthParts) == 2 && oauthParts[1] == "callback" {
+			h.oauthCallback(w, r, siteID, siteDB, physTable, ae, provider)
+		} else {
+			h.oauthAuthorize(w, r, siteDB, ae, provider)
+		}
+		return true
+	}
+
 	return false
 }
 
@@ -142,6 +171,9 @@ func (h *Handler) authRegister(w http.ResponseWriter, r *http.Request, siteID in
 	}
 	body[ae.PasswordColumn] = hashedPassword
 
+	// Force default role (prevent self-assignment of admin, etc.).
+	body[ae.RoleColumn] = ae.DefaultRole
+
 	// Remove id if provided.
 	delete(body, "id")
 
@@ -169,7 +201,7 @@ func (h *Handler) authRegister(w http.ResponseWriter, r *http.Request, siteID in
 	userID, _ := result.LastInsertId()
 
 	// Generate JWT token.
-	token, err := h.generateUserToken(int(userID), username, "user", siteID, ae)
+	token, err := h.generateUserToken(int(userID), username, ae.DefaultRole, siteID, ae)
 	if err != nil {
 		writePublicError(w, http.StatusInternalServerError, "failed to generate token")
 		return
@@ -201,13 +233,14 @@ func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request, siteID int, 
 		return
 	}
 
-	// Find the user by username.
+	// Find the user by username (include role column).
 	var userID int
 	var hashedPassword string
+	var role sql.NullString
 	err := siteDB.QueryRow(
-		fmt.Sprintf("SELECT id, %s FROM %s WHERE %s = ?", ae.PasswordColumn, physTable, ae.UsernameColumn),
+		fmt.Sprintf("SELECT id, %s, %s FROM %s WHERE %s = ?", ae.PasswordColumn, ae.RoleColumn, physTable, ae.UsernameColumn),
 		username,
-	).Scan(&userID, &hashedPassword)
+	).Scan(&userID, &hashedPassword, &role)
 	if err != nil {
 		writePublicError(w, http.StatusUnauthorized, "invalid credentials")
 		return
@@ -219,8 +252,13 @@ func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request, siteID int, 
 		return
 	}
 
+	userRole := role.String
+	if userRole == "" {
+		userRole = ae.DefaultRole
+	}
+
 	// Generate JWT token.
-	token, err := h.generateUserToken(userID, username, "user", siteID, ae)
+	token, err := h.generateUserToken(userID, username, userRole, siteID, ae)
 	if err != nil {
 		writePublicError(w, http.StatusInternalServerError, "failed to generate token")
 		return
@@ -234,7 +272,7 @@ func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request, siteID int, 
 }
 
 // authMe handles GET /api/{path}/me.
-func (h *Handler) authMe(w http.ResponseWriter, r *http.Request, siteID int, siteDB *sql.DB, physTable string, ae *authEndpointConfig) {
+func (h *Handler) authMe(w http.ResponseWriter, r *http.Request, _ int, siteDB *sql.DB, physTable string, ae *authEndpointConfig) {
 	// Extract and validate JWT token.
 	claims, err := h.extractUserClaims(r)
 	if err != nil {
@@ -314,4 +352,303 @@ func (h *Handler) validateSiteTokenOrJWT(siteID int, token string) bool {
 	}
 
 	return false
+}
+
+// --- OAuth (Social Login) ---
+
+type oauthProviderConfig struct {
+	ID               int
+	Name             string
+	DisplayName      string
+	ClientID         string
+	ClientSecretName string
+	AuthorizeURL     string
+	TokenURL         string
+	UserinfoURL      string
+	Scopes           string
+	UsernameField    string
+	AuthEndpointPath string
+}
+
+func loadOAuthProvider(siteDB *sql.DB, providerName, authPath string) (*oauthProviderConfig, error) {
+	var op oauthProviderConfig
+	err := siteDB.QueryRow(
+		"SELECT id, name, display_name, client_id, client_secret_name, authorize_url, token_url, userinfo_url, scopes, username_field, auth_endpoint_path FROM oauth_providers WHERE name = ? AND auth_endpoint_path = ? AND is_enabled = 1",
+		providerName, authPath,
+	).Scan(&op.ID, &op.Name, &op.DisplayName, &op.ClientID, &op.ClientSecretName, &op.AuthorizeURL, &op.TokenURL, &op.UserinfoURL, &op.Scopes, &op.UsernameField, &op.AuthEndpointPath)
+	if err != nil {
+		return nil, err
+	}
+	return &op, nil
+}
+
+// oauthAuthorize handles GET /api/{authPath}/oauth/{provider} — redirects to the OAuth provider.
+func (h *Handler) oauthAuthorize(w http.ResponseWriter, r *http.Request, siteDB *sql.DB, ae *authEndpointConfig, provider string) {
+	op, err := loadOAuthProvider(siteDB, provider, ae.Path)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "OAuth provider not configured")
+		return
+	}
+
+	// Generate HMAC-signed state for CSRF protection.
+	randomBytes := make([]byte, 16)
+	if _, err := rand.Read(randomBytes); err != nil {
+		writePublicError(w, http.StatusInternalServerError, "failed to generate state")
+		return
+	}
+	stateRandom := hex.EncodeToString(randomBytes)
+	stateMAC := hex.EncodeToString(h.deps.JWTManager.HMAC(randomBytes))
+	state := stateRandom + "." + stateMAC
+
+	// Store state in a short-lived cookie (SameSite=Lax for cross-site redirect back).
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oauth_state",
+		Value:    state,
+		Path:     "/api/" + ae.Path + "/oauth/",
+		MaxAge:   600,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+
+	// Build redirect URI from the current request host.
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	redirectURI := fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, r.Host, ae.Path, provider)
+
+	// Build authorization URL.
+	authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s",
+		op.AuthorizeURL,
+		url.QueryEscape(op.ClientID),
+		url.QueryEscape(redirectURI),
+		url.QueryEscape(op.Scopes),
+		url.QueryEscape(state),
+	)
+
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// oauthCallback handles GET /api/{authPath}/oauth/{provider}/callback — exchanges code for token.
+func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request, siteID int, siteDB *sql.DB, physTable string, ae *authEndpointConfig, provider string) {
+	// Validate state parameter.
+	stateCookie, err := r.Cookie("oauth_state")
+	if err != nil {
+		writePublicError(w, http.StatusBadRequest, "missing OAuth state cookie")
+		return
+	}
+	queryState := r.URL.Query().Get("state")
+	if queryState == "" || queryState != stateCookie.Value {
+		writePublicError(w, http.StatusBadRequest, "invalid OAuth state")
+		return
+	}
+	// Verify HMAC on state.
+	parts := strings.SplitN(queryState, ".", 2)
+	if len(parts) != 2 {
+		writePublicError(w, http.StatusBadRequest, "malformed OAuth state")
+		return
+	}
+	randomBytes, err := hex.DecodeString(parts[0])
+	if err != nil {
+		writePublicError(w, http.StatusBadRequest, "invalid OAuth state encoding")
+		return
+	}
+	expectedMAC := hex.EncodeToString(h.deps.JWTManager.HMAC(randomBytes))
+	if !hmac.Equal([]byte(parts[1]), []byte(expectedMAC)) {
+		writePublicError(w, http.StatusBadRequest, "OAuth state verification failed")
+		return
+	}
+	// Clear the state cookie.
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oauth_state",
+		Value:    "",
+		Path:     "/api/" + ae.Path + "/oauth/",
+		MaxAge:   -1,
+		HttpOnly: true,
+	})
+
+	// Check for error from provider.
+	if errParam := r.URL.Query().Get("error"); errParam != "" {
+		writePublicError(w, http.StatusBadRequest, "OAuth error: "+errParam)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writePublicError(w, http.StatusBadRequest, "missing authorization code")
+		return
+	}
+
+	// Load OAuth provider config.
+	op, err := loadOAuthProvider(siteDB, provider, ae.Path)
+	if err != nil {
+		writePublicError(w, http.StatusNotFound, "OAuth provider not configured")
+		return
+	}
+
+	// Decrypt client secret.
+	var encryptedSecret string
+	err = siteDB.QueryRow("SELECT value_encrypted FROM secrets WHERE name = ?", op.ClientSecretName).Scan(&encryptedSecret)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "OAuth client secret not found")
+		return
+	}
+	clientSecret, err := h.deps.Encryptor.Decrypt(encryptedSecret)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "failed to decrypt OAuth secret")
+		return
+	}
+
+	// Build redirect URI (must match authorize step).
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	redirectURI := fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, r.Host, ae.Path, provider)
+
+	// Exchange authorization code for access token.
+	tokenResp, err := exchangeOAuthCode(op, code, redirectURI, clientSecret)
+	if err != nil {
+		writePublicError(w, http.StatusBadGateway, "failed to exchange OAuth code: "+err.Error())
+		return
+	}
+
+	// Fetch user info from provider.
+	userInfo, err := fetchOAuthUserInfo(op, tokenResp.AccessToken)
+	if err != nil {
+		writePublicError(w, http.StatusBadGateway, "failed to fetch user info: "+err.Error())
+		return
+	}
+
+	// Extract username from the configured field.
+	username, ok := userInfo[op.UsernameField].(string)
+	if !ok || username == "" {
+		writePublicError(w, http.StatusBadGateway, fmt.Sprintf("user info missing %s field", op.UsernameField))
+		return
+	}
+
+	// Find or create user in the site's user table.
+	var userID int
+	var role sql.NullString
+	err = siteDB.QueryRow(
+		fmt.Sprintf("SELECT id, %s FROM %s WHERE %s = ?", ae.RoleColumn, physTable, ae.UsernameColumn),
+		username,
+	).Scan(&userID, &role)
+	if err == sql.ErrNoRows {
+		// Create new user with an unusable password and default role.
+		unusableHash, _ := security.HashPassword(hex.EncodeToString(randomBytes) + "!oauth-no-password-login")
+		result, err := siteDB.Exec(
+			fmt.Sprintf("INSERT INTO %s (%s, %s, %s) VALUES (?, ?, ?)", physTable, ae.UsernameColumn, ae.PasswordColumn, ae.RoleColumn),
+			username, unusableHash, ae.DefaultRole,
+		)
+		if err != nil {
+			writePublicError(w, http.StatusInternalServerError, "failed to create user")
+			return
+		}
+		id, _ := result.LastInsertId()
+		userID = int(id)
+		role.String = ae.DefaultRole
+	} else if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	userRole := role.String
+	if userRole == "" {
+		userRole = ae.DefaultRole
+	}
+
+	// Generate JWT.
+	jwtToken, err := h.generateUserToken(userID, username, userRole, siteID, ae)
+	if err != nil {
+		writePublicError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+
+	// Redirect to frontend with token in query param.
+	http.Redirect(w, r, "/?token="+url.QueryEscape(jwtToken), http.StatusFound)
+}
+
+type oauthTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+}
+
+func exchangeOAuthCode(op *oauthProviderConfig, code, redirectURI, clientSecret string) (*oauthTokenResponse, error) {
+	data := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {op.ClientID},
+		"client_secret": {clientSecret},
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, op.TokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token exchange failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp oauthTokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		// Some providers (GitHub) return form-encoded responses.
+		vals, _ := url.ParseQuery(string(body))
+		tokenResp.AccessToken = vals.Get("access_token")
+		tokenResp.TokenType = vals.Get("token_type")
+	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("no access_token in response")
+	}
+
+	return &tokenResp, nil
+}
+
+func fetchOAuthUserInfo(op *oauthProviderConfig, accessToken string) (map[string]interface{}, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, op.UserinfoURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("userinfo request failed (status %d)", resp.StatusCode)
+	}
+
+	var info map[string]interface{}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return nil, fmt.Errorf("invalid userinfo JSON: %w", err)
+	}
+
+	return info, nil
 }

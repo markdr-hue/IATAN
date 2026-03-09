@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS pages (
     template TEXT,
     status TEXT DEFAULT 'published',
     metadata TEXT DEFAULT '{}',
+    layout TEXT DEFAULT NULL,
+    assets TEXT DEFAULT NULL,
     is_deleted BOOLEAN DEFAULT 0,
     deleted_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS page_versions (
 
 CREATE INDEX IF NOT EXISTS idx_page_versions ON page_versions(page_id, version_number DESC);
 CREATE INDEX IF NOT EXISTS idx_page_versions_date ON page_versions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_page_versions_page ON page_versions(page_id);
 
 -- Brain-created assets (CSS, JS, images)
 CREATE TABLE IF NOT EXISTS assets (
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS assets (
     size INTEGER,
     storage_path TEXT NOT NULL,
     alt_text TEXT,
+    scope TEXT NOT NULL DEFAULT 'global',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -71,23 +75,6 @@ CREATE TABLE IF NOT EXISTS brain_log (
 
 CREATE INDEX IF NOT EXISTS idx_brain_log_date ON brain_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_brain_log_event ON brain_log(event_type);
-
--- Goals (hierarchical)
-CREATE TABLE IF NOT EXISTS goals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT,
-    status TEXT DEFAULT 'pending',
-    priority INTEGER DEFAULT 0,
-    progress INTEGER DEFAULT 0,
-    parent_id INTEGER REFERENCES goals(id),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-);
-
-CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
-CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals(parent_id);
 
 -- Key-value memory store
 CREATE TABLE IF NOT EXISTS memory (
@@ -153,6 +140,7 @@ CREATE TABLE IF NOT EXISTS api_endpoints (
     methods TEXT DEFAULT '["GET","POST"]',
     public_columns TEXT,
     requires_auth BOOLEAN DEFAULT 0,
+    required_role TEXT DEFAULT NULL,
     rate_limit INTEGER DEFAULT 60,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -166,6 +154,25 @@ CREATE TABLE IF NOT EXISTS auth_endpoints (
     password_column TEXT NOT NULL DEFAULT 'password',
     public_columns TEXT DEFAULT '[]',
     jwt_expiry_hours INTEGER DEFAULT 24,
+    default_role TEXT NOT NULL DEFAULT 'user',
+    role_column TEXT NOT NULL DEFAULT 'role',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- OAuth providers (social login)
+CREATE TABLE IF NOT EXISTS oauth_providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    client_secret_name TEXT NOT NULL,
+    authorize_url TEXT NOT NULL,
+    token_url TEXT NOT NULL,
+    userinfo_url TEXT NOT NULL,
+    scopes TEXT NOT NULL DEFAULT 'openid email profile',
+    username_field TEXT NOT NULL DEFAULT 'email',
+    auth_endpoint_path TEXT NOT NULL,
+    is_enabled BOOLEAN DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -216,6 +223,7 @@ CREATE TABLE IF NOT EXISTS analytics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics(created_at);
+CREATE INDEX IF NOT EXISTS idx_analytics_page_path ON analytics(page_path, created_at DESC);
 
 -- Secrets (encrypted key-value)
 CREATE TABLE IF NOT EXISTS secrets (
@@ -298,3 +306,90 @@ CREATE TABLE IF NOT EXISTS service_providers (
     is_enabled BOOLEAN DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Detailed LLM request/response log
+CREATE TABLE IF NOT EXISTS llm_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    iteration INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL,
+    provider_type TEXT NOT NULL DEFAULT '',
+    request_messages TEXT,
+    request_system TEXT,
+    request_tools TEXT,
+    request_max_tokens INTEGER,
+    response_content TEXT,
+    response_tool_calls TEXT,
+    response_stop_reason TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_log_date ON llm_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_log_source ON llm_log(source, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_log_session ON llm_log(session_id, created_at DESC);
+
+-- Server-side layout system
+CREATE TABLE IF NOT EXISTS layouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    head_content TEXT DEFAULT '',
+    body_before_main TEXT DEFAULT '',
+    body_after_main TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Pipeline state: singleton row tracking current build progress
+CREATE TABLE IF NOT EXISTS pipeline_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    stage TEXT NOT NULL DEFAULT 'PLAN',
+    plan_json TEXT,
+    blueprint_json TEXT,
+    update_description TEXT,
+    current_page_index INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    last_error TEXT,
+    paused BOOLEAN DEFAULT 0,
+    pause_reason TEXT,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO pipeline_state (id) VALUES (1);
+
+-- Stage execution log
+CREATE TABLE IF NOT EXISTS stage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'started',
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    tool_calls INTEGER DEFAULT 0,
+    duration_ms INTEGER DEFAULT 0,
+    error_message TEXT,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_stage_log_stage ON stage_log(stage, started_at DESC);
+
+-- File version history for text assets (CSS, JS, SVG, etc.)
+CREATE TABLE IF NOT EXISTS file_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    storage_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_type TEXT,
+    size INTEGER,
+    version_number INTEGER NOT NULL,
+    changed_by TEXT NOT NULL DEFAULT 'brain',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_versions_lookup
+    ON file_versions (storage_type, filename, version_number DESC);

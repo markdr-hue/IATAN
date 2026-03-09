@@ -7,6 +7,7 @@ package tools
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -210,7 +211,7 @@ func (t *PagesTool) get(ctx *ToolContext, args map[string]interface{}) (*Result,
 // list — list all pages for the current site
 // ---------------------------------------------------------------------------
 
-func (t *PagesTool) list(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+func (t *PagesTool) list(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
 	rows, err := ctx.DB.Query(
 		"SELECT id, path, title, status, updated_at FROM pages WHERE is_deleted = 0 ORDER BY path",
 	)
@@ -535,4 +536,44 @@ func checkCoherence(pagePath, content string, db *sql.DB) []string {
 	}
 
 	return hints
+}
+
+func (t *PagesTool) MaxResultSize() int { return 16000 }
+
+func (t *PagesTool) Summarize(result string) string {
+	r, data, dataArr, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if dataArr != nil {
+		return fmt.Sprintf(`{"success":true,"summary":"Returned %d items"}`, len(dataArr))
+	}
+	if data == nil {
+		return summarizeTruncate(result, 300)
+	}
+	if content, ok := data["content"].(string); ok && content != "" {
+		path, _ := data["path"].(string)
+		fingerprint := pageStructureFingerprint(content)
+		return fmt.Sprintf(`{"success":true,"summary":"Read page %s (%d chars). %s"}`, path, len(content), fingerprint)
+	}
+	warnings, hasW := data["warnings"]
+	hints, hasH := data["hints"]
+	if hasW || hasH {
+		path, _ := data["path"].(string)
+		var parts []string
+		parts = append(parts, fmt.Sprintf(`"success":true,"path":"%s"`, path))
+		if hasW {
+			wJSON, _ := json.Marshal(warnings)
+			parts = append(parts, fmt.Sprintf(`"warnings":%s,"ACTION_REQUIRED":"Fix these warnings"`, wJSON))
+		}
+		if hasH {
+			hJSON, _ := json.Marshal(hints)
+			parts = append(parts, fmt.Sprintf(`"hints":%s`, hJSON))
+		}
+		return "{" + strings.Join(parts, ",") + "}"
+	}
+	return summarizeTruncate(result, 300)
 }
