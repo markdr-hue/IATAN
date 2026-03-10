@@ -38,20 +38,11 @@ func (t *SecretsTool) Parameters() map[string]interface{} {
 }
 
 func (t *SecretsTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "store":
-		return t.executeStore(ctx, args)
-	case "list":
-		return t.executeList(ctx, args)
-	case "delete":
-		return t.executeDelete(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use store, list, delete)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"store":  t.executeStore,
+		"list":   t.executeList,
+		"delete": t.executeDelete,
+	}, nil)
 }
 
 func (t *SecretsTool) executeStore(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

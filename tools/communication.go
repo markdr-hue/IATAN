@@ -41,18 +41,10 @@ func (t *CommunicationTool) Parameters() map[string]interface{} {
 }
 
 func (t *CommunicationTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "ask":
-		return t.ask(ctx, args)
-	case "check":
-		return t.check(ctx, args)
-	default:
-		return &Result{Success: false, Error: "unknown action: " + action}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"ask":   t.ask,
+		"check": t.check,
+	}, nil)
 }
 
 func (t *CommunicationTool) ask(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

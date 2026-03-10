@@ -37,20 +37,11 @@ func (t *DiagnosticsTool) Parameters() map[string]interface{} {
 }
 
 func (t *DiagnosticsTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "health":
-		return t.executeHealth(ctx, args)
-	case "errors":
-		return t.executeErrors(ctx, args)
-	case "integrity":
-		return t.executeIntegrity(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use health, errors, integrity)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"health":    t.executeHealth,
+		"errors":    t.executeErrors,
+		"integrity": t.executeIntegrity,
+	}, nil)
 }
 
 func (t *DiagnosticsTool) executeHealth(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {
@@ -193,14 +184,14 @@ func (t *DiagnosticsTool) executeIntegrity(ctx *ToolContext, _ map[string]interf
 	}
 
 	// 5. Check design system memories
-	var archCount, blueprintCount int
+	var archCount, designCount int
 	ctx.DB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = 'site_architecture'").Scan(&archCount)
-	ctx.DB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = 'site_blueprint'").Scan(&blueprintCount)
+	ctx.DB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = 'design_summary'").Scan(&designCount)
 	if archCount == 0 {
-		issues = append(issues, "Missing 'site_architecture' memory. Blueprint may not be complete.")
+		issues = append(issues, "Missing 'site_architecture' memory. Design stage may not be complete.")
 	}
-	if blueprintCount == 0 {
-		issues = append(issues, "Missing 'site_blueprint' memory. Blueprint may not be complete.")
+	if designCount == 0 {
+		issues = append(issues, "Missing 'design_summary' memory. Design stage may not be complete.")
 	}
 
 	status := "healthy"
@@ -218,3 +209,5 @@ func (t *DiagnosticsTool) executeIntegrity(ctx *ToolContext, _ map[string]interf
 		},
 	}}, nil
 }
+
+func (t *DiagnosticsTool) MaxResultSize() int { return 8000 }

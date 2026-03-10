@@ -114,19 +114,36 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var content, title, metadata, pageAssets sql.NullString
+	var routeParams map[string]string
 	err = siteDB.QueryRow(
 		"SELECT title, content, metadata, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
 		pagePath,
 	).Scan(&title, &content, &metadata, &pageAssets)
 	if err != nil {
-		writePublicError(w, http.StatusNotFound, "page not found")
-		return
+		// Try parameterized route match: /thread/4 → /thread/:id
+		templatePath, params, paramErr := findParamPage(siteDB.DB, pagePath)
+		if paramErr != nil {
+			writePublicError(w, http.StatusNotFound, "page not found")
+			return
+		}
+		err = siteDB.QueryRow(
+			"SELECT title, content, metadata, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+			templatePath,
+		).Scan(&title, &content, &metadata, &pageAssets)
+		if err != nil {
+			writePublicError(w, http.StatusNotFound, "page not found")
+			return
+		}
+		routeParams = params
 	}
 
 	// Strip shared asset refs the brain may have embedded, then strip external
 	// scripts and CSS links for SPA — extracting their URLs so the router
 	// can load them dynamically.
 	cleaned := stripSharedAssetRefs(content.String, siteDB.DB)
+	// Strip nav/footer — the layout provides these outside <main>.
+	cleaned = navBlockRe.ReplaceAllString(cleaned, "")
+	cleaned = footBlockRe.ReplaceAllString(cleaned, "")
 	cleanContent, contentCSS, contentJS := stripForSPA(cleaned)
 
 	resp := map[string]interface{}{
@@ -135,6 +152,9 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 		"content":  strings.TrimSpace(cleanContent),
 		"metadata": metadata.String,
 		"site_id":  site.ID,
+	}
+	if routeParams != nil {
+		resp["params"] = routeParams
 	}
 
 	// Merge DB-declared page assets with URLs extracted from content.
@@ -149,6 +169,7 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 	if len(contentJS) > 0 {
 		resp["page_js"] = dedupStrings(contentJS)
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writePublicJSON(w, http.StatusOK, resp)
 }
 
@@ -187,6 +208,7 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 		"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
 		pagePath,
 	).Scan(&title, &content, &metadata, &layoutName, &pageAssets)
+	var routeParams map[string]string
 	if err != nil {
 		// Try common homepage variants: the brain often saves as /index.html instead of /
 		found := false
@@ -198,6 +220,18 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 				found = true
 				pagePath = alt
 				break
+			}
+		}
+		// Try parameterized route match: /thread/4 → /thread/:id
+		if !found {
+			if templatePath, params, paramErr := findParamPage(siteDB.DB, pagePath); paramErr == nil {
+				if siteDB.QueryRow(
+					"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+					templatePath,
+				).Scan(&title, &content, &metadata, &layoutName, &pageAssets) == nil {
+					found = true
+					routeParams = params
+				}
 			}
 		}
 		if !found {
@@ -217,7 +251,7 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Render the full HTML document with layout wrapping.
-	doc := h.renderDocument(site, siteDB.DB, pagePath, title.String, content.String, metadata.String, layoutName.String, pageAssets.String)
+	doc := h.renderDocument(site, siteDB.DB, pagePath, title.String, content.String, metadata.String, layoutName.String, pageAssets.String, routeParams)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(doc))
@@ -232,7 +266,7 @@ func (h *Handler) serve404(w http.ResponseWriter, site *models.Site) {
 			"SELECT title, content, metadata, layout, assets FROM pages WHERE path = '/404' AND status = 'published' AND is_deleted = 0",
 		).Scan(&title, &content, &metadata, &layoutName, &pageAssets)
 		if err == nil {
-			doc := h.renderDocument(site, siteDB.DB, "/404", title.String, content.String, metadata.String, layoutName.String, pageAssets.String)
+			doc := h.renderDocument(site, siteDB.DB, "/404", title.String, content.String, metadata.String, layoutName.String, pageAssets.String, nil)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte(doc))
@@ -315,7 +349,7 @@ func injectPageAssets(pageAssetsJSON string) (cssLinks, jsScripts string) {
 	return css.String(), js.String()
 }
 
-func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, title, content, metadataJSON, layoutName, pageAssetsJSON string) string {
+func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, title, content, metadataJSON, layoutName, pageAssetsJSON string, routeParams map[string]string) string {
 	// Parse page metadata.
 	var meta pageMetadata
 	if metadataJSON != "" && metadataJSON != "{}" {
@@ -421,6 +455,10 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 	b.WriteString("<body>\n")
 
 	if layout != nil {
+		// Strip nav/footer from page content — the layout provides these.
+		cleanContent = navBlockRe.ReplaceAllString(cleanContent, "")
+		cleanContent = footBlockRe.ReplaceAllString(cleanContent, "")
+
 		// Layout wrapping: body_before_main → <main> → content → </main> → body_after_main
 		if layout.BodyBeforeMain != "" {
 			b.WriteString(layout.BodyBeforeMain)
@@ -434,8 +472,34 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 			b.WriteString("\n")
 		}
 	} else {
-		// No layout — render content directly (fallback for pre-layout sites / blueprint in progress).
+		// No layout — render content directly (fallback for pre-layout sites).
 		b.WriteString(cleanContent)
+	}
+
+	// Detect SPA architecture from site config.
+	var siteConfig struct {
+		Architecture string `json:"architecture"`
+	}
+	json.Unmarshal([]byte(site.Config), &siteConfig)
+
+	// Inject SPA flag before foundation JS if architecture is SPA.
+	if siteConfig.Architecture == "spa" {
+		b.WriteString("<script>window.__IATAN_SPA=true;</script>\n")
+	}
+
+	// Inject route params for parameterized pages (e.g. /thread/:id → {id: "4"}).
+	if len(routeParams) > 0 {
+		paramsJSON, _ := json.Marshal(routeParams)
+		b.WriteString(fmt.Sprintf("<script>window.__routeParams=%s;</script>\n", paramsJSON))
+	} else {
+		b.WriteString("<script>window.__routeParams={};</script>\n")
+	}
+
+	// Inject built-in foundation JS runtime (App.fetch, App.auth, SPA router, etc.).
+	if len(h.deps.FoundationJS) > 0 {
+		b.WriteString("<script>")
+		b.Write(h.deps.FoundationJS)
+		b.WriteString("</script>\n")
 	}
 
 	// Auto-injected global JS assets (after footer/layout).
@@ -703,6 +767,8 @@ var (
 	headBlockRe = regexp.MustCompile(`(?isU)<head[\s>].*</head>`)
 	bodyOpenRe  = regexp.MustCompile(`(?i)<body[^>]*>`)
 	bodyCloseRe = regexp.MustCompile(`(?i)</body\s*>`)
+	navBlockRe  = regexp.MustCompile(`(?isU)<nav[\s>].*</nav>`)
+	footBlockRe = regexp.MustCompile(`(?isU)<footer[\s>].*</footer>`)
 )
 
 // stripDocumentShell removes structural HTML tags (DOCTYPE, html, head, body)
@@ -759,6 +825,45 @@ func homeFallbacks(path string) []string {
 		// each route individually for SSR/SEO.
 		return nil
 	}
+}
+
+// findParamPage matches a request path against parameterized page templates.
+// e.g. "/thread/4" matches "/thread/:id" → params {"id": "4"}.
+func findParamPage(siteDB *sql.DB, requestPath string) (templatePath string, params map[string]string, err error) {
+	rows, err := siteDB.Query(
+		"SELECT path FROM pages WHERE path LIKE '%:%' AND status = 'published' AND is_deleted = 0",
+	)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+
+	reqParts := strings.Split(requestPath, "/")
+
+	for rows.Next() {
+		var candidate string
+		rows.Scan(&candidate)
+
+		candParts := strings.Split(candidate, "/")
+		if len(candParts) != len(reqParts) {
+			continue
+		}
+
+		match := true
+		extracted := map[string]string{}
+		for i, cp := range candParts {
+			if strings.HasPrefix(cp, ":") {
+				extracted[cp[1:]] = reqParts[i]
+			} else if cp != reqParts[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return candidate, extracted, nil
+		}
+	}
+	return "", nil, fmt.Errorf("no matching parameterized page")
 }
 
 func (h *Handler) trackPageView(siteID int, pagePath string, r *http.Request) {
@@ -1064,6 +1169,7 @@ type apiEndpoint struct {
 	Methods       []string
 	PublicColumns []string // nil means all non-secure
 	RequiresAuth  bool
+	PublicRead    bool   // GET allowed without auth even when RequiresAuth=true
 	RequiredRole  string // empty = any authenticated user, "admin" = admin only
 	RateLimit     int
 	SecureCols    map[string]string // column → "hash" or "encrypt"
@@ -1144,7 +1250,8 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check auth if required (accepts site API key or user JWT).
-	if ep.RequiresAuth {
+	// Skip auth for GET when public_read is enabled.
+	if ep.RequiresAuth && !(r.Method == http.MethodGet && ep.PublicRead) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		// Site API keys bypass role checks (owner-level access).
 		if !h.validateSiteToken(site.ID, token) {
@@ -1200,9 +1307,9 @@ func (h *Handler) loadEndpoint(siteDB *sql.DB, path string) (*apiEndpoint, error
 	var methodsJSON string
 	var publicColsJSON, requiredRole sql.NullString
 	err := siteDB.QueryRow(
-		"SELECT id, path, table_name, methods, public_columns, requires_auth, required_role, rate_limit FROM api_endpoints WHERE path = ?",
+		"SELECT id, path, table_name, methods, public_columns, requires_auth, public_read, required_role, rate_limit FROM api_endpoints WHERE path = ?",
 		path,
-	).Scan(&ep.ID, &ep.Path, &ep.TableName, &methodsJSON, &publicColsJSON, &ep.RequiresAuth, &requiredRole, &ep.RateLimit)
+	).Scan(&ep.ID, &ep.Path, &ep.TableName, &methodsJSON, &publicColsJSON, &ep.RequiresAuth, &ep.PublicRead, &requiredRole, &ep.RateLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -2041,8 +2148,8 @@ func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request, siteDB *sql.D
 		return
 	}
 
-	// Check auth if required.
-	if ep.RequiresAuth {
+	// Check auth if required. Stats are GET-only, so skip when public_read.
+	if ep.RequiresAuth && !ep.PublicRead {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !h.validateSiteToken(getSite(r).ID, token) {
 			writePublicError(w, http.StatusUnauthorized, "unauthorized")

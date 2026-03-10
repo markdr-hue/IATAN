@@ -33,6 +33,7 @@ type systemStatus struct {
 	BrainRunning  int    `json:"brain_running"`
 	RunningSites  []int  `json:"running_sites"`
 	Uptime        string `json:"uptime"`
+	PublicPort    int    `json:"public_port"`
 }
 
 var startTime = time.Now()
@@ -55,6 +56,7 @@ func (h *SystemHandler) Status(w http.ResponseWriter, r *http.Request) {
 		BrainRunning:  h.deps.BrainManager.RunningCount(),
 		RunningSites:  h.deps.BrainManager.RunningSites(),
 		Uptime:        time.Since(startTime).Round(time.Second).String(),
+		PublicPort:    h.deps.Config.PublicPort,
 	}
 
 	writeJSON(w, http.StatusOK, status)

@@ -21,6 +21,7 @@ type Deps struct {
 	Bus           *events.Bus
 	Encryptor     *security.Encryptor
 	JWTManager    *security.JWTManager
+	FoundationJS  []byte // embedded JS runtime for public sites
 	Logger        *slog.Logger
 }
 

@@ -35,22 +35,12 @@ func (t *MemoryTool) Parameters() map[string]interface{} {
 }
 
 func (t *MemoryTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "remember":
-		return t.remember(ctx, args)
-	case "recall":
-		return t.recall(ctx, args)
-	case "list":
-		return t.list(ctx, args)
-	case "forget":
-		return t.forget(ctx, args)
-	default:
-		return &Result{Success: false, Error: "unknown action: " + action}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"remember": t.remember,
+		"recall":   t.recall,
+		"list":     t.list,
+		"forget":   t.forget,
+	}, nil)
 }
 
 func (t *MemoryTool) remember(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

@@ -58,22 +58,12 @@ func (t *SchedulerTool) Parameters() map[string]interface{} {
 }
 
 func (t *SchedulerTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "create":
-		return t.executeCreate(ctx, args)
-	case "list":
-		return t.executeList(ctx, args)
-	case "update":
-		return t.executeUpdate(ctx, args)
-	case "delete":
-		return t.executeDelete(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use create, list, update, delete)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"create": t.executeCreate,
+		"list":   t.executeList,
+		"update": t.executeUpdate,
+		"delete": t.executeDelete,
+	}, nil)
 }
 
 func (t *SchedulerTool) executeCreate(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

@@ -16,18 +16,19 @@ import { emptyState } from '../../ui/helpers.js';
 export async function renderSiteDiagnostics(container, siteId) {
   clear(container);
 
-  const refreshBtn = h('button', {
-    className: 'btn btn--sm btn--secondary',
-    onClick: () => loadAll(body, siteId),
-  }, 'Run Checks');
-
   const header = h('div', { className: 'context-panel__header' }, [
     h('h3', { className: 'context-panel__title' }, 'Diagnostics'),
-    refreshBtn,
   ]);
 
   const body = h('div', { className: 'context-panel__body' });
+
+  const refreshBtn = h('button', {
+    className: 'btn btn--sm btn--secondary mb-3',
+    onClick: () => loadAll(body, siteId),
+  }, 'Run Checks');
+
   container.appendChild(header);
+  body.appendChild(refreshBtn);
   container.appendChild(body);
 
   await loadAll(body, siteId);
@@ -58,36 +59,38 @@ function renderResults(container, health, integrity, errors) {
   const rt = health.runtime || {};
   const mem = health.memory || {};
   const site = health.site || {};
-  container.appendChild(h('div', { className: 'flex gap-3 mb-3', style: { flexWrap: 'wrap' } }, [
-    miniCard('Go', rt.go_version),
-    miniCard('Goroutines', rt.goroutines),
-    miniCard('Memory', mem.alloc_mb + ' MB'),
-    miniCard('GC Runs', mem.num_gc),
-    miniCard('Pages', site.pages),
-    miniCard('Memories', site.memories),
-    miniCard('Tables', site.tables),
+  container.appendChild(h('div', { className: 'stat-cards stat-cards--compact' }, [
+    statCard('Go', rt.go_version, 'code'),
+    statCard('Goroutines', rt.goroutines, 'activity'),
+    statCard('Memory', (mem.alloc_mb ?? '-') + ' MB', 'cpu'),
+    statCard('GC Runs', mem.num_gc, 'refresh-cw'),
+    statCard('Pages', site.pages, 'file-text'),
+    statCard('Memories', site.memories, 'brain'),
+    statCard('Tables', site.tables, 'database'),
   ]));
 
   // Integrity section
   container.appendChild(sectionHeader('Integrity Check', integrity.ok ? 'check' : 'alert-circle'));
   const issues = integrity.issues || [];
   if (issues.length === 0) {
-    container.appendChild(h('div', {
-      className: 'text-sm mb-3',
-      style: { padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: '6px', color: 'var(--success)' },
-    }, 'All checks passed.'));
+    container.appendChild(h('div', { className: 'card mb-3' }, [
+      h('div', { className: 'flex items-center gap-2' }, [
+        h('span', { innerHTML: icon('check'), style: { color: 'var(--success)' } }),
+        h('span', { className: 'text-sm' }, 'All checks passed.'),
+      ]),
+    ]));
   } else {
     for (const issue of issues) {
       const isError = issue.level === 'error';
-      container.appendChild(h('div', {
-        className: `flex items-center gap-2 text-sm mb-2`,
-        style: { padding: '6px 12px', background: 'var(--bg-secondary)', borderRadius: '4px' },
-      }, [
-        h('span', {
-          innerHTML: icon(isError ? 'alert-circle' : 'alert-circle'),
-          style: { color: isError ? 'var(--danger)' : 'var(--warning)' },
-        }),
-        h('span', {}, issue.message),
+      container.appendChild(h('div', { className: 'card mb-2' }, [
+        h('div', { className: 'flex items-center gap-2' }, [
+          h('span', {
+            innerHTML: icon(isError ? 'alert-circle' : 'alert-triangle'),
+            style: { color: isError ? 'var(--danger)' : 'var(--warning)' },
+          }),
+          h('span', { className: 'text-sm' }, issue.message),
+          h('span', { className: `badge ${isError ? 'badge--danger' : 'badge--warning'}` }, issue.level),
+        ]),
       ]));
     }
   }
@@ -95,10 +98,12 @@ function renderResults(container, health, integrity, errors) {
   // Errors section
   container.appendChild(sectionHeader('Recent Errors', 'zap'));
   if (errors.length === 0) {
-    container.appendChild(h('div', {
-      className: 'text-sm mb-3',
-      style: { padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: '6px' },
-    }, 'No recent errors.'));
+    container.appendChild(h('div', { className: 'card mb-3' }, [
+      h('div', { className: 'flex items-center gap-2' }, [
+        h('span', { innerHTML: icon('check'), style: { color: 'var(--text-tertiary)' } }),
+        h('span', { className: 'text-sm text-secondary' }, 'No recent errors.'),
+      ]),
+    ]));
   } else {
     for (const err of errors) {
       container.appendChild(h('div', { className: 'card mb-2' }, [
@@ -110,9 +115,9 @@ function renderResults(container, health, integrity, errors) {
           h('span', { className: 'text-xs text-secondary' },
             new Date(err.created_at).toLocaleString()),
         ]),
-        ...(err.details ? [h('div', {
+        ...(err.details ? [h('pre', {
           className: 'text-xs text-secondary',
-          style: { padding: '0 12px 12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '100px', overflow: 'auto' },
+          style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '100px', overflow: 'auto', margin: 0 },
         }, err.details)] : []),
       ]));
     }
@@ -120,21 +125,18 @@ function renderResults(container, health, integrity, errors) {
 }
 
 function sectionHeader(title, iconName) {
-  return h('h4', {
-    className: 'flex items-center gap-2 text-sm text-secondary mb-2',
-    style: { padding: '0 4px', marginTop: '12px' },
-  }, [
+  return h('h4', { className: 'flex items-center gap-2 text-sm text-secondary mb-2 mt-4' }, [
     h('span', { innerHTML: icon(iconName) }),
     h('span', {}, title),
   ]);
 }
 
-function miniCard(label, value) {
-  return h('div', {
-    className: 'card',
-    style: { padding: '8px 12px', minWidth: '80px', textAlign: 'center' },
-  }, [
-    h('div', { className: 'text-xs text-secondary' }, label),
-    h('div', { style: { fontSize: '1.1rem', fontWeight: 600 } }, String(value ?? '-')),
+function statCard(label, value, iconName) {
+  return h('div', { className: 'stat-card' }, [
+    h('div', { className: 'flex items-center justify-between mb-2' }, [
+      h('span', { className: 'stat-card__label' }, label),
+      h('span', { innerHTML: icon(iconName), style: { color: 'var(--text-tertiary)' } }),
+    ]),
+    h('div', { className: 'stat-card__value' }, String(value ?? '-')),
   ]);
 }

@@ -31,10 +31,9 @@ const (
 type PipelineStage string
 
 const (
-	StagePlan           PipelineStage = "PLAN"
-	StageDesign         PipelineStage = "DESIGN"
-	StageBlueprintPages PipelineStage = "BLUEPRINT_PAGES"
-	StageDataLayer      PipelineStage = "DATA_LAYER"
+	StagePlan      PipelineStage = "PLAN"
+	StageDesign    PipelineStage = "DESIGN"
+	StageDataLayer PipelineStage = "DATA_LAYER"
 	StageBuildPages     PipelineStage = "BUILD_PAGES"
 	StageReview         PipelineStage = "REVIEW"
 	StageComplete       PipelineStage = "COMPLETE"

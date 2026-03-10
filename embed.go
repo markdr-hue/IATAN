@@ -9,3 +9,6 @@ import "embed"
 
 //go:embed all:web/admin
 var adminFS embed.FS
+
+//go:embed web/foundation/iatan.js
+var foundationJS []byte

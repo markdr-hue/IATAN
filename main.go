@@ -29,7 +29,7 @@ import (
 	"github.com/markdr-hue/IATAN/webhooks"
 )
 
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 func main() {
 	// 1. Load config
@@ -226,6 +226,7 @@ func main() {
 		ProviderFactory: providerFactory,
 		Logger:          slog.Default(),
 		AdminFS:         adminSubFS,
+		FoundationJS:    foundationJS,
 		Version:         Version,
 	})
 

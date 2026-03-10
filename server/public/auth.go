@@ -177,6 +177,39 @@ func (h *Handler) authRegister(w http.ResponseWriter, r *http.Request, siteID in
 	// Remove id if provided.
 	delete(body, "id")
 
+	// Load actual table columns to filter out unknown fields from request.
+	// This prevents INSERT failures when the frontend sends extra fields
+	// like "confirm_password", "terms_accepted", etc.
+	colRows, colErr := siteDB.Query(fmt.Sprintf("PRAGMA table_info(%s)", physTable))
+	if colErr == nil {
+		validCols := make(map[string]bool)
+		for colRows.Next() {
+			var cid int
+			var name, colType string
+			var notNull int
+			var dfltValue sql.NullString
+			var pk int
+			colRows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk)
+			validCols[name] = true
+		}
+		colRows.Close()
+
+		// Verify the auth config columns actually exist in the table.
+		if len(validCols) > 0 {
+			if !validCols[ae.UsernameColumn] || !validCols[ae.PasswordColumn] {
+				writePublicError(w, http.StatusInternalServerError,
+					fmt.Sprintf("auth config mismatch: table %q is missing column %q or %q", ae.TableName, ae.UsernameColumn, ae.PasswordColumn))
+				return
+			}
+		}
+
+		for col := range body {
+			if !validCols[col] {
+				delete(body, col)
+			}
+		}
+	}
+
 	// Insert the row — validate column names from request body.
 	columns := make([]string, 0, len(body))
 	placeholders := make([]string, 0, len(body))
@@ -191,10 +224,15 @@ func (h *Handler) authRegister(w http.ResponseWriter, r *http.Request, siteID in
 		values = append(values, val)
 	}
 
+	if len(columns) == 0 {
+		writePublicError(w, http.StatusInternalServerError, "no valid columns for registration — auth endpoint config does not match table schema")
+		return
+	}
+
 	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", physTable, strings.Join(columns, ", "), strings.Join(placeholders, ", "))
 	result, err := siteDB.Exec(query, values...)
 	if err != nil {
-		writePublicError(w, http.StatusBadRequest, "registration failed")
+		writePublicError(w, http.StatusBadRequest, "registration failed: "+err.Error())
 		return
 	}
 
@@ -566,8 +604,10 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request, siteID i
 		return
 	}
 
-	// Redirect to frontend with token in query param.
-	http.Redirect(w, r, "/?token="+url.QueryEscape(jwtToken), http.StatusFound)
+	// Redirect to frontend with token in URL fragment (not query param).
+	// Fragments are never sent to the server, preventing token leakage
+	// in server logs, Referer headers, and browser history.
+	http.Redirect(w, r, "/#token="+url.QueryEscape(jwtToken), http.StatusFound)
 }
 
 type oauthTokenResponse struct {

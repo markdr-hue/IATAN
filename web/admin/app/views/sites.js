@@ -93,7 +93,21 @@ export async function renderSites(container) {
             h('strong', {}, site.name),
           ]),
         ]),
-        h('td', {}, site.domain || '--'),
+        h('td', {}, (() => {
+          const sys = state.get('systemStatus') || {};
+          const publicPort = sys.public_port || 5000;
+          const needsPort = !site.domain || site.domain.includes('localhost');
+          const host = site.domain || 'localhost';
+          const url = needsPort ? `http://${host}:${publicPort}` : `http://${host}`;
+          const label = needsPort ? `${host}:${publicPort}` : host;
+          return h('a', {
+            href: url,
+            target: '_blank',
+            rel: 'noopener',
+            className: 'link',
+            onClick: (e) => e.stopPropagation(),
+          }, label);
+        })()),
         h('td', {}, [
           h('span', {
             className: `badge ${isRunning ? 'badge--success' : 'badge--warning'}`,

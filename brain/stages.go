@@ -197,6 +197,10 @@ func (w *PipelineWorker) runPlan(ctx context.Context) (PipelineStage, error) {
 	planJSON, _ := MarshalPlan(plan)
 	w.siteDB.ExecWrite("UPDATE pipeline_state SET plan_json = ?, current_page_index = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1", planJSON)
 
+	// Store architecture in site config so the public handler knows whether to inject SPA runtime.
+	configJSON := fmt.Sprintf(`{"architecture":"%s"}`, plan.Architecture)
+	w.deps.DB.Exec("UPDATE sites SET config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", configJSON, w.siteID)
+
 	w.publishBrainMessage(fmt.Sprintf("Plan created: %d pages, architecture: %s", len(plan.Pages), plan.Architecture))
 	LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
 
@@ -233,101 +237,38 @@ func (w *PipelineWorker) runDesign(ctx context.Context) (PipelineStage, error) {
 
 	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(designTools))
 
-	_, lastModel, totalTokens, toolCalls, err := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 12, 8192)
+	_, lastModel, totalTokens, toolCalls, err := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 12, 16384)
 	if err != nil {
 		LogStageError(w.siteDB, logID, err.Error())
 		return StageDesign, err
 	}
 
-	// Validate design output.
+	// Validate design output — run one targeted fix attempt before failing.
 	issues := validateDesign(w.siteDB.Writer(), plan)
 	if len(issues) > 0 {
-		w.logger.Warn("design validation failed", "issues", issues)
-		LogStageError(w.siteDB, logID, strings.Join(issues, "; "))
-		return StageDesign, fmt.Errorf("design validation: %s", strings.Join(issues, "; "))
+		w.logger.Warn("design validation issues, attempting fix", "issues", issues)
+		fixPrompt := "Fix these design issues:\n"
+		for _, iss := range issues {
+			fixPrompt += "- " + iss + "\n"
+		}
+		fixMsgs := []llm.Message{{Role: llm.RoleUser, Content: fixPrompt}}
+		_, _, fixTokens, fixCalls, fixErr := w.runToolLoop(ctx, provider, modelID, prompt, fixMsgs, toolDefs, 6, 4096)
+		totalTokens += fixTokens
+		toolCalls += fixCalls
+		if fixErr == nil {
+			issues = validateDesign(w.siteDB.Writer(), plan)
+		}
+		if len(issues) > 0 {
+			LogStageError(w.siteDB, logID, strings.Join(issues, "; "))
+			return StageDesign, fmt.Errorf("design validation: %s", strings.Join(issues, "; "))
+		}
 	}
 
 	w.publishBrainMessage("Design system created successfully.")
 	LogStageComplete(w.siteDB, logID, totalTokens, 0, toolCalls, time.Since(start))
 	_ = lastModel
 
-	return StageBlueprintPages, nil
-}
-
-// --- BLUEPRINT_PAGES stage ---
-
-func (w *PipelineWorker) runBlueprintPages(ctx context.Context) (PipelineStage, error) {
-	start := time.Now()
-	logID, _ := LogStageStart(w.siteDB, StageBlueprintPages)
-
-	plan, err := w.loadPlan()
-	if err != nil {
-		LogStageError(w.siteDB, logID, err.Error())
-		return StageBlueprintPages, err
-	}
-
-	provider, modelID, err := w.getProvider()
-	if err != nil {
-		LogStageError(w.siteDB, logID, err.Error())
-		return StageBlueprintPages, err
-	}
-
-	// Load CSS class map from the design stage output for blueprint context.
-	cssContent := w.getGlobalCSS()
-	cssClassMap := extractCSSClassMap(cssContent)
-	layoutSummary := w.getLayoutSummary()
-
-	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
-	var siteDescription string
-	if site != nil && site.Description != nil {
-		siteDescription = *site.Description
-	}
-
-	prompt := buildBlueprintPrompt(plan, cssClassMap, layoutSummary, siteDescription)
-	userMsg := "Generate the page blueprints for every page in the plan."
-	w.saveChatMessageOnce(llm.Message{Role: llm.RoleUser, Content: userMsg})
-
-	// Single LLM call, no tools — like PLAN stage.
-	content, tokens, err := w.callLLM(ctx, provider, modelID, prompt, userMsg, 8192)
-	if err != nil {
-		LogStageError(w.siteDB, logID, err.Error())
-		return StageBlueprintPages, err
-	}
-
-	bp, err := ParseSiteBlueprint(content)
-	if err != nil {
-		// Retry once with stricter prompt.
-		w.logger.Warn("blueprint parse failed, retrying", "error", err)
-		retryPrompt := prompt + fmt.Sprintf("\n\nCRITICAL: Your previous response was not valid JSON. Parse error: %s\nRespond with ONLY a JSON object, no markdown, no explanation.", err.Error())
-		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, retryPrompt, "Respond with ONLY the JSON blueprint.", 8192)
-		tokens += tokens2
-		if err2 != nil {
-			LogStageError(w.siteDB, logID, err2.Error())
-			return StageBlueprintPages, err2
-		}
-		bp, err = ParseSiteBlueprint(content)
-		if err != nil {
-			LogStageError(w.siteDB, logID, err.Error())
-			return StageBlueprintPages, fmt.Errorf("blueprint parse failed after retry: %w", err)
-		}
-	}
-
-	// Validate blueprint completeness (non-fatal: missing pages get generic treatment).
-	if issues := ValidateBlueprint(bp, plan); len(issues) > 0 {
-		w.logger.Warn("blueprint validation issues", "issues", issues)
-	}
-
-	// Save blueprint JSON to pipeline_state.
-	bpJSON, _ := json.Marshal(bp)
-	_, err = w.siteDB.ExecWrite(`UPDATE pipeline_state SET blueprint_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1`, string(bpJSON))
-	if err != nil {
-		LogStageError(w.siteDB, logID, err.Error())
-		return StageBlueprintPages, err
-	}
-
-	w.publishBrainMessage("Page blueprints created.")
-	LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
-
+	// Route: if site needs data, create tables/endpoints before pages.
 	if plan.NeedsDataLayer {
 		return StageDataLayer, nil
 	}
@@ -431,6 +372,10 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 	cssContent := w.getGlobalCSS()
 	cssClassMap := extractCSSClassMap(cssContent)
 
+	// Load structured API contract (generated from DATA_LAYER output).
+	apiContract := w.getAPIContract()
+	authContract := w.getAuthEndpointContract()
+
 	// Load site description for content context.
 	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
 	var siteDescription string
@@ -438,14 +383,8 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		siteDescription = *site.Description
 	}
 
-	// Load blueprint from pipeline_state (created by BLUEPRINT_PAGES stage).
-	var blueprint *SiteBlueprint
-	if state != nil && state.BlueprintJSON != "" {
-		blueprint, _ = ParseSiteBlueprint(state.BlueprintJSON)
-	}
-
-	// Build homepage first to establish tone, then build remaining pages concurrently.
-	// This lets us collect warnings and extract key content terms from the homepage.
+	// Build homepage first to establish tone, then build remaining pages.
+	// This lets us collect warnings and content terms from the homepage.
 	var previousWarnings []string
 	var contentTerms []string
 	var remainingPages []PagePlan
@@ -475,7 +414,7 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 			if exists > 0 {
 				w.logger.Info("homepage already exists, skipping", "path", "/")
 			} else {
-				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil, blueprint); err != nil {
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, apiContract, authContract, nil, nil); err != nil {
 					return StageBuildPages, err
 				}
 				w.publishBrainMessage(fmt.Sprintf("Built page: **%s** (%s)", page.Title, page.Path))
@@ -516,7 +455,7 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 		contentTerms = w.extractContentTermsFromAll(builtPaths, siteDescription)
 		previousWarnings = w.collectWarningsFromAll(builtPaths)
 
-		err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, contentTerms, previousWarnings, blueprint)
+		err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, apiContract, authContract, contentTerms, previousWarnings)
 		if err != nil {
 			w.logger.Error("page build failed", "path", page.Path, "error", err)
 			var created int
@@ -535,7 +474,7 @@ func (w *PipelineWorker) runBuildPages(ctx context.Context) (PipelineStage, erro
 	return StageReview, nil
 }
 
-func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription string, contentTerms, previousWarnings []string, blueprint *SiteBlueprint) error {
+func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, page PagePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription, apiContract, authContract string, contentTerms, previousWarnings []string) error {
 	start := time.Now()
 	logID, _ := LogStageStart(w.siteDB, StageBuildPages)
 
@@ -545,82 +484,10 @@ func (w *PipelineWorker) buildSinglePage(ctx context.Context, plan *SitePlan, pa
 		return err
 	}
 
-	// Load table schemas if page needs data (supports multiple tables per page).
-	// Use writer pool for WAL visibility (tables/endpoints written in DATA_LAYER).
-	var tableSchema string
-	if page.NeedsData && len(page.DataTables) > 0 {
-		var parts []string
-		for _, tableName := range page.DataTables {
-			var entry strings.Builder
-			var schemaDef sql.NullString
-			w.siteDB.Writer().QueryRow("SELECT schema_def FROM dynamic_tables WHERE table_name = ?", tableName).Scan(&schemaDef)
-			if schemaDef.Valid {
-				entry.WriteString(schemaDef.String)
-			} else {
-				entry.WriteString(fmt.Sprintf("Table: %s", tableName))
-			}
-			// Query API endpoint path, auth requirement, and public columns.
-			var apiPath, publicCols sql.NullString
-			var requiresAuth bool
-			w.siteDB.Writer().QueryRow(
-				"SELECT path, requires_auth, public_columns FROM api_endpoints WHERE table_name = ?", tableName,
-			).Scan(&apiPath, &requiresAuth, &publicCols)
-			if apiPath.Valid {
-				entry.WriteString(fmt.Sprintf("\nAPI endpoint: /api/%s", apiPath.String))
-				if requiresAuth {
-					entry.WriteString(" (REQUIRES AUTH — include Authorization header)")
-				}
-				if publicCols.Valid && publicCols.String != "" && publicCols.String != "[]" {
-					entry.WriteString(fmt.Sprintf("\nPublic columns (only these are returned by GET): %s", publicCols.String))
-				}
-			}
-			parts = append(parts, entry.String())
-		}
-		tableSchema = strings.Join(parts, "\n\n")
-
-		// Find the auth endpoint (login/register path) for this site so the
-		// LLM knows how to obtain and use JWT tokens.
-		var authPath, usernameCol sql.NullString
-		w.siteDB.Writer().QueryRow("SELECT path, username_column FROM auth_endpoints LIMIT 1").Scan(&authPath, &usernameCol)
-		if authPath.Valid {
-			loginField := "username"
-			if usernameCol.Valid && usernameCol.String != "" {
-				loginField = usernameCol.String
-			}
-			tableSchema += fmt.Sprintf("\n\nAuth endpoint: POST /api/%s/login -> returns {\"token\": \"jwt...\"}", authPath.String)
-			tableSchema += fmt.Sprintf("\nRegister: POST /api/%s/register", authPath.String)
-			tableSchema += fmt.Sprintf("\nLogin/register JSON field: \"%s\" (use this exact key in the request body)", loginField)
-			tableSchema += fmt.Sprintf("\nExample body: {\"%s\": \"...\", \"password\": \"...\"}", loginField)
-			tableSchema += "\nUse: fetch(url, {headers: {'Authorization': 'Bearer ' + token}})"
-
-			// OAuth providers for this auth endpoint.
-			oauthRows, _ := w.siteDB.Writer().Query("SELECT name, display_name FROM oauth_providers WHERE auth_endpoint_path = ? AND is_enabled = 1", authPath.String)
-			if oauthRows != nil {
-				var oauthProviders []string
-				for oauthRows.Next() {
-					var name, displayName string
-					oauthRows.Scan(&name, &displayName)
-					oauthProviders = append(oauthProviders, fmt.Sprintf("%s (/api/%s/oauth/%s)", displayName, authPath.String, name))
-				}
-				oauthRows.Close()
-				if len(oauthProviders) > 0 {
-					tableSchema += "\nOAuth: " + strings.Join(oauthProviders, ", ")
-				}
-			}
-
-			// Role info.
-			var defaultRole, roleCol sql.NullString
-			w.siteDB.Writer().QueryRow("SELECT default_role, role_column FROM auth_endpoints WHERE path = ?", authPath.String).Scan(&defaultRole, &roleCol)
-			if defaultRole.Valid && defaultRole.String != "" {
-				tableSchema += fmt.Sprintf("\nRoles: default=%s (stored in column: %s)", defaultRole.String, roleCol.String)
-			}
-		}
-	}
-
 	// List available SVG assets for page content.
 	svgAssets := w.getSVGAssetList()
 
-	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets, contentTerms, previousWarnings, blueprint)
+	prompt := buildPagePrompt(page, plan, allPaths, layoutSummary, cssClassMap, siteDescription, apiContract, authContract, svgAssets, contentTerms, previousWarnings)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: fmt.Sprintf("Build the page: %s (%s)", page.Title, page.Path)}}
 	w.saveChatMessageOnce(messages[0])
 
@@ -651,6 +518,9 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 	start := time.Now()
 	logID, _ := LogStageStart(w.siteDB, StageReview)
 
+	// Pre-compute CSS class map for both rebuild and review prompt.
+	cssClassMap := extractCSSClassMap(w.getGlobalCSS())
+
 	// First: rebuild any missing planned pages (Go-driven, no LLM guessing).
 	plan, _ := w.loadPlan()
 	if plan != nil {
@@ -659,19 +529,11 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			allPaths[i] = p.Path
 		}
 		layoutSummary := w.getLayoutSummary()
-		cssClassMap := extractCSSClassMap(w.getGlobalCSS())
 
 		site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
 		var siteDescription string
 		if site != nil && site.Description != nil {
 			siteDescription = *site.Description
-		}
-
-		// Load blueprint for rebuilding context.
-		var blueprint *SiteBlueprint
-		reviewState, _ := LoadPipelineState(w.siteDB.DB)
-		if reviewState != nil && reviewState.BlueprintJSON != "" {
-			blueprint, _ = ParseSiteBlueprint(reviewState.BlueprintJSON)
 		}
 
 		for _, page := range plan.Pages {
@@ -681,27 +543,52 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			if exists == 0 {
 				w.logger.Warn("review: rebuilding missing planned page", "path", page.Path)
 				w.publishBrainMessage(fmt.Sprintf("Rebuilding missing page: %s", page.Path))
-				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, nil, nil, blueprint); err != nil {
+				apiContract := w.getAPIContract()
+				authContract := w.getAuthEndpointContract()
+				if err := w.buildSinglePage(ctx, plan, page, allPaths, layoutSummary, cssClassMap, siteDescription, apiContract, authContract, nil, nil); err != nil {
 					w.logger.Error("review: failed to rebuild page", "path", page.Path, "error", err)
 				}
 			}
 		}
 	}
 
-	// Run Go-based validation (zero tokens) with a multi-pass fix loop
-	// (same pattern as DATA_LAYER fix-up at lines 287-308).
+	// Run Go-based validation (zero tokens) with a multi-pass fix loop.
+	// Track previous issues to skip recurring ones that the LLM can't fix.
 	issues := validateSite(w.siteDB.DB)
 	issues = append(issues, validateColorContrast(plan)...)
 	totalTokens := 0
+	var previousIssues map[string]bool
 
 	for fixAttempt := 0; fixAttempt < 3; fixAttempt++ {
 		if len(issues) == 0 {
 			break
 		}
+
+		// Filter out issues that were already seen in the previous attempt
+		// (the LLM tried and failed to fix them — don't retry).
+		if previousIssues != nil {
+			var newIssues []string
+			for _, iss := range issues {
+				if !previousIssues[iss] {
+					newIssues = append(newIssues, iss)
+				}
+			}
+			issues = newIssues
+			if len(issues) == 0 {
+				break
+			}
+		}
+
 		if fixAttempt == 2 {
 			// Final attempt still has issues — log and proceed (don't block deployment).
 			w.publishBrainMessage(fmt.Sprintf("Review: %d issues remain after %d fix attempts: %s", len(issues), fixAttempt+1, strings.Join(issues, "; ")))
 			break
+		}
+
+		// Track current issues for deduplication on next pass.
+		previousIssues = make(map[string]bool, len(issues))
+		for _, iss := range issues {
+			previousIssues[iss] = true
 		}
 
 		w.publishBrainMessage(fmt.Sprintf("Review found %d issues (attempt %d/3), fixing...", len(issues), fixAttempt+1))
@@ -711,18 +598,19 @@ func (w *PipelineWorker) runReview(ctx context.Context) (PipelineStage, error) {
 			break
 		}
 
-		prompt := buildReviewPrompt(issues, w.siteDB.DB, plan)
+		prompt := buildReviewPrompt(issues, w.siteDB.DB, plan, cssClassMap)
 		messages := []llm.Message{{Role: llm.RoleUser, Content: "Fix the following issues:\n" + strings.Join(issues, "\n")}}
 		if fixAttempt == 0 {
 			w.saveChatMessageOnce(messages[0])
 		}
 
 		toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(reviewTools))
-		_, _, tokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 4, 8192)
+		_, _, tokens, _, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 8, 8192)
 		totalTokens += tokens
 
-		// Re-validate after fixes.
+		// Re-validate after fixes (include color contrast check).
 		issues = validateSite(w.siteDB.DB)
+		issues = append(issues, validateColorContrast(plan)...)
 	}
 
 	if len(issues) == 0 {
@@ -744,7 +632,9 @@ func (w *PipelineWorker) runComplete(ctx context.Context) (PipelineStage, error)
 	w.publishBrainMessage("Site build complete! Switching to monitoring mode.")
 
 	// Update site mode to monitoring.
-	w.deps.DB.Exec("UPDATE sites SET mode = 'monitoring', updated_at = CURRENT_TIMESTAMP WHERE id = ?", w.siteID)
+	if _, err := w.deps.DB.Exec("UPDATE sites SET mode = 'monitoring', updated_at = CURRENT_TIMESTAMP WHERE id = ?", w.siteID); err != nil {
+		w.logger.Error("failed to update site mode to monitoring", "error", err)
+	}
 	if w.deps.Bus != nil {
 		w.deps.Bus.Publish(events.NewEvent(events.EventBrainModeChanged, w.siteID, map[string]interface{}{
 			"site_id": w.siteID,
@@ -799,47 +689,50 @@ func (w *PipelineWorker) runUpdatePlan(ctx context.Context) (PipelineStage, erro
 	}
 
 	// Apply patch to existing plan.
-	if existingPlan != nil {
-		// Add new pages.
-		existingPlan.Pages = append(existingPlan.Pages, patch.AddPages...)
-
-		// Modify existing pages: update the plan and soft-delete the old
-		// page so BUILD_PAGES will rebuild it with the new spec.
-		for _, mod := range patch.ModifyPages {
-			for i, p := range existingPlan.Pages {
-				if p.Path == mod.Path {
-					existingPlan.Pages[i] = mod
-					w.siteDB.ExecWrite("UPDATE pages SET is_deleted = 1 WHERE path = ? AND is_deleted = 0", mod.Path)
-					break
-				}
-			}
-		}
-
-		// Remove pages.
-		for _, rm := range patch.RemovePages {
-			for i, p := range existingPlan.Pages {
-				if p.Path == rm {
-					existingPlan.Pages = append(existingPlan.Pages[:i], existingPlan.Pages[i+1:]...)
-					break
-				}
-			}
-		}
-
-		// Add new tables.
-		existingPlan.DataTables = append(existingPlan.DataTables, patch.AddTables...)
-		if len(patch.AddTables) > 0 {
-			existingPlan.NeedsDataLayer = true
-		}
-
-		// Save updated plan.
-		planJSON, _ := MarshalPlan(existingPlan)
-		w.siteDB.ExecWrite("UPDATE pipeline_state SET plan_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1", planJSON)
-
-		// Set page index to start building only new/modified pages.
-		// Find index of first new page.
-		newStartIdx := len(existingPlan.Pages) - len(patch.AddPages)
-		w.siteDB.ExecWrite("UPDATE pipeline_state SET current_page_index = ? WHERE id = 1", newStartIdx)
+	if existingPlan == nil {
+		LogStageError(w.siteDB, logID, "cannot apply patch: no existing plan found")
+		return StageUpdatePlan, fmt.Errorf("cannot apply patch: no existing plan found")
 	}
+
+	// Add new pages.
+	existingPlan.Pages = append(existingPlan.Pages, patch.AddPages...)
+
+	// Modify existing pages: update the plan and soft-delete the old
+	// page so BUILD_PAGES will rebuild it with the new spec.
+	for _, mod := range patch.ModifyPages {
+		for i, p := range existingPlan.Pages {
+			if p.Path == mod.Path {
+				existingPlan.Pages[i] = mod
+				w.siteDB.ExecWrite("UPDATE pages SET is_deleted = 1 WHERE path = ? AND is_deleted = 0", mod.Path)
+				break
+			}
+		}
+	}
+
+	// Remove pages.
+	for _, rm := range patch.RemovePages {
+		for i, p := range existingPlan.Pages {
+			if p.Path == rm {
+				existingPlan.Pages = append(existingPlan.Pages[:i], existingPlan.Pages[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// Add new tables.
+	existingPlan.DataTables = append(existingPlan.DataTables, patch.AddTables...)
+	if len(patch.AddTables) > 0 {
+		existingPlan.NeedsDataLayer = true
+	}
+
+	// Save updated plan.
+	planJSON, _ := MarshalPlan(existingPlan)
+	w.siteDB.ExecWrite("UPDATE pipeline_state SET plan_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1", planJSON)
+
+	// Set page index to start building only new/modified pages.
+	// Find index of first new page.
+	newStartIdx := len(existingPlan.Pages) - len(patch.AddPages)
+	w.siteDB.ExecWrite("UPDATE pipeline_state SET current_page_index = ? WHERE id = 1", newStartIdx)
 
 	// Clear the update description now that it's been consumed.
 	w.siteDB.ExecWrite("UPDATE pipeline_state SET update_description = NULL WHERE id = 1")
@@ -847,14 +740,13 @@ func (w *PipelineWorker) runUpdatePlan(ctx context.Context) (PipelineStage, erro
 	LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
 
 	// Route to appropriate next stage.
-	// Always regenerate blueprints for new/modified pages.
 	if patch.UpdateCSS {
-		return StageDesign, nil // DESIGN → BLUEPRINT_PAGES → DATA_LAYER? → BUILD_PAGES
+		return StageDesign, nil
 	}
 	if len(patch.AddTables) > 0 {
-		return StageBlueprintPages, nil // BLUEPRINT_PAGES → DATA_LAYER → BUILD_PAGES
+		return StageDataLayer, nil
 	}
-	return StageBlueprintPages, nil // BLUEPRINT_PAGES → BUILD_PAGES
+	return StageBuildPages, nil
 }
 
 // --- Monitoring tick ---
@@ -1108,6 +1000,284 @@ func (w *PipelineWorker) getGlobalCSS() string {
 	return string(data)
 }
 
+// getAPIContract builds a structured API reference from all endpoint tables.
+// This replaces the raw schema dump with an accurate, compact contract that
+// BUILD_PAGES uses for JS-API coherence.
+func (w *PipelineWorker) getAPIContract() string {
+	// Use the read pool (4 connections) — DATA_LAYER committed all writes
+	// before this runs, so WAL reads see the latest data.
+	db := w.siteDB.DB
+	var b strings.Builder
+
+	// --- CRUD API endpoints ---
+	apiRows, err := db.Query(`SELECT e.path, e.table_name, e.methods, e.public_columns, e.requires_auth, e.public_read, e.required_role, t.schema_def
+		FROM api_endpoints e
+		LEFT JOIN dynamic_tables t ON e.table_name = t.table_name
+		ORDER BY e.path`)
+	if err == nil {
+		for apiRows.Next() {
+			var path, tableName string
+			var methods, publicCols, requiredRole, schemaDef sql.NullString
+			var requiresAuth, publicRead bool
+			apiRows.Scan(&path, &tableName, &methods, &publicCols, &requiresAuth, &publicRead, &requiredRole, &schemaDef)
+
+			methodList := "GET, POST"
+			if methods.Valid && methods.String != "" {
+				methodList = strings.Trim(methods.String, "[]\"")
+				methodList = strings.ReplaceAll(methodList, "\"", "")
+			}
+			b.WriteString(fmt.Sprintf("%s /api/%s", methodList, path))
+			if requiresAuth {
+				b.WriteString(" [AUTH]")
+			}
+			if publicRead {
+				b.WriteString(" [PUBLIC_READ]")
+			}
+			if requiredRole.Valid && requiredRole.String != "" {
+				b.WriteString(fmt.Sprintf(" [ROLE: %s]", requiredRole.String))
+			}
+			b.WriteString("\n")
+
+			// Show POST body fields from schema (excluding id, created_at, PASSWORD cols).
+			if schemaDef.Valid && schemaDef.String != "" {
+				var cols map[string]string
+				if json.Unmarshal([]byte(schemaDef.String), &cols) == nil {
+					var postFields []string
+					for col, typ := range cols {
+						if col == "id" || col == "created_at" || strings.EqualFold(typ, "PASSWORD") {
+							continue
+						}
+						postFields = append(postFields, fmt.Sprintf("%s: %s", col, typ))
+					}
+					sort.Strings(postFields)
+					if len(postFields) > 0 {
+						b.WriteString(fmt.Sprintf("  POST body: {%s}\n", strings.Join(postFields, ", ")))
+					}
+				}
+			}
+
+			// Show which columns GET returns.
+			if publicCols.Valid && publicCols.String != "" && publicCols.String != "[]" {
+				b.WriteString(fmt.Sprintf("  GET returns: %s\n", publicCols.String))
+			}
+			b.WriteString("\n")
+		}
+		apiRows.Close()
+	}
+
+	// --- Auth endpoints ---
+	authRows, err := db.Query(`SELECT ae.path, ae.table_name, ae.username_column, ae.password_column,
+		ae.default_role, ae.role_column, dt.schema_def
+		FROM auth_endpoints ae
+		LEFT JOIN dynamic_tables dt ON ae.table_name = dt.table_name`)
+	if err == nil {
+		for authRows.Next() {
+			var path, tableName, usernameCol, passwordCol, defaultRole, roleCol string
+			var schemaDef sql.NullString
+			authRows.Scan(&path, &tableName, &usernameCol, &passwordCol, &defaultRole, &roleCol, &schemaDef)
+
+			// Build list of optional registration fields from schema
+			// (exclude id, created_at, username, password, role columns).
+			var optionalFields []string
+			if schemaDef.Valid && schemaDef.String != "" {
+				var cols map[string]string
+				if json.Unmarshal([]byte(schemaDef.String), &cols) == nil {
+					for col, typ := range cols {
+						if col == "id" || col == "created_at" || col == usernameCol ||
+							col == passwordCol || col == roleCol ||
+							strings.EqualFold(typ, "PASSWORD") {
+							continue
+						}
+						optionalFields = append(optionalFields, fmt.Sprintf("\"%s\": \"...\"", col))
+					}
+					sort.Strings(optionalFields)
+				}
+			}
+
+			// Show base path prominently so LLM passes it (not the full sub-path) to App.auth.
+			b.WriteString(fmt.Sprintf("Auth base path: /api/%s\n", path))
+			b.WriteString(fmt.Sprintf("  App.auth.login('/api/%s', {...})      ← pass this base path\n", path))
+			b.WriteString(fmt.Sprintf("  App.auth.register('/api/%s', {...})   ← NOT /api/%s/register\n\n", path, path))
+
+			b.WriteString(fmt.Sprintf("  POST /api/%s/register — create account\n", path))
+			b.WriteString(fmt.Sprintf("    Body: {\"%s\": \"...\", \"%s\": \"...\"", usernameCol, passwordCol))
+			if len(optionalFields) > 0 {
+				b.WriteString(", " + strings.Join(optionalFields, ", "))
+			}
+			b.WriteString("}\n")
+			b.WriteString("    Response: {success: true, user_id: <number>, token: \"jwt...\"}\n\n")
+
+			b.WriteString(fmt.Sprintf("  POST /api/%s/login — authenticate\n", path))
+			b.WriteString(fmt.Sprintf("    Body: {\"%s\": \"...\", \"%s\": \"...\"}\n", usernameCol, passwordCol))
+			b.WriteString("    Response: {success: true, user_id: <number>, token: \"jwt...\"}\n\n")
+
+			b.WriteString(fmt.Sprintf("  GET /api/%s/me [AUTH] — current user profile\n\n", path))
+
+			if defaultRole != "" {
+				b.WriteString(fmt.Sprintf("  Default role: \"%s\", stored in column: \"%s\"\n\n", defaultRole, roleCol))
+			}
+
+			// OAuth providers for this auth endpoint.
+			oauthRows, _ := db.Query("SELECT name, display_name FROM oauth_providers WHERE auth_endpoint_path = ? AND is_enabled = 1", path)
+			if oauthRows != nil {
+				for oauthRows.Next() {
+					var name, displayName string
+					oauthRows.Scan(&name, &displayName)
+					b.WriteString(fmt.Sprintf("OAuth: <a href=\"/api/%s/oauth/%s\">%s</a>\n", path, name, displayName))
+				}
+				oauthRows.Close()
+			}
+		}
+		authRows.Close()
+	}
+
+	// --- SSE stream endpoints ---
+	streamRows, err := db.Query("SELECT path, event_types, requires_auth FROM stream_endpoints")
+	if err == nil {
+		for streamRows.Next() {
+			var path, eventTypes string
+			var requiresAuth bool
+			streamRows.Scan(&path, &eventTypes, &requiresAuth)
+			b.WriteString(fmt.Sprintf("SSE /api/%s/stream", path))
+			if requiresAuth {
+				b.WriteString(" [AUTH]")
+			}
+			b.WriteString("\n")
+			b.WriteString(fmt.Sprintf("  Events: %s\n", eventTypes))
+			b.WriteString(fmt.Sprintf("  Usage: new EventSource('/api/%s/stream')\n\n", path))
+		}
+		streamRows.Close()
+	}
+
+	// --- WebSocket endpoints ---
+	wsRows, err := db.Query("SELECT path, event_types, receive_event_type, write_to_table, requires_auth FROM ws_endpoints")
+	if err == nil {
+		for wsRows.Next() {
+			var path, eventTypes, receiveType string
+			var writeToTable sql.NullString
+			var requiresAuth bool
+			wsRows.Scan(&path, &eventTypes, &receiveType, &writeToTable, &requiresAuth)
+			b.WriteString(fmt.Sprintf("WebSocket /api/%s/ws", path))
+			if requiresAuth {
+				b.WriteString(" [AUTH]")
+			}
+			b.WriteString("\n")
+			b.WriteString(fmt.Sprintf("  Receive events: %s\n", eventTypes))
+			b.WriteString(fmt.Sprintf("  Send: ws.send(JSON.stringify({...})) → %s\n", receiveType))
+			if writeToTable.Valid && writeToTable.String != "" {
+				b.WriteString(fmt.Sprintf("  Auto-writes to table: %s\n", writeToTable.String))
+			}
+			b.WriteString(fmt.Sprintf("  Usage: new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/api/%s/ws')\n\n", path))
+		}
+		wsRows.Close()
+	}
+
+	// --- Upload endpoints ---
+	uploadRows, err := db.Query("SELECT path, allowed_types, max_size_mb, requires_auth FROM upload_endpoints")
+	if err == nil {
+		for uploadRows.Next() {
+			var path, allowedTypes string
+			var maxSizeMB int
+			var requiresAuth bool
+			uploadRows.Scan(&path, &allowedTypes, &maxSizeMB, &requiresAuth)
+			b.WriteString(fmt.Sprintf("POST /api/%s/upload (multipart, field: \"file\")", path))
+			if requiresAuth {
+				b.WriteString(" [AUTH]")
+			}
+			b.WriteString("\n")
+			b.WriteString(fmt.Sprintf("  Allowed: %s, max: %dMB\n", allowedTypes, maxSizeMB))
+			b.WriteString("  Response: {url, filename, size, type}\n\n")
+		}
+		uploadRows.Close()
+	}
+
+	result := b.String()
+	if result == "" {
+		return ""
+	}
+
+	// Append standard response format docs.
+	result += `Standard response formats:
+  List: GET /api/{path} → {data: [...], count: N, limit: N, offset: N}
+  Single: GET /api/{path}/{id} → bare object
+  Filter: /api/{path}?column=value&sort=col&order=asc|desc
+  Stats: GET /api/{path}/_stats?fn=count|sum|avg|min|max&column=col (inherits [AUTH] from endpoint)
+  Create: POST /api/{path} → created object
+  Error: {error: "message"} with 4xx/5xx status
+  Auth header: Authorization: Bearer {token}
+`
+	return result
+}
+
+// getAuthEndpointContract returns just the auth endpoint reference (register/login/me).
+// Used for pages that don't need full CRUD data but still need auth form endpoints.
+func (w *PipelineWorker) getAuthEndpointContract() string {
+	db := w.siteDB.DB
+	var b strings.Builder
+
+	authRows, err := db.Query(`SELECT ae.path, ae.username_column, ae.password_column,
+		ae.default_role, dt.schema_def
+		FROM auth_endpoints ae
+		LEFT JOIN dynamic_tables dt ON ae.table_name = dt.table_name`)
+	if err != nil {
+		return ""
+	}
+	defer authRows.Close()
+
+	for authRows.Next() {
+		var path, usernameCol, passwordCol string
+		var defaultRole sql.NullString
+		var schemaDef sql.NullString
+		authRows.Scan(&path, &usernameCol, &passwordCol, &defaultRole, &schemaDef)
+
+		// Build optional registration fields from schema.
+		var optionalFields []string
+		if schemaDef.Valid && schemaDef.String != "" {
+			var cols map[string]string
+			if json.Unmarshal([]byte(schemaDef.String), &cols) == nil {
+				for col, typ := range cols {
+					if col == "id" || col == "created_at" || col == usernameCol ||
+						col == passwordCol || strings.EqualFold(typ, "PASSWORD") {
+						continue
+					}
+					if defaultRole.Valid && col == "role" {
+						continue
+					}
+					optionalFields = append(optionalFields, fmt.Sprintf("\"%s\": \"...\"", col))
+				}
+				sort.Strings(optionalFields)
+			}
+		}
+
+		b.WriteString(fmt.Sprintf("POST /api/%s/register — create account\n", path))
+		b.WriteString(fmt.Sprintf("  Body: {\"%s\": \"...\", \"%s\": \"...\"", usernameCol, passwordCol))
+		if len(optionalFields) > 0 {
+			b.WriteString(", " + strings.Join(optionalFields, ", "))
+		}
+		b.WriteString("}\n")
+		b.WriteString("  Response: {success: true, user_id: <number>, token: \"jwt...\"}\n\n")
+
+		b.WriteString(fmt.Sprintf("POST /api/%s/login — authenticate\n", path))
+		b.WriteString(fmt.Sprintf("  Body: {\"%s\": \"...\", \"%s\": \"...\"}\n", usernameCol, passwordCol))
+		b.WriteString("  Response: {success: true, user_id: <number>, token: \"jwt...\"}\n\n")
+
+		b.WriteString(fmt.Sprintf("GET /api/%s/me [AUTH] — current user profile\n\n", path))
+
+		// OAuth providers.
+		oauthRows, _ := db.Query("SELECT name, display_name FROM oauth_providers WHERE auth_endpoint_path = ? AND is_enabled = 1", path)
+		if oauthRows != nil {
+			for oauthRows.Next() {
+				var name, displayName string
+				oauthRows.Scan(&name, &displayName)
+				b.WriteString(fmt.Sprintf("OAuth: <a href=\"/api/%s/oauth/%s\">%s</a>\n", path, name, displayName))
+			}
+			oauthRows.Close()
+		}
+	}
+
+	return b.String()
+}
+
 // cssCustomPropRe matches CSS custom property declarations like --primary: #hex;
 var cssCustomPropRe = regexp.MustCompile(`(--[\w-]+)\s*:`)
 
@@ -1213,9 +1383,12 @@ func extractClassSignature(declarations string) string {
 	return " (" + strings.Join(parts, ", ") + ")"
 }
 
+// cssNestedSelectorRe matches ".parent .child" or ".parent > .child" selectors.
+var cssNestedSelectorRe = regexp.MustCompile(`\.([a-zA-Z_][\w-]*)\s*[> ]+\s*\.([a-zA-Z_][\w-]*)`)
+
 // extractCSSClassMap extracts class names with property signatures and custom
-// properties from CSS content. Returns a compact reference string (~70% smaller
-// than full CSS) that tells the LLM what each class does.
+// properties from CSS content. Groups classes into component patterns (parent-child)
+// and utility classes for a structured reference.
 func extractCSSClassMap(cssContent string) string {
 	if cssContent == "" {
 		return ""
@@ -1232,12 +1405,49 @@ func extractCSSClassMap(cssContent string) string {
 		}
 	}
 
-	// Also pick up classes from the existing selector regex that the rule block regex might miss
-	// (e.g. classes in complex selectors, pseudo-classes).
+	// Also pick up classes from the existing selector regex that the rule block regex might miss.
 	for _, m := range cssSelectorRe.FindAllStringSubmatch(cssContent, -1) {
 		if len(m) > 1 {
 			if _, exists := classSignatures[m[1]]; !exists {
 				classSignatures[m[1]] = ""
+			}
+		}
+	}
+
+	// --- Build component patterns from CSS nesting + prefix analysis ---
+	children := make(map[string][]string) // parent → child classes
+
+	// 1. Detect parent-child from CSS nested selectors (.card .card-title).
+	for _, m := range cssNestedSelectorRe.FindAllStringSubmatch(cssContent, -1) {
+		parent, child := m[1], m[2]
+		if parent != child {
+			children[parent] = appendUniqueStr(children[parent], child)
+		}
+	}
+
+	// 2. Group by shared prefix: card-title, card-body → children of "card".
+	allClasses := make([]string, 0, len(classSignatures))
+	for cls := range classSignatures {
+		allClasses = append(allClasses, cls)
+	}
+	for _, cls := range allClasses {
+		if idx := strings.Index(cls, "-"); idx > 0 {
+			prefix := cls[:idx]
+			// Only group if the prefix itself is a defined class.
+			if _, isClass := classSignatures[prefix]; isClass && prefix != cls {
+				children[prefix] = appendUniqueStr(children[prefix], cls)
+			}
+		}
+	}
+
+	// Identify which classes are components (have children).
+	componentClasses := make(map[string]bool)
+	childClasses := make(map[string]bool)
+	for parent, kids := range children {
+		if len(kids) >= 1 {
+			componentClasses[parent] = true
+			for _, kid := range kids {
+				childClasses[kid] = true
 			}
 		}
 	}
@@ -1251,18 +1461,40 @@ func extractCSSClassMap(cssContent string) string {
 	}
 
 	var b strings.Builder
-	if len(classSignatures) > 0 {
-		classes := make([]string, 0, len(classSignatures))
-		for cls := range classSignatures {
-			classes = append(classes, cls)
+
+	// Output component patterns first.
+	if len(componentClasses) > 0 {
+		parents := make([]string, 0, len(componentClasses))
+		for p := range componentClasses {
+			parents = append(parents, p)
 		}
-		sort.Strings(classes)
-		b.WriteString("Available CSS classes:\n")
-		for _, cls := range classes {
+		sort.Strings(parents)
+		b.WriteString("Component patterns:\n")
+		for _, parent := range parents {
+			kids := children[parent]
+			sort.Strings(kids)
+			sig := classSignatures[parent]
+			b.WriteString(fmt.Sprintf("  .%s%s > %s\n", parent, sig, "."+strings.Join(kids, ", .")))
+		}
+		b.WriteString("\n")
+	}
+
+	// Output remaining utility/standalone classes.
+	remaining := make([]string, 0)
+	for cls := range classSignatures {
+		if !componentClasses[cls] && !childClasses[cls] {
+			remaining = append(remaining, cls)
+		}
+	}
+	if len(remaining) > 0 {
+		sort.Strings(remaining)
+		b.WriteString("Utility classes:\n")
+		for _, cls := range remaining {
 			sig := classSignatures[cls]
 			b.WriteString("  " + cls + sig + "\n")
 		}
 	}
+
 	if len(propSet) > 0 {
 		props := make([]string, 0, len(propSet))
 		for prop := range propSet {
@@ -1274,6 +1506,16 @@ func extractCSSClassMap(cssContent string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// appendUniqueStr appends s to slice if not already present.
+func appendUniqueStr(slice []string, s string) []string {
+	for _, existing := range slice {
+		if existing == s {
+			return slice
+		}
+	}
+	return append(slice, s)
 }
 
 
@@ -1296,15 +1538,6 @@ func validateDesign(db *sql.DB, plan *SitePlan) []string {
 	}
 	if !layoutAfter.Valid || layoutAfter.String == "" {
 		issues = append(issues, "Layout 'default' missing or has empty body_after_main (footer)")
-	}
-
-	// SPA: check for router JS.
-	if plan.Architecture == "spa" {
-		var routerCount int
-		db.QueryRow("SELECT COUNT(*) FROM assets WHERE scope = 'global' AND filename LIKE '%router%' AND filename LIKE '%.js'").Scan(&routerCount)
-		if routerCount == 0 {
-			issues = append(issues, "SPA architecture but no router JS file found")
-		}
 	}
 
 	// Check that all referenced custom layouts exist.

@@ -101,21 +101,13 @@ func (t *PaymentsTool) Parameters() map[string]interface{} {
 }
 
 func (t *PaymentsTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, _ := args["action"].(string)
-	switch action {
-	case "configure":
-		return t.configure(ctx, args)
-	case "create_checkout":
-		return t.createCheckout(ctx, args)
-	case "check_status":
-		return t.checkStatus(ctx, args)
-	case "list":
-		return t.list(ctx, args)
-	case "handle_webhook":
-		return t.handleWebhook(ctx, args)
-	default:
-		return &Result{Success: false, Error: "action is required: configure, create_checkout, check_status, list, handle_webhook"}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"configure":       t.configure,
+		"create_checkout": t.createCheckout,
+		"check_status":    t.checkStatus,
+		"list":            t.list,
+		"handle_webhook":  t.handleWebhook,
+	}, nil)
 }
 
 func (t *PaymentsTool) ensureTables(db *sql.DB) {
@@ -597,4 +589,21 @@ func verifyWebhookSignature(providerType, body, signature, secret string) bool {
 		// Generic: compare directly.
 		return hmac.Equal([]byte(signature), []byte(expectedMAC))
 	}
+}
+
+func (t *PaymentsTool) Summarize(result string) string {
+	r, dataMap, dataArr, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if dataArr != nil {
+		return fmt.Sprintf(`{"success":true,"summary":"Listed %d payments"}`, len(dataArr))
+	}
+	if status, _ := dataMap["status"].(string); status != "" {
+		return fmt.Sprintf(`{"success":true,"summary":"Payment status: %s"}`, status)
+	}
+	return summarizeTruncate(result, 300)
 }

@@ -67,80 +67,19 @@ type ColumnDef struct {
 }
 
 type TablePlan struct {
-	Name     string      `json:"name"`
-	Columns  []ColumnDef `json:"columns"`
-	HasAPI   bool        `json:"has_api"`
-	HasAuth  bool        `json:"has_auth"`
-	HasOAuth []string    `json:"has_oauth,omitempty"` // e.g. ["google", "github"]
-	Roles    []string    `json:"roles,omitempty"`     // e.g. ["user", "admin"]
-	SeedData bool        `json:"seed_data"`
+	Name       string      `json:"name"`
+	Columns    []ColumnDef `json:"columns"`
+	HasAPI     bool        `json:"has_api"`
+	HasAuth    bool        `json:"has_auth"`
+	PublicRead bool        `json:"public_read,omitempty"` // GET public, POST/PUT/DELETE require auth
+	HasOAuth   []string    `json:"has_oauth,omitempty"`   // e.g. ["google", "github"]
+	Roles      []string    `json:"roles,omitempty"`       // e.g. ["user", "admin"]
+	SeedData   bool        `json:"seed_data"`
 }
 
 type PlanQuestion struct {
 	Question string   `json:"question"`
 	Options  []string `json:"options,omitempty"`
-}
-
-// PageBlueprint is the BLUEPRINT stage output for a single page.
-type PageBlueprint struct {
-	Path              string   `json:"path"`
-	HTMLSkeleton      string   `json:"html_skeleton"`
-	ComponentPatterns []string `json:"component_patterns"`
-	ContentNotes      string   `json:"content_notes"`
-	DataDisplay       string   `json:"data_display,omitempty"`
-}
-
-// SiteBlueprint is the full BLUEPRINT stage output.
-type SiteBlueprint struct {
-	Pages          []PageBlueprint   `json:"pages"`
-	SharedPatterns map[string]string `json:"shared_patterns"`
-	ContentStyle   string            `json:"content_style"`
-}
-
-// ParseSiteBlueprint parses a SiteBlueprint from raw LLM output.
-func ParseSiteBlueprint(raw string) (*SiteBlueprint, error) {
-	raw = extractJSON(raw)
-	var bp SiteBlueprint
-	if err := json.Unmarshal([]byte(raw), &bp); err != nil {
-		return nil, fmt.Errorf("invalid blueprint JSON: %w", err)
-	}
-	return &bp, nil
-}
-
-// ValidateBlueprint checks a SiteBlueprint for completeness.
-func ValidateBlueprint(bp *SiteBlueprint, plan *SitePlan) []string {
-	var errs []string
-	if len(bp.Pages) == 0 {
-		errs = append(errs, "blueprint has no pages")
-		return errs
-	}
-
-	bpPaths := make(map[string]bool, len(bp.Pages))
-	for _, p := range bp.Pages {
-		bpPaths[p.Path] = true
-		if p.HTMLSkeleton == "" {
-			errs = append(errs, fmt.Sprintf("blueprint page %s has empty html_skeleton", p.Path))
-		}
-	}
-
-	// Every planned page should have a blueprint entry.
-	for _, p := range plan.Pages {
-		if !bpPaths[p.Path] {
-			errs = append(errs, fmt.Sprintf("blueprint missing page %s", p.Path))
-		}
-	}
-
-	return errs
-}
-
-// BlueprintForPage returns the blueprint entry for a given page path, or nil.
-func (bp *SiteBlueprint) BlueprintForPage(path string) *PageBlueprint {
-	for i := range bp.Pages {
-		if bp.Pages[i].Path == path {
-			return &bp.Pages[i]
-		}
-	}
-	return nil
 }
 
 // PlanPatch describes incremental changes for an UPDATE flow.
@@ -157,7 +96,6 @@ type PlanPatch struct {
 type PipelineState struct {
 	Stage             PipelineStage
 	PlanJSON          string
-	BlueprintJSON     string // JSON-encoded SiteBlueprint from BLUEPRINT_PAGES stage
 	CurrentPageIndex  int
 	ErrorCount        int
 	LastError         string
@@ -272,9 +210,19 @@ func ValidatePlan(plan *SitePlan) []string {
 		}
 	}
 
-	// Verify nav_items reference valid paths.
+	// Verify nav_items reference valid paths (same parameterised matching as links_to).
 	for _, nav := range plan.NavItems {
-		if !paths[nav] {
+		if paths[nav] {
+			continue
+		}
+		found := false
+		for knownPath := range paths {
+			if strings.HasPrefix(knownPath, nav+"/") {
+				found = true
+				break
+			}
+		}
+		if !found {
 			errs = append(errs, fmt.Sprintf("nav_items references %s which is not in the plan", nav))
 		}
 	}
@@ -339,13 +287,13 @@ func MarshalPlan(plan *SitePlan) (string, error) {
 // LoadPipelineState loads the singleton pipeline_state row.
 func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
 	var s PipelineState
-	var planJSON, blueprintJSON, lastError, pauseReason, updateDesc sql.NullString
+	var planJSON, lastError, pauseReason, updateDesc sql.NullString
 	var startedAt, updatedAt sql.NullString
 
-	err := db.QueryRow(`SELECT stage, plan_json, COALESCE(blueprint_json, ''), current_page_index, error_count,
+	err := db.QueryRow(`SELECT stage, plan_json, current_page_index, error_count,
 		last_error, paused, pause_reason, COALESCE(update_description, ''), started_at, updated_at
 		FROM pipeline_state WHERE id = 1`).Scan(
-		&s.Stage, &planJSON, &blueprintJSON, &s.CurrentPageIndex, &s.ErrorCount,
+		&s.Stage, &planJSON, &s.CurrentPageIndex, &s.ErrorCount,
 		&lastError, &s.Paused, &pauseReason, &updateDesc, &startedAt, &updatedAt,
 	)
 	if err != nil {
@@ -353,7 +301,6 @@ func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
 	}
 
 	s.PlanJSON = planJSON.String
-	s.BlueprintJSON = blueprintJSON.String
 	s.LastError = lastError.String
 	s.PauseReason = pauseReason.String
 	s.UpdateDescription = updateDesc.String
@@ -370,11 +317,11 @@ func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
 // SavePipelineState persists the full pipeline state.
 func SavePipelineState(sdb *db.SiteDB, s *PipelineState) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = ?, plan_json = ?, blueprint_json = ?, current_page_index = ?,
+		stage = ?, plan_json = ?, current_page_index = ?,
 		error_count = ?, last_error = ?, paused = ?,
 		pause_reason = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = 1`,
-		s.Stage, s.PlanJSON, s.BlueprintJSON, s.CurrentPageIndex,
+		s.Stage, s.PlanJSON, s.CurrentPageIndex,
 		s.ErrorCount, s.LastError, s.Paused, s.PauseReason,
 	)
 	return err
@@ -389,7 +336,7 @@ func AdvanceStage(sdb *db.SiteDB, stage PipelineStage) error {
 // ResetPipeline resets pipeline state for a fresh build.
 func ResetPipeline(sdb *db.SiteDB) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = 'PLAN', plan_json = NULL, blueprint_json = NULL, current_page_index = 0,
+		stage = 'PLAN', plan_json = NULL, current_page_index = 0,
 		error_count = 0, last_error = NULL, paused = 0,
 		pause_reason = NULL, started_at = CURRENT_TIMESTAMP,
 		updated_at = CURRENT_TIMESTAMP

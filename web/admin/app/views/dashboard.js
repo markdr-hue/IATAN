@@ -124,7 +124,21 @@ export async function renderDashboard(container) {
               h('strong', {}, site.name),
             ]),
           ]),
-          h('td', {}, site.domain || '--'),
+          h('td', {}, (() => {
+            if (!site.domain) return '--';
+            const sys = state.get('systemStatus') || {};
+            const publicPort = sys.public_port || 5000;
+            const needsPort = site.domain.includes('localhost');
+            const url = needsPort ? `http://${site.domain}:${publicPort}` : `http://${site.domain}`;
+            const label = needsPort ? `${site.domain}:${publicPort}` : site.domain;
+            return h('a', {
+              href: url,
+              target: '_blank',
+              rel: 'noopener',
+              className: 'link',
+              onClick: (e) => e.stopPropagation(),
+            }, label);
+          })()),
           h('td', {}, [
             h('span', {
               className: `badge ${isRunning ? 'badge--success' : 'badge--warning'}`,

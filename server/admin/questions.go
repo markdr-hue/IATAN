@@ -24,14 +24,16 @@ type QuestionsHandler struct {
 }
 
 type question struct {
-	ID        int       `json:"id"`
-	SiteID    int       `json:"site_id"`
-	Question  string    `json:"question"`
-	Answer    *string   `json:"answer"`
-	Status    string    `json:"status"`
-	Type      *string   `json:"type,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID         int       `json:"id"`
+	SiteID     int       `json:"site_id"`
+	Question   string    `json:"question"`
+	Answer     *string   `json:"answer"`
+	Status     string    `json:"status"`
+	Type       *string   `json:"type,omitempty"`
+	SecretName *string   `json:"secret_name,omitempty"`
+	Fields     *string   `json:"fields,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // List returns questions across all sites, optionally filtered by status.
@@ -64,7 +66,7 @@ func (h *QuestionsHandler) List(w http.ResponseWriter, r *http.Request) {
 			rows, err = siteDB.Query(
 				`SELECT q.id, q.question,
 				        (SELECT a.answer FROM answers a WHERE a.question_id = q.id ORDER BY a.created_at DESC LIMIT 1),
-				        q.status, q.type, q.created_at, q.created_at
+				        q.status, q.type, q.secret_name, q.fields, q.created_at, q.created_at
 				 FROM questions q WHERE q.status = ? ORDER BY q.created_at DESC`,
 				statusFilter,
 			)
@@ -72,7 +74,7 @@ func (h *QuestionsHandler) List(w http.ResponseWriter, r *http.Request) {
 			rows, err = siteDB.Query(
 				`SELECT q.id, q.question,
 				        (SELECT a.answer FROM answers a WHERE a.question_id = q.id ORDER BY a.created_at DESC LIMIT 1),
-				        q.status, q.type, q.created_at, q.created_at
+				        q.status, q.type, q.secret_name, q.fields, q.created_at, q.created_at
 				 FROM questions q ORDER BY q.created_at DESC`,
 			)
 		}
@@ -82,7 +84,7 @@ func (h *QuestionsHandler) List(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var q question
 			q.SiteID = siteID
-			if err := rows.Scan(&q.ID, &q.Question, &q.Answer, &q.Status, &q.Type, &q.CreatedAt, &q.UpdatedAt); err != nil {
+			if err := rows.Scan(&q.ID, &q.Question, &q.Answer, &q.Status, &q.Type, &q.SecretName, &q.Fields, &q.CreatedAt, &q.UpdatedAt); err != nil {
 				continue
 			}
 			questions = append(questions, q)

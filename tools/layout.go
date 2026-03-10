@@ -54,32 +54,25 @@ func (t *LayoutTool) Parameters() map[string]interface{} {
 }
 
 func (t *LayoutTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasBefore := args["body_before_main"]; hasBefore {
-			action = "save"
-		} else if _, hasAfter := args["body_after_main"]; hasAfter {
-			action = "save"
-		} else if _, hasHead := args["head_content"]; hasHead {
-			action = "save"
-		} else if _, hasName := args["name"]; hasName {
-			action = "get"
-		} else {
-			action = "list"
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"save": t.save,
+		"get":  t.get,
+		"list": t.list,
+	}, func(a map[string]interface{}) string {
+		if _, has := a["body_before_main"]; has {
+			return "save"
 		}
-		args["action"] = action
-	}
-	switch action {
-	case "save":
-		return t.save(ctx, args)
-	case "get":
-		return t.get(ctx, args)
-	case "list":
-		return t.list(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action %q — use save, get, or list", action)}, nil
-	}
+		if _, has := a["body_after_main"]; has {
+			return "save"
+		}
+		if _, has := a["head_content"]; has {
+			return "save"
+		}
+		if _, has := a["name"]; has {
+			return "get"
+		}
+		return "list"
+	})
 }
 
 // Regexes for stripping content that shouldn't be in layouts.

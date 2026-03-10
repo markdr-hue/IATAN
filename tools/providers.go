@@ -52,24 +52,13 @@ func (t *ProvidersTool) Parameters() map[string]interface{} {
 }
 
 func (t *ProvidersTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "add":
-		return t.executeAdd(ctx, args)
-	case "list":
-		return t.executeList(ctx, args)
-	case "remove":
-		return t.executeRemove(ctx, args)
-	case "update":
-		return t.executeUpdate(ctx, args)
-	case "request":
-		return t.executeRequest(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use add, list, remove, update, request)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"add":     t.executeAdd,
+		"list":    t.executeList,
+		"remove":  t.executeRemove,
+		"update":  t.executeUpdate,
+		"request": t.executeRequest,
+	}, nil)
 }
 
 func (t *ProvidersTool) executeAdd(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

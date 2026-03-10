@@ -111,7 +111,7 @@ func (h *SiteDiagnosticsHandler) Integrity(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Check design system memories
-	for _, key := range []string{"site_architecture", "site_blueprint"} {
+	for _, key := range []string{"site_architecture", "design_summary"} {
 		var cnt int
 		_ = siteDB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = ?", key).Scan(&cnt)
 		if cnt == 0 {

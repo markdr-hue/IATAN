@@ -36,18 +36,10 @@ func (t *AnalyticsTool) Parameters() map[string]interface{} {
 }
 
 func (t *AnalyticsTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "query":
-		return t.executeQuery(ctx, args)
-	case "summary":
-		return t.executeSummary(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use query, summary)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"query":   t.executeQuery,
+		"summary": t.executeSummary,
+	}, nil)
 }
 
 func (t *AnalyticsTool) executeQuery(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

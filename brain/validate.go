@@ -37,8 +37,7 @@ func validateSite(db *sql.DB) []string {
 	issues = append(issues, validateEndpoints(db)...)
 	issues = append(issues, validateHeadings(db)...)
 	issues = append(issues, validateContentLength(db)...)
-	issues = append(issues, validateMetadata(db)...)
-	issues = append(issues, validateSections(db)...)
+	issues = append(issues, validateJSAPICalls(db)...)
 
 	return issues
 }
@@ -53,8 +52,9 @@ func validateLinks(db *sql.DB) []string {
 	}
 	defer rows.Close()
 
-	// Build set of existing paths.
+	// Build set of existing paths and parameterised route patterns.
 	existingPaths := loadExistingPaths(db)
+	paramPatterns := loadParamPatterns(existingPaths)
 
 	for rows.Next() {
 		var path, content string
@@ -85,7 +85,7 @@ func validateLinks(db *sql.DB) []string {
 				continue
 			}
 			seen[target] = true
-			if !existingPaths[target] {
+			if !existingPaths[target] && !matchesParamRoute(target, paramPatterns) {
 				issues = append(issues, fmt.Sprintf("Page %s links to %s which does not exist", path, target))
 			}
 		}
@@ -105,6 +105,7 @@ func validateNav(db *sql.DB) []string {
 	}
 
 	existingPaths := loadExistingPaths(db)
+	paramPatterns := loadParamPatterns(existingPaths)
 
 	clean := stripScripts(navHTML.String)
 	matches := internalHrefRe.FindAllStringSubmatch(clean, -1)
@@ -120,7 +121,7 @@ func validateNav(db *sql.DB) []string {
 		if strings.Contains(target, "${") || strings.HasSuffix(target, "=") || strings.HasSuffix(target, "?") {
 			continue
 		}
-		if !existingPaths[target] {
+		if !existingPaths[target] && !matchesParamRoute(target, paramPatterns) {
 			issues = append(issues, fmt.Sprintf("Nav links to %s which does not exist", target))
 		}
 	}
@@ -204,6 +205,7 @@ func validateStructure(db *sql.DB) []string {
 		if noneLayoutPages[path] {
 			continue
 		}
+		// Note: <header> inside sections/articles is valid HTML5 — only flag <nav> and <footer>.
 		if strings.Contains(lower, "<nav") {
 			issues = append(issues, fmt.Sprintf("Page %s contains <nav> — navigation belongs in the layout", path))
 		}
@@ -234,6 +236,41 @@ func validateEssentialPages(db *sql.DB) []string {
 	}
 
 	return issues
+}
+
+// loadParamPatterns builds regex patterns from parameterised page paths.
+// E.g. "/category/:id" → regexp matching "^/category/[^/]+$"
+func loadParamPatterns(existingPaths map[string]bool) []*regexp.Regexp {
+	var patterns []*regexp.Regexp
+	for path := range existingPaths {
+		if !strings.Contains(path, ":") {
+			continue
+		}
+		parts := strings.Split(path, "/")
+		var regexParts []string
+		for _, part := range parts {
+			if strings.HasPrefix(part, ":") {
+				regexParts = append(regexParts, "[^/]+")
+			} else {
+				regexParts = append(regexParts, regexp.QuoteMeta(part))
+			}
+		}
+		pattern := "^" + strings.Join(regexParts, "/") + "$"
+		if re, err := regexp.Compile(pattern); err == nil {
+			patterns = append(patterns, re)
+		}
+	}
+	return patterns
+}
+
+// matchesParamRoute checks if a target path matches any parameterised route pattern.
+func matchesParamRoute(target string, patterns []*regexp.Regexp) bool {
+	for _, re := range patterns {
+		if re.MatchString(target) {
+			return true
+		}
+	}
+	return false
 }
 
 // loadExistingPaths returns a set of all non-deleted page paths.
@@ -352,12 +389,16 @@ func validateCSSAlignment(db *sql.DB) []string {
 			}
 		}
 
-		// Common utility/state classes toggled by JS — don't need CSS definitions.
+		// Common utility/state/layout classes toggled by JS or used as
+		// generic HTML conventions — don't need explicit CSS definitions.
 		skipClasses := map[string]bool{
 			"active": true, "hidden": true, "open": true, "closed": true,
 			"disabled": true, "loading": true, "error": true, "selected": true,
 			"visible": true, "collapsed": true, "expanded": true, "show": true,
 			"fade-in": true, "fade-out": true,
+			"container": true, "wrapper": true, "content": true,
+			"row": true, "col": true, "section": true, "header": true,
+			"main": true, "sidebar": true, "inner": true, "outer": true,
 		}
 
 		// Find classes used in HTML that aren't in any CSS.
@@ -373,8 +414,8 @@ func validateCSSAlignment(db *sql.DB) []string {
 			issues = append(issues, fmt.Sprintf("Page %s uses only %d CSS classes — likely unstyled", path, len(pageClasses)))
 		}
 
-		// Report if >40% of classes are undefined.
-		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.4 {
+		// Report if >25% of classes are undefined.
+		if len(undefined) > 0 && float64(len(undefined))/float64(len(pageClasses)) > 0.25 {
 			examples := undefined
 			if len(examples) > 5 {
 				examples = examples[:5]
@@ -437,7 +478,7 @@ func validateEndpoints(db *sql.DB) []string {
 var headingTagRe = regexp.MustCompile(`(?i)<h([1-6])[\s>]`)
 
 // validateHeadings checks heading hierarchy in page content.
-// The layout typically provides h1, so we only flag multiple h1s and skipped levels.
+// The layout typically provides h1, so we only flag multiple h1s.
 func validateHeadings(db *sql.DB) []string {
 	var issues []string
 
@@ -466,42 +507,17 @@ func validateHeadings(db *sql.DB) []string {
 		}
 
 		h1Count := 0
-		var levels []int
 		for _, m := range matches {
 			level, _ := strconv.Atoi(m[1])
-			levels = append(levels, level)
 			if level == 1 {
 				h1Count++
 			}
 		}
 
-		// Only flag multiple h1s. Missing h1 is OK if layout provides one.
 		if h1Count > 1 {
 			issues = append(issues, fmt.Sprintf("Page %s has %d <h1> headings (should have exactly one)", path, h1Count))
 		} else if h1Count == 0 && !layoutHasH1 {
 			issues = append(issues, fmt.Sprintf("Page %s has no <h1> heading", path))
-		}
-
-		// Check for skipped levels (e.g. h2 → h4 without h3).
-		seen := make(map[int]bool)
-		for _, l := range levels {
-			seen[l] = true
-		}
-		minLevel := levels[0]
-		maxLevel := levels[0]
-		for _, l := range levels {
-			if l < minLevel {
-				minLevel = l
-			}
-			if l > maxLevel {
-				maxLevel = l
-			}
-		}
-		for l := minLevel + 1; l <= maxLevel; l++ {
-			if !seen[l] {
-				issues = append(issues, fmt.Sprintf("Page %s skips heading level h%d (has h%d and h%d)", path, l, l-1, l+1))
-				break
-			}
 		}
 	}
 
@@ -550,117 +566,6 @@ func validateContentLength(db *sql.DB) []string {
 }
 
 // validateMetadata checks that pages have valid meta descriptions.
-// Only flags descriptions that exist but have wrong length. Missing descriptions
-// are common during initial build and would create too many issues.
-func validateMetadata(db *sql.DB) []string {
-	var issues []string
-
-	rows, err := db.Query("SELECT path, metadata FROM pages WHERE is_deleted = 0 AND metadata IS NOT NULL AND metadata != '' AND metadata != '{}'")
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var path, metadataJSON string
-		if rows.Scan(&path, &metadataJSON) != nil {
-			continue
-		}
-
-		var meta map[string]interface{}
-		if json.Unmarshal([]byte(metadataJSON), &meta) != nil {
-			continue
-		}
-
-		desc, _ := meta["description"].(string)
-		desc = strings.TrimSpace(desc)
-		if len(desc) > 0 && len(desc) < 50 {
-			issues = append(issues, fmt.Sprintf("Page %s meta description is too short (%d chars, recommend 50-160)", path, len(desc)))
-		} else if len(desc) > 160 {
-			issues = append(issues, fmt.Sprintf("Page %s meta description is too long (%d chars, recommend 50-160)", path, len(desc)))
-		}
-	}
-
-	return issues
-}
-
-// sectionTagRe matches <section> tags in HTML content.
-var sectionTagRe = regexp.MustCompile(`(?i)<section[\s>]`)
-
-// sectionNameRe matches section, article, or div elements with id or class attributes.
-var sectionNameRe = regexp.MustCompile(`(?i)<(?:section|article|div)\s+[^>]*(?:id|class)\s*=\s*["']([^"']+)["']`)
-
-// validateSections checks that pages contain roughly the number of sections
-// planned in the SitePlan, and that section names roughly match the plan.
-func validateSections(db *sql.DB) []string {
-	var planJSON sql.NullString
-	db.QueryRow("SELECT plan_json FROM pipeline_state WHERE id = 1").Scan(&planJSON)
-	if !planJSON.Valid || planJSON.String == "" {
-		return nil
-	}
-
-	var plan SitePlan
-	if json.Unmarshal([]byte(planJSON.String), &plan) != nil {
-		return nil
-	}
-
-	var issues []string
-	for _, pagePlan := range plan.Pages {
-		if len(pagePlan.Sections) < 2 {
-			continue // too few planned sections to validate meaningfully
-		}
-
-		var content sql.NullString
-		db.QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", pagePlan.Path).Scan(&content)
-		if !content.Valid || content.String == "" {
-			continue
-		}
-
-		sectionCount := len(sectionTagRe.FindAllString(content.String, -1))
-		planned := len(pagePlan.Sections)
-
-		// Check section count.
-		if sectionCount < planned-1 {
-			issues = append(issues, fmt.Sprintf("Page %s has %d sections but %d were planned (%s)",
-				pagePlan.Path, sectionCount, planned, strings.Join(pagePlan.Sections, ", ")))
-		}
-
-		// Check section names via fuzzy matching on id/class attributes.
-		contentLower := strings.ToLower(content.String)
-		nameMatches := sectionNameRe.FindAllStringSubmatch(contentLower, -1)
-		foundNames := make(map[string]bool)
-		for _, m := range nameMatches {
-			if len(m) > 1 {
-				for _, cls := range strings.Fields(m[1]) {
-					foundNames[cls] = true
-				}
-			}
-		}
-		var missingSections []string
-		for _, section := range pagePlan.Sections {
-			sectionLower := strings.ToLower(section)
-			found := false
-			for name := range foundNames {
-				// Fuzzy: "features" matches "features-grid", "feature-cards", etc.
-				if strings.Contains(name, sectionLower) || strings.Contains(sectionLower, name) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				missingSections = append(missingSections, section)
-			}
-		}
-		// Only flag if multiple sections are missing (allow some flexibility).
-		if len(missingSections) > 1 {
-			issues = append(issues, fmt.Sprintf("Page %s is missing sections: %s",
-				pagePlan.Path, strings.Join(missingSections, ", ")))
-		}
-	}
-
-	return issues
-}
-
 // loadGlobalCSS reads the global CSS file content from disk for use in prompts.
 func loadGlobalCSS(db *sql.DB) string {
 	var storagePath sql.NullString
@@ -675,4 +580,228 @@ func loadGlobalCSS(db *sql.DB) string {
 		return ""
 	}
 	return string(data)
+}
+
+// --- JS-API coherence validation ---
+
+var (
+	fetchURLRe     = regexp.MustCompile(`fetch\s*\(\s*['"]([^'"]+)['"]`)
+	fetchTplRe     = regexp.MustCompile("fetch\\s*\\(\\s*`(/api/[^`]*)`")
+	eventSourceRe  = regexp.MustCompile(`new\s+EventSource\s*\(\s*['"]([^'"]+)['"]`)
+	webSocketURLRe = regexp.MustCompile(`['"]([^'"]*?/api/[^'"]*?/ws)['"]`)
+	authLoginRe    = regexp.MustCompile(`App\.auth\.login\s*\(\s*['"]([^'"]+)['"]`)
+	authRegisterRe = regexp.MustCompile(`App\.auth\.register\s*\(\s*['"]([^'"]+)['"]`)
+	authGetUserRe  = regexp.MustCompile(`App\.auth\.getUser\s*\(\s*['"]([^'"]+)['"]`)
+)
+
+// validateJSAPICalls checks that fetch(), EventSource, and WebSocket URLs
+// in page JavaScript reference endpoints that actually exist.
+func validateJSAPICalls(db *sql.DB) []string {
+	var issues []string
+
+	// Build set of valid API base paths.
+	validPaths := make(map[string]bool)
+
+	// api_endpoints: /api/{path}
+	apiRows, err := db.Query("SELECT path FROM api_endpoints")
+	if err == nil {
+		defer apiRows.Close()
+		for apiRows.Next() {
+			var path string
+			apiRows.Scan(&path)
+			validPaths["/api/"+path] = true
+		}
+	}
+
+	// auth_endpoints: /api/{path}/login, /register, /me
+	// Also track base paths for App.auth.login/register validation.
+	authBasePaths := make(map[string]bool)
+	authRows, err := db.Query("SELECT path FROM auth_endpoints")
+	if err == nil {
+		defer authRows.Close()
+		for authRows.Next() {
+			var path string
+			authRows.Scan(&path)
+			authBasePaths["/api/"+path] = true
+			validPaths["/api/"+path+"/login"] = true
+			validPaths["/api/"+path+"/register"] = true
+			validPaths["/api/"+path+"/me"] = true
+			// OAuth sub-routes.
+			oauthRows, _ := db.Query("SELECT name FROM oauth_providers WHERE auth_endpoint_path = ?", path)
+			if oauthRows != nil {
+				for oauthRows.Next() {
+					var name string
+					oauthRows.Scan(&name)
+					validPaths["/api/"+path+"/oauth/"+name] = true
+				}
+				oauthRows.Close()
+			}
+		}
+	}
+
+	// stream_endpoints: /api/{path}/stream
+	rows, _ := db.Query("SELECT path FROM stream_endpoints")
+	if rows != nil {
+		for rows.Next() {
+			var path string
+			rows.Scan(&path)
+			validPaths["/api/"+path+"/stream"] = true
+		}
+		rows.Close()
+	}
+
+	// ws_endpoints: /api/{path}/ws
+	rows, _ = db.Query("SELECT path FROM ws_endpoints")
+	if rows != nil {
+		for rows.Next() {
+			var path string
+			rows.Scan(&path)
+			validPaths["/api/"+path+"/ws"] = true
+		}
+		rows.Close()
+	}
+
+	// upload_endpoints: /api/{path}/upload
+	rows, _ = db.Query("SELECT path FROM upload_endpoints")
+	if rows != nil {
+		for rows.Next() {
+			var path string
+			rows.Scan(&path)
+			validPaths["/api/"+path+"/upload"] = true
+		}
+		rows.Close()
+	}
+
+	// Also add /api/page (SPA page fetch) and /api/webhooks as known paths.
+	validPaths["/api/page"] = true
+
+	if len(validPaths) <= 1 {
+		// No API endpoints configured — skip JS validation.
+		return nil
+	}
+
+	// Scan all pages for JS API calls.
+	pageRows, err := db.Query("SELECT path, content FROM pages WHERE is_deleted = 0 AND content IS NOT NULL")
+	if err != nil {
+		return nil
+	}
+	defer pageRows.Close()
+
+	for pageRows.Next() {
+		var pagePath, content string
+		if pageRows.Scan(&pagePath, &content) != nil {
+			continue
+		}
+
+		// Extract script blocks.
+		scripts := scriptTagRe.FindAllString(content, -1)
+		if len(scripts) == 0 {
+			continue
+		}
+		allJS := strings.Join(scripts, "\n")
+
+		// Check fetch() URLs.
+		for _, re := range []*regexp.Regexp{fetchURLRe, fetchTplRe} {
+			for _, m := range re.FindAllStringSubmatch(allJS, -1) {
+				url := m[1]
+				if !strings.HasPrefix(url, "/api/") {
+					continue
+				}
+				// Skip dynamic template expressions.
+				if strings.Contains(url, "${") {
+					continue
+				}
+				basePath := stripAPIQueryAndID(url)
+				if !validPaths[basePath] {
+					issues = append(issues, fmt.Sprintf(
+						"Page %s: fetch('%s') — no API endpoint at %s", pagePath, url, basePath))
+				}
+			}
+		}
+
+		// Check EventSource URLs.
+		for _, m := range eventSourceRe.FindAllStringSubmatch(allJS, -1) {
+			url := m[1]
+			if !strings.HasPrefix(url, "/api/") {
+				continue
+			}
+			if !validPaths[url] {
+				issues = append(issues, fmt.Sprintf(
+					"Page %s: EventSource('%s') — no stream endpoint exists", pagePath, url))
+			}
+		}
+
+		// Check WebSocket URLs.
+		for _, m := range webSocketURLRe.FindAllStringSubmatch(allJS, -1) {
+			wsPath := m[1]
+			// Extract just the path part (may have protocol prefix in template literal).
+			if idx := strings.Index(wsPath, "/api/"); idx >= 0 {
+				wsPath = wsPath[idx:]
+			}
+			if !validPaths[wsPath] {
+				issues = append(issues, fmt.Sprintf(
+					"Page %s: WebSocket to '%s' — no ws endpoint exists", pagePath, wsPath))
+			}
+		}
+
+		// Check App.auth.login/register/getUser calls.
+		// These functions append /login, /register, /me — so the argument must be the BASE auth path.
+		for _, pair := range []struct {
+			re     *regexp.Regexp
+			method string
+			suffix string
+		}{
+			{authLoginRe, "App.auth.login", "/login"},
+			{authRegisterRe, "App.auth.register", "/register"},
+			{authGetUserRe, "App.auth.getUser", "/me"},
+		} {
+			for _, m := range pair.re.FindAllStringSubmatch(allJS, -1) {
+				authPath := m[1]
+				if !strings.HasPrefix(authPath, "/api/") {
+					continue
+				}
+				// Detect doubled paths: LLM passed full sub-path instead of base path.
+				if strings.HasSuffix(authPath, pair.suffix) {
+					basePath := strings.TrimSuffix(authPath, pair.suffix)
+					issues = append(issues, fmt.Sprintf(
+						"Page %s: %s('%s') — pass the base path '%s', not the full sub-path (App.auth appends %s automatically)",
+						pagePath, pair.method, authPath, basePath, pair.suffix))
+				} else if !authBasePaths[authPath] {
+					issues = append(issues, fmt.Sprintf(
+						"Page %s: %s('%s') — no auth endpoint at %s",
+						pagePath, pair.method, authPath, authPath))
+				}
+			}
+		}
+	}
+
+	return issues
+}
+
+// stripAPIQueryAndID removes query parameters and trailing numeric ID/sub-paths
+// from an API URL for base-path matching.
+// "/api/products/5?limit=10" → "/api/products"
+// "/api/products/_stats" → "/api/products"
+func stripAPIQueryAndID(url string) string {
+	// Strip query params.
+	if i := strings.Index(url, "?"); i >= 0 {
+		url = url[:i]
+	}
+	// Strip trailing path segments that are IDs or special sub-routes.
+	parts := strings.Split(strings.TrimRight(url, "/"), "/")
+	for len(parts) > 2 {
+		last := parts[len(parts)-1]
+		// Numeric ID.
+		if _, err := strconv.Atoi(last); err == nil {
+			parts = parts[:len(parts)-1]
+			continue
+		}
+		// Special sub-routes like _stats.
+		if strings.HasPrefix(last, "_") {
+			parts = parts[:len(parts)-1]
+			continue
+		}
+		break
+	}
+	return strings.Join(parts, "/")
 }

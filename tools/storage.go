@@ -227,42 +227,32 @@ func (t *FilesTool) Parameters() map[string]interface{} {
 }
 
 func (t *FilesTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasVersion := args["version"]; hasVersion {
-			action = "rollback"
-		} else if _, hasContent := args["content"]; hasContent {
-			action = "save"
-		} else if _, hasData := args["data"]; hasData {
-			action = "save"
-		} else if _, hasNewName := args["new_filename"]; hasNewName {
-			action = "rename"
-		} else if _, hasFilename := args["filename"]; hasFilename {
-			action = "get"
-		} else {
-			action = "list"
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"save":     t.executeSave,
+		"get":      t.executeGet,
+		"list":     t.executeList,
+		"delete":   t.executeDelete,
+		"rename":   t.executeRename,
+		"history":  t.executeHistory,
+		"rollback": t.executeRollback,
+	}, func(a map[string]interface{}) string {
+		if _, has := a["version"]; has {
+			return "rollback"
 		}
-		args["action"] = action
-	}
-	switch action {
-	case "save":
-		return t.executeSave(ctx, args)
-	case "get":
-		return t.executeGet(ctx, args)
-	case "list":
-		return t.executeList(ctx, args)
-	case "delete":
-		return t.executeDelete(ctx, args)
-	case "rename":
-		return t.executeRename(ctx, args)
-	case "history":
-		return t.executeHistory(ctx, args)
-	case "rollback":
-		return t.executeRollback(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use save, get, list, delete, rename, history, rollback)", action)}, nil
-	}
+		if _, has := a["content"]; has {
+			return "save"
+		}
+		if _, has := a["data"]; has {
+			return "save"
+		}
+		if _, has := a["new_filename"]; has {
+			return "rename"
+		}
+		if _, has := a["filename"]; has {
+			return "get"
+		}
+		return "list"
+	})
 }
 
 func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (*Result, error) {

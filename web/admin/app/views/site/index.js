@@ -143,6 +143,22 @@ export async function renderSiteDetail(container, params) {
       statusDot,
       h('h2', { className: 'site-header__name' }, site.name),
       stateBadge,
+      (() => {
+        const sys = state.get('systemStatus') || {};
+        const publicPort = sys.public_port || 5000;
+        const needsPort = !site.domain || site.domain.includes('localhost');
+        const host = site.domain || 'localhost';
+        const url = needsPort ? `http://${host}:${publicPort}` : `http://${host}`;
+        const label = needsPort ? `${host}:${publicPort}` : host;
+        return h('a', {
+          href: url,
+          target: '_blank',
+          rel: 'noopener',
+          className: 'link',
+          title: 'View site',
+          style: { fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: '3px' },
+        }, label);
+      })(),
     ]),
     h('div', { className: 'site-header__mode flex items-center gap-2' }, [
       modeSelect,

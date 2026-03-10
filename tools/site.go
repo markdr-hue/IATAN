@@ -50,18 +50,10 @@ func (t *SiteTool) Parameters() map[string]interface{} {
 }
 
 func (t *SiteTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		return errResult, nil
-	}
-	switch action {
-	case "info":
-		return t.info(ctx, args)
-	case "set_mode":
-		return t.setMode(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use info, set_mode)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"info":     t.info,
+		"set_mode": t.setMode,
+	}, nil)
 }
 
 func (t *SiteTool) info(ctx *ToolContext, _ map[string]interface{}) (*Result, error) {

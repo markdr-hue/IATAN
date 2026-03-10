@@ -43,38 +43,28 @@ func (t *WebhooksTool) Parameters() map[string]interface{} {
 }
 
 func (t *WebhooksTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasEventTypes := args["event_types"]; hasEventTypes {
-			action = "subscribe"
-		} else if _, hasURL := args["url"]; hasURL {
-			action = "create"
-		} else if _, hasEnabled := args["is_enabled"]; hasEnabled {
-			action = "update"
-		} else if _, hasName := args["name"]; hasName {
-			action = "get"
-		} else {
-			action = "list"
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"create":    t.create,
+		"get":       t.get,
+		"list":      t.list,
+		"delete":    t.delete,
+		"update":    t.update,
+		"subscribe": t.subscribe,
+	}, func(a map[string]interface{}) string {
+		if _, has := a["event_types"]; has {
+			return "subscribe"
 		}
-		args["action"] = action
-	}
-	switch action {
-	case "create":
-		return t.create(ctx, args)
-	case "get":
-		return t.get(ctx, args)
-	case "list":
-		return t.list(ctx, args)
-	case "delete":
-		return t.delete(ctx, args)
-	case "update":
-		return t.update(ctx, args)
-	case "subscribe":
-		return t.subscribe(ctx, args)
-	default:
-		return &Result{Success: false, Error: "unknown action: " + action}, nil
-	}
+		if _, has := a["url"]; has {
+			return "create"
+		}
+		if _, has := a["is_enabled"]; has {
+			return "update"
+		}
+		if _, has := a["name"]; has {
+			return "get"
+		}
+		return "list"
+	})
 }
 
 func (t *WebhooksTool) create(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
@@ -279,9 +269,6 @@ func (t *WebhooksTool) update(ctx *ToolContext, args map[string]interface{}) (*R
 func (t *WebhooksTool) subscribe(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
 	name, _ := args["name"].(string)
 	if name == "" {
-		name, _ = args["webhook_name"].(string) // backward compat
-	}
-	if name == "" {
 		return &Result{Success: false, Error: "name is required"}, nil
 	}
 
@@ -315,7 +302,7 @@ func (t *WebhooksTool) subscribe(ctx *ToolContext, args map[string]interface{}) 
 	}
 
 	return &Result{Success: true, Data: map[string]interface{}{
-		"webhook_name": name,
-		"subscribed":   subscribed,
+		"name":       name,
+		"subscribed": subscribed,
 	}}, nil
 }

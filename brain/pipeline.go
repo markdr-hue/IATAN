@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,7 +25,6 @@ const (
 	monitoringBaseDefault = 5 * time.Minute
 	monitoringMaxDefault  = 15 * time.Minute
 	idleThreshold         = 3
-	maxGlobalErrors       = 5
 	maxStageRetries       = 3
 	llmTimeout            = 5 * time.Minute
 )
@@ -110,6 +110,19 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 		w.setState(StateBuilding)
 		// Auto-recover from crashes: reset error count and clear non-question pauses
 		// so the pipeline can resume instead of staying stuck in paused loop.
+		// But if error_count was high (repeated failures), keep the pause to avoid
+		// burning tokens on the same failure after restart.
+		var prevErrorCount int
+		w.siteDB.DB.QueryRow("SELECT error_count FROM pipeline_state WHERE id = 1").Scan(&prevErrorCount)
+		if prevErrorCount >= maxStageRetries {
+			w.logger.Warn("auto-recovery skipped: previous error_count was high, manual resume required", "error_count", prevErrorCount)
+			w.setState(StatePaused)
+			w.runPausedLoop(ctx)
+			return
+		}
+		if prevErrorCount > 0 {
+			w.logger.Info("auto-recovery: clearing error_count", "previous_count", prevErrorCount)
+		}
 		w.siteDB.ExecWrite(`UPDATE pipeline_state SET error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND error_count > 0`)
 		w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN (?, ?)`, PauseReasonOwnerAnswers, PauseReasonApproval)
 		w.runBuildPipeline(ctx)
@@ -177,8 +190,6 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 				nextStage, stageErr = w.runPlan(ctx)
 			case StageDesign:
 				nextStage, stageErr = w.runDesign(ctx)
-			case StageBlueprintPages:
-				nextStage, stageErr = w.runBlueprintPages(ctx)
 			case StageDataLayer:
 				nextStage, stageErr = w.runDataLayer(ctx)
 			case StageBuildPages:
@@ -197,7 +208,10 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 		if stageErr != nil {
 			// Check if the stage intentionally paused (e.g., awaiting owner answers).
 			// Don't count intentional pauses as errors.
-			ps, _ := LoadPipelineState(w.siteDB.DB)
+			ps, psErr := LoadPipelineState(w.siteDB.DB)
+			if psErr != nil {
+				w.logger.Warn("failed to check pause state after stage error", "error", psErr)
+			}
 			if ps != nil && ps.Paused {
 				w.logger.Info("stage paused intentionally", "stage", stage, "reason", ps.PauseReason)
 				w.setState(StatePaused)
@@ -206,7 +220,18 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 			}
 
 			w.logger.Error("stage failed", "stage", stage, "error", stageErr)
-			errCount, _ := IncrementErrorCount(w.siteDB, stageErr.Error())
+
+			// Circuit breaker: permanent errors (bad config) should pause
+			// immediately instead of burning retries that can never succeed.
+			if isPermanentError(stageErr) {
+				PausePipeline(w.siteDB, fmt.Sprintf("permanent error in %s: %v", stage, stageErr))
+				w.publishBrainError(fmt.Sprintf("Pipeline paused: **%s** — %v. Fix the configuration and resume.", stage, stageErr))
+				w.setState(StatePaused)
+				w.runPausedLoop(ctx)
+				return
+			}
+
+			IncrementErrorCount(w.siteDB, stageErr.Error())
 			stageRetries++
 
 			if stageRetries >= maxStageRetries {
@@ -217,16 +242,8 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 				return
 			}
 
-			if errCount >= maxGlobalErrors {
-				PausePipeline(w.siteDB, fmt.Sprintf("too many errors (%d)", errCount))
-				w.publishBrainError(fmt.Sprintf("Pipeline paused after %d consecutive errors. Last: %v", errCount, stageErr))
-				w.setState(StatePaused)
-				w.runPausedLoop(ctx)
-				return
-			}
-
 			// Backoff before retrying to prevent tight loops.
-			backoff := time.Duration(errCount) * 5 * time.Second
+			backoff := time.Duration(stageRetries) * 5 * time.Second
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second
 			}
@@ -242,6 +259,9 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 		// Stage succeeded — advance (also resets error count atomically).
 		if err := AdvanceStage(w.siteDB, nextStage); err != nil {
 			w.logger.Error("failed to advance stage", "error", err)
+			// Don't update in-memory stage — retry so the DB stays consistent.
+			// Stages are idempotent, so re-executing is safe.
+			continue
 		}
 		stage = nextStage
 		stageRetries = 0
@@ -791,7 +811,23 @@ func (w *PipelineWorker) finalizeTaskRun(runID int64, taskID int, success bool, 
 	}
 }
 
-// --- Utility functions (ported from worker.go) ---
+// --- Utility functions ---
+
+// isPermanentError returns true for errors that can never succeed on retry,
+// such as missing API keys or invalid provider configuration.
+func isPermanentError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	permanentPatterns := []string{
+		"no api key", "no model configured", "provider not available",
+		"failed to decrypt", "has no api key", "has no base_url",
+	}
+	for _, p := range permanentPatterns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
 
 func isInteractiveTool(name string) bool {
 	switch name {

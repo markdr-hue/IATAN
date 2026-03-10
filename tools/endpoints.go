@@ -69,6 +69,10 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 				"type":        "boolean",
 				"description": "If true, API requests must include a valid bearer token (default: false). Only for create_api.",
 			},
+			"public_read": map[string]interface{}{
+				"type":        "boolean",
+				"description": "If true, GET requests are allowed without auth even when requires_auth=true. Use for public-readable data (forums, products, articles). Default: false. Only for create_api.",
+			},
 			"rate_limit": map[string]interface{}{
 				"type":        "number",
 				"description": "Max requests per minute per IP (default: 60). Only for create_api.",
@@ -169,65 +173,22 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 }
 
 func (t *EndpointsTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		// Check most-specific params first to avoid ambiguity.
-		if _, has := args["password"]; has {
-			action = "verify_password"
-		} else if _, has := args["password_column"]; has {
-			action = "create_auth"
-		} else if _, has := args["allowed_types"]; has {
-			action = "create_upload"
-		} else if _, has := args["receive_event_type"]; has {
-			action = "create_websocket"
-		} else if _, has := args["write_to_table"]; has {
-			action = "create_websocket"
-		} else if _, has := args["event_types"]; has {
-			action = "create_stream"
-		} else if _, has := args["provider_name"]; has {
-			action = "create_oauth"
-		} else if _, has := args["table_name"]; has {
-			action = "create_api"
-		} else if _, has := args["path"]; has {
-			action = "test"
-		} else {
-			action = "list_api"
-		}
-		args["action"] = action
-	}
-	switch action {
-	case "create_api":
-		return t.createAPI(ctx, args)
-	case "list_api":
-		return t.listAPI(ctx, args)
-	case "delete_api":
-		return t.deleteAPI(ctx, args)
-	case "create_auth":
-		return t.createAuth(ctx, args)
-	case "list_auth":
-		return t.listAuth(ctx, args)
-	case "delete_auth":
-		return t.deleteAuth(ctx, args)
-	case "create_upload":
-		return t.createUpload(ctx, args)
-	case "create_stream":
-		return t.createStream(ctx, args)
-	case "create_websocket":
-		return t.createWebSocket(ctx, args)
-	case "verify_password":
-		return t.verifyPassword(ctx, args)
-	case "test":
-		return t.testEndpoint(ctx, args)
-	case "create_oauth":
-		return t.createOAuth(ctx, args)
-	case "list_oauth":
-		return t.listOAuth(ctx, args)
-	case "delete_oauth":
-		return t.deleteOAuth(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action: %q (use create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, create_websocket, verify_password, test, create_oauth, list_oauth, delete_oauth)", action)}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"create_api":       t.createAPI,
+		"list_api":         t.listAPI,
+		"delete_api":       t.deleteAPI,
+		"create_auth":      t.createAuth,
+		"list_auth":        t.listAuth,
+		"delete_auth":      t.deleteAuth,
+		"create_upload":    t.createUpload,
+		"create_stream":    t.createStream,
+		"create_websocket": t.createWebSocket,
+		"verify_password":  t.verifyPassword,
+		"test":             t.testEndpoint,
+		"create_oauth":     t.createOAuth,
+		"list_oauth":       t.listOAuth,
+		"delete_oauth":     t.deleteOAuth,
+	}, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +243,11 @@ func (t *EndpointsTool) createAPI(ctx *ToolContext, args map[string]interface{})
 		requiresAuth = ra
 	}
 
+	publicRead := false
+	if pr, ok := args["public_read"].(bool); ok {
+		publicRead = pr
+	}
+
 	// Role-based access control: if required_role is set, implies requires_auth.
 	var requiredRole *string
 	if rr, ok := args["required_role"].(string); ok && rr != "" {
@@ -295,16 +261,17 @@ func (t *EndpointsTool) createAPI(ctx *ToolContext, args map[string]interface{})
 	}
 
 	_, err = ctx.DB.Exec(
-		`INSERT INTO api_endpoints (path, table_name, methods, public_columns, requires_auth, required_role, rate_limit)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO api_endpoints (path, table_name, methods, public_columns, requires_auth, public_read, required_role, rate_limit)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   table_name = excluded.table_name,
 		   methods = excluded.methods,
 		   public_columns = excluded.public_columns,
 		   requires_auth = excluded.requires_auth,
+		   public_read = excluded.public_read,
 		   required_role = excluded.required_role,
 		   rate_limit = excluded.rate_limit`,
-		path, tableName, string(methodsJSON), publicColsJSON, requiresAuth, requiredRole, rateLimit,
+		path, tableName, string(methodsJSON), publicColsJSON, requiresAuth, publicRead, requiredRole, rateLimit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating API endpoint: %w", err)
@@ -315,6 +282,7 @@ func (t *EndpointsTool) createAPI(ctx *ToolContext, args map[string]interface{})
 		"table_name":    tableName,
 		"methods":       methods,
 		"requires_auth": requiresAuth,
+		"public_read":   publicRead,
 		"rate_limit":    rateLimit,
 	}
 	if requiredRole != nil {
@@ -619,17 +587,6 @@ func (t *EndpointsTool) createUpload(ctx *ToolContext, args map[string]interface
 	// Optional: link to a table to store file metadata.
 	tableName, _ := args["table_name"].(string)
 
-	// Ensure upload_endpoints table exists.
-	ctx.DB.Exec(`CREATE TABLE IF NOT EXISTS upload_endpoints (
-		id INTEGER PRIMARY KEY,
-		path TEXT UNIQUE NOT NULL,
-		allowed_types TEXT,
-		max_size_mb INTEGER DEFAULT 5,
-		requires_auth BOOLEAN DEFAULT 0,
-		table_name TEXT,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	)`)
-
 	_, err := ctx.DB.Exec(
 		`INSERT INTO upload_endpoints (path, allowed_types, max_size_mb, requires_auth, table_name)
 		 VALUES (?, ?, ?, ?, ?)
@@ -680,15 +637,6 @@ func (t *EndpointsTool) createStream(ctx *ToolContext, args map[string]interface
 	if ra, ok := args["requires_auth"].(bool); ok {
 		requiresAuth = ra
 	}
-
-	// Ensure stream_endpoints table exists.
-	ctx.DB.Exec(`CREATE TABLE IF NOT EXISTS stream_endpoints (
-		id INTEGER PRIMARY KEY,
-		path TEXT UNIQUE NOT NULL,
-		event_types TEXT,
-		requires_auth BOOLEAN DEFAULT 0,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	)`)
 
 	_, err := ctx.DB.Exec(
 		`INSERT INTO stream_endpoints (path, event_types, requires_auth)
@@ -750,17 +698,6 @@ func (t *EndpointsTool) createWebSocket(ctx *ToolContext, args map[string]interf
 	if ra, ok := args["requires_auth"].(bool); ok {
 		requiresAuth = ra
 	}
-
-	// Ensure ws_endpoints table exists.
-	ctx.DB.Exec(`CREATE TABLE IF NOT EXISTS ws_endpoints (
-		id INTEGER PRIMARY KEY,
-		path TEXT UNIQUE NOT NULL,
-		event_types TEXT,
-		receive_event_type TEXT DEFAULT 'ws.message',
-		write_to_table TEXT DEFAULT '',
-		requires_auth BOOLEAN DEFAULT 0,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	)`)
 
 	_, err := ctx.DB.Exec(
 		`INSERT INTO ws_endpoints (path, event_types, receive_event_type, write_to_table, requires_auth)
@@ -980,4 +917,24 @@ func (t *EndpointsTool) deleteOAuth(ctx *ToolContext, args map[string]interface{
 	return &Result{Success: true, Data: map[string]interface{}{
 		"deleted": providerName,
 	}}, nil
+}
+
+func (t *EndpointsTool) MaxResultSize() int { return 8000 }
+
+func (t *EndpointsTool) Summarize(result string) string {
+	r, dataMap, dataArr, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if dataArr != nil {
+		return fmt.Sprintf(`{"success":true,"summary":"Listed %d endpoints"}`, len(dataArr))
+	}
+	// For create/test operations, include key fields.
+	if path, _ := dataMap["path"].(string); path != "" {
+		return fmt.Sprintf(`{"success":true,"summary":"Endpoint at /api/%s"}`, path)
+	}
+	return summarizeTruncate(result, 300)
 }

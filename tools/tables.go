@@ -165,32 +165,21 @@ func (t *SchemaTool) Parameters() map[string]interface{} {
 }
 
 func (t *SchemaTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasCols := args["columns"]; hasCols {
-			action = "create"
-		} else if _, hasTable := args["table_name"]; hasTable {
-			action = "describe"
-		} else {
-			action = "list"
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"create":   t.create,
+		"alter":    t.alter,
+		"describe": t.describe,
+		"list":     t.list,
+		"drop":     t.drop,
+	}, func(a map[string]interface{}) string {
+		if _, has := a["columns"]; has {
+			return "create"
 		}
-		args["action"] = action
-	}
-	switch action {
-	case "create":
-		return t.create(ctx, args)
-	case "alter":
-		return t.alter(ctx, args)
-	case "describe":
-		return t.describe(ctx, args)
-	case "list":
-		return t.list(ctx, args)
-	case "drop":
-		return t.drop(ctx, args)
-	default:
-		return &Result{Success: false, Error: "invalid action: must be create, alter, describe, list, or drop"}, nil
-	}
+		if _, has := a["table_name"]; has {
+			return "describe"
+		}
+		return "list"
+	})
 }
 
 func (t *SchemaTool) create(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
@@ -535,6 +524,28 @@ func (t *SchemaTool) drop(ctx *ToolContext, args map[string]interface{}) (*Resul
 	}}, nil
 }
 
+func (t *SchemaTool) MaxResultSize() int { return 8000 }
+
+func (t *SchemaTool) Summarize(result string) string {
+	r, dataMap, dataArr, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if dataArr != nil {
+		return fmt.Sprintf(`{"success":true,"summary":"Listed %d tables"}`, len(dataArr))
+	}
+	if tableName, _ := dataMap["table"].(string); tableName != "" {
+		if cols, ok := dataMap["columns"].([]interface{}); ok {
+			return fmt.Sprintf(`{"success":true,"summary":"Table %s: %d columns"}`, tableName, len(cols))
+		}
+		return fmt.Sprintf(`{"success":true,"summary":"Table %s created"}`, tableName)
+	}
+	return summarizeTruncate(result, 300)
+}
+
 // ---------------------------------------------------------------------------
 // DataTool — manage_data
 // ---------------------------------------------------------------------------
@@ -610,44 +621,31 @@ func (t *DataTool) Parameters() map[string]interface{} {
 }
 
 func (t *DataTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasRows := args["rows"]; hasRows {
-			action = "insert"
-		} else if _, hasID := args["id"]; hasID {
-			if _, hasData := args["data"]; hasData {
-				action = "update"
-			} else {
-				action = "delete"
-			}
-		} else if _, hasData := args["data"]; hasData {
-			action = "insert"
-		} else if _, hasFunction := args["function"]; hasFunction {
-			action = "aggregate"
-		} else if _, hasFilters := args["filters"]; hasFilters {
-			action = "query"
-		} else {
-			action = "query"
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"query":     t.query,
+		"insert":    t.insert,
+		"update":    t.update,
+		"delete":    t.del,
+		"count":     t.count,
+		"aggregate": t.aggregate,
+	}, func(a map[string]interface{}) string {
+		if _, has := a["rows"]; has {
+			return "insert"
 		}
-		args["action"] = action
-	}
-	switch action {
-	case "query":
-		return t.query(ctx, args)
-	case "insert":
-		return t.insert(ctx, args)
-	case "update":
-		return t.update(ctx, args)
-	case "delete":
-		return t.del(ctx, args)
-	case "count":
-		return t.count(ctx, args)
-	case "aggregate":
-		return t.aggregate(ctx, args)
-	default:
-		return &Result{Success: false, Error: "invalid action: must be query, insert, update, delete, count, or aggregate"}, nil
-	}
+		if _, hasID := a["id"]; hasID {
+			if _, hasData := a["data"]; hasData {
+				return "update"
+			}
+			return "delete"
+		}
+		if _, has := a["data"]; has {
+			return "insert"
+		}
+		if _, has := a["function"]; has {
+			return "aggregate"
+		}
+		return "query"
+	})
 }
 
 func (t *DataTool) query(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
@@ -1106,6 +1104,8 @@ func (t *DataTool) aggregate(ctx *ToolContext, args map[string]interface{}) (*Re
 		"data":     results,
 	}}, nil
 }
+
+func (t *DataTool) MaxResultSize() int { return 12000 }
 
 func (t *DataTool) Summarize(result string) string {
 	r, _, dataArr, ok := parseSummaryResult(result)

@@ -61,13 +61,15 @@ export async function renderSiteAnalytics(container, siteId) {
 
   const header = h('div', { className: 'context-panel__header' }, [
     h('h3', { className: 'context-panel__title' }, 'Analytics'),
-    h('div', { className: 'flex items-center gap-2', style: { flexWrap: 'wrap' } }, [
-      startInput, h('span', { className: 'text-secondary' }, 'to'), endInput,
-      presets, refreshBtn,
-    ]),
+  ]);
+
+  const controls = h('div', { className: 'flex items-center gap-2 mb-3', style: { flexWrap: 'wrap' } }, [
+    startInput, h('span', { className: 'text-secondary' }, 'to'), endInput,
+    presets, refreshBtn,
   ]);
 
   container.appendChild(header);
+  body.appendChild(controls);
   container.appendChild(body);
 
   await loadAnalytics(body, siteId, startInput.value, endInput.value);
@@ -98,26 +100,38 @@ function renderAnalytics(container, data) {
     return;
   }
 
-  // Stat cards
-  const stats = h('div', { className: 'flex gap-3 mb-3', style: { flexWrap: 'wrap' } }, [
-    statCard('Total Views', data.total_views, 'activity'),
-    statCard('Unique Visitors', data.unique_visitors, 'users'),
+  // Stat cards — same pattern as dashboard
+  const statsGrid = h('div', { className: 'stat-cards' }, [
+    h('div', { className: 'stat-card' }, [
+      h('div', { className: 'flex items-center justify-between mb-2' }, [
+        h('span', { className: 'stat-card__label' }, 'Total Views'),
+        h('span', { innerHTML: icon('activity'), style: { color: 'var(--text-tertiary)' } }),
+      ]),
+      h('div', { className: 'stat-card__value' }, String(data.total_views)),
+    ]),
+    h('div', { className: 'stat-card' }, [
+      h('div', { className: 'flex items-center justify-between mb-2' }, [
+        h('span', { className: 'stat-card__label' }, 'Unique Visitors'),
+        h('span', { innerHTML: icon('users'), style: { color: 'var(--text-tertiary)' } }),
+      ]),
+      h('div', { className: 'stat-card__value' }, String(data.unique_visitors)),
+    ]),
   ]);
-  container.appendChild(stats);
+  container.appendChild(statsGrid);
 
   // Daily chart
   if (data.daily.length > 0) {
-    container.appendChild(h('h4', { className: 'text-sm text-secondary mb-2', style: { padding: '0 4px' } }, 'Daily Views'));
+    container.appendChild(h('h4', { className: 'text-sm text-secondary mb-2' }, 'Daily Views'));
     container.appendChild(renderBarChart(data.daily));
   }
 
   // Top pages
   if (data.top_pages.length > 0) {
-    container.appendChild(h('h4', { className: 'text-sm text-secondary mb-2', style: { padding: '0 4px', marginTop: '16px' } }, 'Top Pages'));
+    container.appendChild(h('h4', { className: 'text-sm text-secondary mb-2 mt-4' }, 'Top Pages'));
     const maxViews = data.top_pages[0].views;
     for (const p of data.top_pages) {
       const pct = Math.round((p.views / maxViews) * 100);
-      container.appendChild(h('div', { className: 'mb-2', style: { padding: '0 4px' } }, [
+      container.appendChild(h('div', { className: 'mb-2' }, [
         h('div', { className: 'flex justify-between text-sm mb-1' }, [
           h('code', { style: { fontSize: 'var(--text-xs)' } }, p.path),
           h('span', { className: 'text-secondary' }, String(p.views)),
@@ -131,27 +145,14 @@ function renderAnalytics(container, data) {
 
   // Top referrers
   if (data.top_referrers.length > 0) {
-    container.appendChild(h('h4', { className: 'text-sm text-secondary mb-2', style: { padding: '0 4px', marginTop: '16px' } }, 'Top Referrers'));
+    container.appendChild(h('h4', { className: 'text-sm text-secondary mb-2 mt-4' }, 'Top Referrers'));
     for (const r of data.top_referrers) {
-      container.appendChild(h('div', { className: 'flex justify-between text-sm mb-1', style: { padding: '0 4px' } }, [
+      container.appendChild(h('div', { className: 'flex justify-between text-sm mb-1' }, [
         h('span', { style: { wordBreak: 'break-all' } }, r.referrer),
         h('span', { className: 'text-secondary' }, String(r.count)),
       ]));
     }
   }
-}
-
-function statCard(label, value, iconName) {
-  return h('div', {
-    className: 'card',
-    style: { padding: '12px 16px', flex: '1', minWidth: '120px' },
-  }, [
-    h('div', { className: 'flex items-center gap-2 text-secondary text-xs mb-1' }, [
-      h('span', { innerHTML: icon(iconName), style: { width: '14px', height: '14px' } }),
-      h('span', {}, label),
-    ]),
-    h('div', { style: { fontSize: '1.5rem', fontWeight: 700 } }, String(value)),
-  ]);
 }
 
 function renderBarChart(daily) {

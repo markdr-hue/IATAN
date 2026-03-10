@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS api_endpoints (
     methods TEXT DEFAULT '["GET","POST"]',
     public_columns TEXT,
     requires_auth BOOLEAN DEFAULT 0,
+    public_read BOOLEAN DEFAULT 0,
     required_role TEXT DEFAULT NULL,
     rate_limit INTEGER DEFAULT 60,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -394,3 +395,34 @@ CREATE TABLE IF NOT EXISTS file_versions (
 
 CREATE INDEX IF NOT EXISTS idx_file_versions_lookup
     ON file_versions (storage_type, filename, version_number DESC);
+
+-- Upload endpoints (file upload routes)
+CREATE TABLE IF NOT EXISTS upload_endpoints (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    allowed_types TEXT,
+    max_size_mb INTEGER DEFAULT 5,
+    requires_auth BOOLEAN DEFAULT 0,
+    table_name TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- SSE stream endpoints
+CREATE TABLE IF NOT EXISTS stream_endpoints (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    event_types TEXT,
+    requires_auth BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- WebSocket endpoints
+CREATE TABLE IF NOT EXISTS ws_endpoints (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    event_types TEXT,
+    receive_event_type TEXT DEFAULT 'ws.message',
+    write_to_table TEXT DEFAULT '',
+    requires_auth BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

@@ -910,6 +910,20 @@ select.input {
   margin-top: 4px;
 }
 
+.stat-cards--compact {
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.stat-cards--compact .stat-card {
+  padding: 12px 16px;
+}
+
+.stat-cards--compact .stat-card__value {
+  font-size: var(--text-lg);
+}
+
 /* ---------- Badges ---------- */
 .badge {
   display: inline-flex;

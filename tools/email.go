@@ -86,19 +86,12 @@ func (t *EmailTool) Parameters() map[string]interface{} {
 }
 
 func (t *EmailTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, _ := args["action"].(string)
-	switch action {
-	case "configure":
-		return t.configure(ctx, args)
-	case "send":
-		return t.send(ctx, args)
-	case "save_template":
-		return t.saveTemplate(ctx, args)
-	case "list_templates":
-		return t.listTemplates(ctx, args)
-	default:
-		return &Result{Success: false, Error: "action is required: configure, send, save_template, list_templates"}, nil
-	}
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"configure":      t.configure,
+		"send":           t.send,
+		"save_template":  t.saveTemplate,
+		"list_templates": t.listTemplates,
+	}, nil)
 }
 
 func (t *EmailTool) ensureTables(db *sql.DB) {
@@ -388,4 +381,21 @@ func (t *EmailTool) listTemplates(ctx *ToolContext, _ map[string]interface{}) (*
 	}
 
 	return &Result{Success: true, Data: templates}, nil
+}
+
+func (t *EmailTool) Summarize(result string) string {
+	r, dataMap, dataArr, ok := parseSummaryResult(result)
+	if !ok {
+		return summarizeTruncate(result, 200)
+	}
+	if !r.Success {
+		return summarizeError(r.Error)
+	}
+	if dataArr != nil {
+		return fmt.Sprintf(`{"success":true,"summary":"Listed %d email templates"}`, len(dataArr))
+	}
+	if status, _ := dataMap["status"].(string); status != "" {
+		return fmt.Sprintf(`{"success":true,"summary":"Email: %s"}`, status)
+	}
+	return summarizeTruncate(result, 300)
 }

@@ -46,38 +46,26 @@ func (t *PagesTool) Parameters() map[string]interface{} {
 }
 
 func (t *PagesTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	action, errResult := RequireAction(args)
-	if errResult != nil {
-		// Infer action from provided args — LLMs sometimes omit the action field.
-		if _, hasContent := args["content"]; hasContent {
-			action = "save"
-		} else if _, hasQuery := args["query"]; hasQuery {
-			action = "search"
-		} else if _, hasPath := args["path"]; hasPath {
-			action = "get"
-		} else {
-			action = "list"
+	return DispatchAction(ctx, args, map[string]ActionHandler{
+		"save":    t.save,
+		"get":     t.get,
+		"list":    t.list,
+		"delete":  t.delete,
+		"restore": t.restore,
+		"history": t.history,
+		"search":  t.search,
+	}, func(a map[string]interface{}) string {
+		if _, has := a["content"]; has {
+			return "save"
 		}
-		args["action"] = action
-	}
-	switch action {
-	case "save":
-		return t.save(ctx, args)
-	case "get":
-		return t.get(ctx, args)
-	case "list":
-		return t.list(ctx, args)
-	case "delete":
-		return t.delete(ctx, args)
-	case "restore":
-		return t.restore(ctx, args)
-	case "history":
-		return t.history(ctx, args)
-	case "search":
-		return t.search(ctx, args)
-	default:
-		return &Result{Success: false, Error: fmt.Sprintf("unknown action %q — use save, get, list, delete, restore, history, or search", action)}, nil
-	}
+		if _, has := a["query"]; has {
+			return "search"
+		}
+		if _, has := a["path"]; has {
+			return "get"
+		}
+		return "list"
+	})
 }
 
 // ---------------------------------------------------------------------------

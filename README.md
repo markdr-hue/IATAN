@@ -6,52 +6,35 @@
 
 ---
 
-## IATAN (I Am The Admin Now)
+## What is IATAN?
 
-IATAN is a self-hosted AI platform that autonomously builds, deploys, and monitors (multiple) websites. One binary.
+**One binary. Describe your site. Done.**
 
-It plans, designs, writes code, creates databases, sets up APIs, scheduled tasks, webhooks and reviews its own work, and keeps the site healthy, all on its own.
-Just point your domain(s) to the server IP and you're good to go, SSL is configured automatically and free (<3 Let's Encrypt / Caddy>).
+IATAN is a self-hosted AI platform that autonomously builds, deploys, and monitors websites.
+It plans, designs, writes code, creates databases, sets up APIs and auth, and keeps everything running...all on its own.
 
-No Docker. No npm. No database server. No build steps. No webserver to install.
-It works out of the box (fingers crossed :).
+No Docker. No npm. No database server. No webserver. No build steps. Just run it.
 
-**IMPORTANT: This is a very early release to get feedback and ideas from the community. Erorrs WILL be there, promised! Have been mainly testing with Z.ai (GLM-5) throughout but Claude should give better results, it was just too costly for me to blow tokens during development. Also deployment on Linux has not been tested, feedback is very much welcomed.**
+**IMPORTANT: This is an early release to get feedback and ideas from the community. Errors WILL be there, promised! Have been mainly testing with Z.ai (GLM-5) throughout but Claude should give better results, it was just too costly for me to blow tokens during development. Also deployment on Linux has not been tested, feedback is very much welcomed.**
 
 To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the brain creates and maintains this as we speak.
 
-## Features
+---
 
-- **Autonomous site/app building** : Describe what you want, the AI plans, designs, codes, and deploys it
-- **Human-in-the-loop** : The brain asks clarifying questions when your description is vague and pauses until you answer
-- **Incremental updates** : Tell the brain what to change, only affected pages and components get rebuilt
-- **Dynamic REST APIs** : Auto-generated CRUD endpoints with filtering, sorting, pagination, and role-based access control
-- **Dynamic database tables** : The AI creates SQLite tables on the fly, with secure column types (PASSWORD via bcrypt, ENCRYPTED via AES-256)
-- **User authentication** : JWT-based auth with bcrypt password hashing, configurable roles, and secure token management
-- **OAuth / social login** : Google, GitHub, Discord, and any OAuth 2.0 provider, configured by the AI with HMAC-signed state and automatic user provisioning
-- **Role-based access control** : Per-endpoint role enforcement, default role assignment on registration, and role-aware API middleware
-- **File uploads** : Public upload endpoints with MIME type validation, size limits (10MB), and metadata tracking
-- **Real-time updates (SSE + WebSocket)** : SSE for live data feeds (server to client), WebSocket for bidirectional communication (chat, collaboration)
-- **Email sending** : Provider-agnostic email with template support (SendGrid, Mailgun, Resend, SES, or any REST API)
-- **Payment flows** : Generic checkout integration (Stripe, PayPal, Mollie, Square, or any provider) with webhook signature verification
-- **Aggregation queries** : COUNT, SUM, AVG, MIN, MAX with GROUP BY through the public API
-- **Webhooks** : Incoming and outgoing, 20+ event types, HMAC-SHA256 signature verification, retry with exponential backoff
-- **Scheduled tasks** : Cron-based automation the AI sets up and manages itself
-- **Service providers** : Connect any external API with stored credentials and automatic auth injection
-- **Encrypted secrets** : AES-256-GCM storage for API keys and sensitive credentials
-- **Analytics** : Page view tracking with unique visitors, top pages, referrers, and date range filtering
-- **Site memory** : Persistent key-value store the AI uses to remember context across sessions
-- **Multi-site/app** : Run unlimited sites from a single instance, each with its own database and isolated storage
-- **Free HTTPS** : Embedded Caddy with automatic Let's Encrypt certificates
-- **Self-healing monitoring** : Adaptive health checks (5-15 min) that detect and fix issues autonomously
-- **Crash recovery** : Pipeline checkpoint system, the brain resumes exactly where it left off after a restart
-- **Version history** : Full page and file versioning with rollback support
-- **LLM logging** : Full request/response logging with CSV export, token usage stats, and 30-day auto-cleanup
-- **Prompt caching** : Anthropic-specific optimization for reduced token usage on repeated prompts
+## Quick Start
 
-## Simple Setup
+Download from **[Releases](https://github.com/markdr-hue/IATAN/releases)**, run the binary, open `http://localhost:5001`.
+The setup wizard handles the rest in ~2 minutes. Your site is served at `http://localhost:5000`.
 
-![Get Going in No Time!](docs/demo.gif)
+```bash
+# Linux / macOS
+chmod +x ./iatan && ./iatan
+
+# Windows
+.\iatan.exe
+```
+
+---
 
 ## Testimonials
 
@@ -67,33 +50,37 @@ To see IATAN in action visit [IATAN's home](https://iamtheadminnow.com), the bra
 > "I used IATAN for my daughter's lemonade stand website. She now has a multinational beverage distribution platform across 40 countries. She's 9. I need a lawyer."
 > : Sandra, lemonade mom
 
-
-
 ---
 
-## Quick Start
+## Core Features
 
-```bash
-# Linux / macOS
-chmod +x ./iatan && ./iatan
+- **Autonomous site building** : Describe what you want, the AI plans, designs, codes, and deploys it
+- **Human-in-the-loop** : The brain asks clarifying questions when your description is vague and pauses until you answer
+- **Incremental updates** : Tell the brain what to change, only affected pages and components get rebuilt
+- **Dynamic databases** : The AI creates SQLite tables on the fly, with secure column types (PASSWORD via bcrypt, ENCRYPTED via AES-256)
+- **REST APIs** : Auto-generated CRUD endpoints with filtering, sorting, pagination, and role-based access control
+- **User auth + OAuth** : JWT-based auth with bcrypt, configurable roles, plus Google/GitHub/Discord/any OAuth 2.0 provider
+- **Free HTTPS** : Embedded Caddy with automatic Let's Encrypt certificates, zero config
+- **Multi-site** : Unlimited sites from a single instance, each with its own database and isolated storage
 
-# Windows
-.\iatan.exe
-```
+## Advanced Features
 
-Open `http://localhost:5001` : the setup wizard handles the rest in about 2 minutes.
-
-Your site is served at `http://localhost:5000`.
-
----
-
-## Download
-
-Grab the latest release:
-
-- **[IATAN_VX.X.X.zip](https://github.com/markdr-hue/IATAN/releases)** : contains `iatan.exe`, `config.json`, and `firstrun.json`
-
-Unzip somewhere convenient, run `iatan.exe`, open `http://localhost:5001`.
+- File uploads with MIME validation and size limits
+- Real-time updates (SSE for server-to-client, WebSocket for bidirectional)
+- Email sending (SendGrid, Mailgun, Resend, SES, or any REST provider)
+- Payment flows (Stripe, PayPal, Mollie, Square, or any provider)
+- Aggregation queries (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
+- Webhooks (20+ event types, HMAC-SHA256 signatures, retry with backoff)
+- Scheduled tasks (cron-based, AI-managed)
+- Service providers (connect any external API with stored credentials)
+- Encrypted secrets (AES-256-GCM for API keys and credentials)
+- Analytics (page views, unique visitors, top pages, referrers)
+- Site memory (persistent key-value store for cross-session context)
+- Self-healing monitoring (adaptive 5-15 min health checks)
+- Crash recovery (pipeline checkpoint, resumes exactly where it left off)
+- Version history (pages and files with rollback)
+- LLM logging with token stats, CSV export, and prompt caching
+- Built-in JS runtime (`App.fetch`, SPA router, state management, auth helpers)
 
 ---
 
@@ -104,121 +91,40 @@ Every site goes through the same deterministic build process:
 | Stage | What Happens |
 |---|---|
 | **PLAN** | Analyzes your description, asks clarifying questions if needed, produces a structured JSON site plan |
-| **DESIGN** | Creates CSS theme, layout system, SPA router |
-| **BLUEPRINT** | Generates per-page HTML skeletons, component patterns, and content notes for cross-page consistency |
+| **DESIGN** | Creates CSS theme, layout system, and shared assets. Sets up the SPA router |
 | **DATA LAYER** | Tables, schemas, auth, OAuth, API endpoints with RBAC (skipped if not needed) |
 | **BUILD PAGES** | One focused LLM call per page, built sequentially with shared context |
-| **REVIEW** | Go-based HTML/CSS/link/heading/metadata validation + LLM fix cycle |
+| **REVIEW** | Go-based HTML/CSS/link validation + LLM fix cycle |
 | **COMPLETE** | Notifies the owner, switches to monitoring mode |
-| **MONITORING** | Adaptive health checks (5-15 min intervals), self-healing |
+| **MONITORING** | Adaptive health checks (5-15 min), self-healing |
 
-Updates use an incremental path (`UPDATE_PLAN`) : only the affected pages and components get rebuilt via a PlanPatch (add, modify, or remove pages; update CSS/nav; add tables).
-
-The brain uses **18 registered tools** with 100+ actions covering pages, files, schemas, data, endpoints, memory, communication, analytics, HTTP, webhooks, providers, secrets, site config, scheduling, layouts, diagnostics, email, and payments.
+Updates use an incremental path: only affected pages and components get rebuilt via a PlanPatch.
 
 ---
 
 ## LLM Providers
 
-IATAN supports two provider types out of the box:
-
-- **Anthropic** (native API) : Claude models with prompt caching support
-- **OpenAI-compatible** : Any API that follows the OpenAI chat completions format
-
-The `firstrun.json` file pre-seeds these providers so they appear in the setup wizard:
-
 | Provider | Type | Notes |
 |---|---|---|
-| Anthropic Claude | anthropic | Sonnet 4.6, Haiku 4.5, Opus 4.6 |
+| Anthropic Claude | anthropic | Sonnet 4.6, Haiku 4.5, Opus 4.6 — with prompt caching |
 | Ollama (local) | openai-compatible | Free, runs locally, no API key needed |
 | Z.ai (GLM) | openai-compatible | GLM-5, GLM-4.7, and Flash variants |
 
-You can add any OpenAI-compatible provider through the setup wizard or by editing `firstrun.json`.
-
----
-
-## Admin Dashboard
-
-The admin panel at `:5001` is a vanilla JS single-page app (no build step, no Node.js) with a dark-first design.
-
-- **Setup wizard** : Provider selection, admin account, first site creation
-- **Site dashboard** : Brain status, controls (start/stop/pause), mode switching
-- **Chat** : Streaming conversation with the brain via SSE
-- **Pages** : View and edit generated pages with version history
-- **Assets & files** : Manage CSS, JS, images, and user uploads
-- **Tables** : Browse and edit dynamic database tables created by the AI
-- **Endpoints** : View auto-generated REST API and auth routes
-- **LLM logs** : Full request/response history with token stats and CSV export
-- **Analytics** : Page views, unique visitors, top pages, referrers
-- **Diagnostics** : Site health checks and integrity validation
-- **Memory, secrets, webhooks, scheduled tasks, layouts, service providers** : All manageable from the UI
-- **Questions** : View and answer questions the brain has asked
-
----
-
-## Production HTTPS
-
-IATAN has [Caddy](https://caddyserver.com) built into the binary. When you're ready to go live:
-
-1. Point your domain's DNS to your server
-2. Set the domain on your site in the admin panel
-3. Set `IATAN_CADDY_ENABLED=true`
-4. Restart
-
-Caddy automatically gets a free SSL certificate from Let's Encrypt. No certbot, no nginx, no renewal cron jobs.
-
-Make sure port 80 and 443 can be reached to validate the domain. See troubleshooting section for more info.
+Any OpenAI-compatible provider can be added through the setup wizard or `firstrun.json`.
 
 ---
 
 ## Configuration
 
-IATAN works with zero configuration. If you want to tweak things:
+IATAN works with zero configuration out of the box. Optionally use `config.json` or environment variables with the `IATAN_` prefix to customize ports, data directory, log level, and CORS settings. JWT secrets and encryption keys are auto-generated on first run.
 
-```bash
-cp config.example.json config.json
-```
+LLM API keys are configured through the setup wizard, or set as environment variables (`ANTHROPIC_API_KEY`, etc.).
 
-Then edit `config.json`:
+---
 
-```json
-{
-  "admin_port": 5001,
-  "public_port": 5000,
-  "data_dir": "./data",
-  "log_level": "info",
-  "caddy_enabled": false,
-  "cors_origins": [],
-  "rate_limit_rate": 100,
-  "rate_limit_burst": 200
-}
-```
+## Production HTTPS
 
-All fields are optional, only include what you want to change. The example file (`config.example.json`) ships with the defaults.
-
-Or use environment variables with the `IATAN_` prefix:
-
-```bash
-IATAN_ADMIN_PORT=5001
-IATAN_PUBLIC_PORT=5000
-IATAN_DATA_DIR=./data
-IATAN_LOG_LEVEL=debug
-IATAN_CADDY_ENABLED=true
-IATAN_FIRSTRUN_PATH=firstrun.json
-```
-
-`IATAN_JWT_SECRET` and `IATAN_ENCRYPTION_KEY` are auto-generated on first run if not set.
-
-LLM API keys are configured through the setup wizard, but you can also set them as environment variables:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-ZAI_API_KEY=...
-```
-
-Any OpenAI-compatible provider can be added through the setup wizard or `firstrun.json`.
-
-Priority: environment variables > `config.json` > defaults.
+Point your domain's DNS to your server, set the domain in the admin panel, set `IATAN_CADDY_ENABLED=true`, and restart. Caddy automatically gets a free SSL certificate from Let's Encrypt. Make sure ports 80 and 443 are open.
 
 ---
 
@@ -239,97 +145,9 @@ make dev            # Run in development mode
 
 ---
 
-## Architecture
-
-```
-                    You
-                     |
-              localhost:5001 (admin)
-                     |
-            +--------+--------+
-            |    IATAN Core   |
-            |                 |
-            |  Pipeline Brain |
-            |  Chat (SSE)     |
-            |  18 Tools       |
-            |  Event Bus      |
-            |  Per-site SQLite|
-            +--------+--------+
-                     |
-              localhost:5000 (public)
-                     |
-                  Visitors
-```
-
-- **Admin** (`:5001`) : Manage sites, chat with the brain, view logs and analytics. Vanilla JS SPA embedded in the binary.
-- **Public** (`:5000`) : Your generated sites served to visitors, with dynamic API endpoints, file uploads, SSE streams, WebSocket connections, and webhook ingestion.
-- **Brain** : One goroutine per site (max 4 concurrent), channel-based commands, deterministic pipeline with crash recovery via `pipeline_state` checkpoint.
-- **Database** : Main DB (`data/iatan.db`) for users, providers, sites + per-site SQLite DB (`data/sites/{id}/site.db`) for pages, tables, endpoints, and everything else. Pure Go SQLite, no CGO.
-- **Chat** : Streaming conversation via SSE, separate from the build pipeline. The brain can use all 18 tools during chat to make changes on demand.
-- **Event bus** : 22 event types drive real-time updates, webhook delivery, and inter-component coordination.
-- **Real-time** : SSE (`/api/{path}/stream`) for server-to-client feeds, WebSocket (`/api/{path}/ws`) for bidirectional communication. The AI brain decides which to create based on the site's needs.
-- **Caddy** : Optional embedded reverse proxy with automatic HTTPS via Let's Encrypt.
-
----
-
-## Requirements
-
-- An LLM API key (Anthropic, Z.ai, OpenAI, or any OpenAI-compatible provider) : or [Ollama](https://ollama.com) for fully local/free operations
-- That's it
-
----
-
 ## Security
 
-### Lock down the admin port
-
-The admin panel runs on port **5001** by default. If your server's firewall allows it, **anyone on the internet can reach it**. You should block external access and use an SSH tunnel instead:
-
-**Windows Server:**
-
-```powershell
-netsh advfirewall firewall add rule name="Block IATAN Admin" dir=in action=block protocol=tcp localport=5001
-```
-
-**Linux (ufw):**
-
-```bash
-sudo ufw deny 5001/tcp
-```
-
-Then access admin remotely through an SSH tunnel:
-
-```bash
-ssh -L 5001:localhost:5001 user@yourserver
-```
-
-Open `http://localhost:5001` on your local machine : the traffic is encrypted through SSH and the port stays closed to the outside world.
-
----
-
-## Troubleshooting
-
-### HTTPS / Let's Encrypt fails with "Timeout during connect"
-
-Caddy needs ports **80** and **443** open for Let's Encrypt to verify your domain. Open them on your server's firewall:
-
-**Windows Server:**
-
-```powershell
-netsh advfirewall firewall add rule name="HTTP" dir=in action=allow protocol=tcp localport=80
-netsh advfirewall firewall add rule name="HTTPS" dir=in action=allow protocol=tcp localport=443
-```
-
-**Linux (ufw):**
-
-```bash
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-```
-
-Also check your hosting provider's control panel : many VPS providers have a separate firewall/security group that needs ports 80 and 443 allowed.
-
-Once the ports are open, restart IATAN and Caddy will automatically retry and get the certificate.
+The admin panel runs on port **5001**. If your server is publicly accessible, block this port externally and use an SSH tunnel (`ssh -L 5001:localhost:5001 user@yourserver`) to access it securely.
 
 ---
 

@@ -109,32 +109,82 @@ export async function renderSiteQuestions(container, siteId) {
   function showAnswerModal(question) {
     const isSecret = question.type === 'secret';
 
-    const answerInput = isSecret
-        ? h('input', {
-            type: 'password',
-            className: 'input',
-            placeholder: 'Enter secret value...',
-        })
-        : h('textarea', {
-            className: 'input',
-            rows: 4,
-            placeholder: 'Type your answer...',
-        });
+    // Parse structured fields if present.
+    let parsedFields = [];
+    if (question.fields) {
+      try {
+        parsedFields = typeof question.fields === 'string' ? JSON.parse(question.fields) : question.fields;
+      } catch { /* ignore */ }
+    }
+    if (!Array.isArray(parsedFields)) parsedFields = [];
 
-    const content = h('div', {}, [
+    const contentChildren = [
       h('div', { className: 'form-group' }, [
         h('label', {}, 'Question'),
         h('p', { style: { padding: '8px 0' } }, question.question),
       ]),
-      isSecret ? h('p', {
-        className: 'text-sm text-secondary mb-3',
-        style: { opacity: 0.7 },
-      }, `This value will be encrypted and stored as secret '${question.secret_name}'.`) : null,
-      h('div', { className: 'form-group' }, [
+    ];
+
+    let getAnswer;
+
+    if (parsedFields.length > 0) {
+      // Multi-field structured input form.
+      const fieldInputs = {};
+      for (const field of parsedFields) {
+        const inputType = field.type === 'secret' ? 'password' : 'text';
+        const input = h('input', {
+          type: inputType,
+          className: 'input',
+          placeholder: field.label || field.name,
+        });
+        fieldInputs[field.name] = input;
+        contentChildren.push(h('div', { className: 'form-group' }, [
+          h('label', {}, field.label || field.name),
+          field.type === 'secret' ? h('p', {
+            className: 'text-sm text-secondary',
+            style: { opacity: 0.7, marginBottom: '4px' },
+          }, 'This value will be encrypted.') : null,
+          input,
+        ].filter(Boolean)));
+      }
+      getAnswer = () => {
+        const values = {};
+        let hasValue = false;
+        for (const field of parsedFields) {
+          const val = fieldInputs[field.name].value.trim();
+          if (val) hasValue = true;
+          values[field.name] = val;
+        }
+        return hasValue ? JSON.stringify(values) : '';
+      };
+    } else {
+      // Single input (legacy path).
+      const answerInput = isSecret
+        ? h('input', {
+            type: 'password',
+            className: 'input',
+            placeholder: 'Enter secret value...',
+          })
+        : h('textarea', {
+            className: 'input',
+            rows: 4,
+            placeholder: 'Type your answer...',
+          });
+
+      if (isSecret) {
+        contentChildren.push(h('p', {
+          className: 'text-sm text-secondary mb-3',
+          style: { opacity: 0.7 },
+        }, `This value will be encrypted and stored as secret '${question.secret_name}'.`));
+      }
+      contentChildren.push(h('div', { className: 'form-group' }, [
         h('label', {}, isSecret ? 'Secret Value' : 'Your Answer'),
         answerInput,
-      ]),
-    ].filter(Boolean));
+      ]));
+      getAnswer = () => answerInput.value.trim();
+    }
+
+    const content = h('div', {}, contentChildren);
 
     modal.show('Answer Question', content, [
       { label: 'Cancel', onClick: () => {} },
@@ -142,10 +192,10 @@ export async function renderSiteQuestions(container, siteId) {
         label: 'Submit',
         className: 'btn btn--primary',
         onClick: async () => {
+          const answer = getAnswer();
+          if (!answer) return false;
           try {
-            await post(`/admin/api/questions/${question.id}/answer`, {
-              answer: answerInput.value.trim(),
-            });
+            await post(`/admin/api/questions/${question.id}/answer`, { answer });
             toast.success('Answer submitted');
             const questions = await get(`/admin/api/sites/${siteId}/questions`);
             renderList(questions);

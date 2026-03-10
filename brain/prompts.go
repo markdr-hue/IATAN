@@ -80,6 +80,7 @@ Create a complete site plan as a JSON object with this exact structure:
       ],
       "has_api": true,
       "has_auth": false,
+      "public_read": false,
       "seed_data": true
     }
   ],
@@ -112,12 +113,10 @@ Create a complete site plan as a JSON object with this exact structure:
 13. Set "data_tables": [] and "needs_data_layer": false if the site doesn't need dynamic data
 14. Each page's "data_tables" is an array of table names the page needs (e.g. ["articles", "comments"]). A page can use multiple tables.
 15. Each page can specify a "layout" name. Options: "default" (standard nav+footer), "none" (no layout — for landing pages), or a custom name like "blog" (with sidebar). Most pages should use "default". The DESIGN stage will create all referenced layouts.
-16. If the site needs payments (e-commerce, donations, subscriptions), set "needs_data_layer": true — the DATA_LAYER stage will configure the payment provider.
-17. If the site needs file uploads (profile pics, attachments, form submissions), set "needs_data_layer": true — the DATA_LAYER stage will create upload endpoints.
-18. If the site needs real-time updates, set "needs_data_layer": true — the DATA_LAYER stage will create real-time endpoints. Use SSE for server→client updates (live feeds, notifications). Use WebSocket for bidirectional communication (chat, collaborative editing, interactive features).
-19. Pages with login, register, or sign-in forms MUST set "needs_data": true and include the user/auth table name in "data_tables". This ensures the page builder receives the auth endpoint URL and JSON field names.
-20. If the site needs social login (Google, GitHub, etc.), include "has_oauth": ["google", "github"] on the user table. The table MUST also have has_auth: true and a PASSWORD column. Set "needs_data_layer": true.
-21. If the site has different user roles (admin, editor, member), include "roles": ["user", "admin"] on the user table. The table should have a TEXT column named "role". For API endpoints only accessible to specific roles, note this in the page's purpose.
+16. If the site needs any of: authentication, payments, file uploads, real-time updates, social login, or user roles — set "needs_data_layer": true and define the relevant tables. The DATA_LAYER stage handles all implementation details (endpoints, auth, providers, etc.).
+17. Pages with login/register forms MUST set "needs_data": true and include the user table in "data_tables".
+18. For user tables with auth: include a PASSWORD column. For social login: add "has_oauth": ["google"]. For user roles: add "roles": ["user", "admin"] and a TEXT column named "role".
+19. Set "public_read": true on tables where unauthenticated visitors should see data (posts, products, articles). Keep false for private data.
 
 ## Vague Descriptions
 
@@ -152,7 +151,7 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
 	b.WriteString(`## Your Tasks
 
 1. CREATE GLOBAL CSS (manage_files, action="save", storage="assets", scope="global"):
-   - File: css/styles.css (or similar)
+   - File: css/styles.css (use EXACTLY this filename)
    - Include CSS custom properties from the plan's color_scheme and typography:
      --primary, --secondary, --accent, --bg, --surface, --text, --text-muted
      --font-heading, --font-body, --scale
@@ -169,7 +168,7 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
 2. CREATE LAYOUTS (manage_layout, action="save"):
    - Create the "default" layout (name="default"):
      - body_before_main: Skip-to-content link + <nav> with links from nav_items
-     - body_after_main: <footer> with site info
+     - body_after_main: <footer> with site info and copyright using the current year (see date above)
      - head_content: Google Fonts import if using web fonts
    - If any page uses layout="none", no extra layout is needed (pages with layout "none" render without nav/footer)
    - If any page uses a custom layout name (e.g. "blog"), create that layout too with manage_layout(action="save", name="blog")
@@ -199,46 +198,7 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
 		b.WriteString("\n\n")
 	}
 
-	if plan.Architecture == "spa" {
-		b.WriteString(`3. CREATE SPA ROUTER (manage_files, action="save", storage="assets", scope="global"):
-   - File: js/router.js
-   - Intercept same-origin <a> clicks (skip external, #anchors, ctrl/meta+click)
-   - Fetch JSON: fetch('/api/page?path=' + encodeURIComponent(href))
-   - Swap: document.querySelector('main').innerHTML = response.content
-   - Handle page-scoped assets: remove [data-page-asset], load response.page_css + page_js
-   - Evaluate inline <script> tags in new content (create new script elements, do NOT set defer)
-   - history.pushState() + popstate handler
-   - Update document.title from response.title
-   IMPORTANT: When dynamically loading page_js scripts, do NOT set script.defer = true.
-   Dynamically appended scripts should execute immediately so page initialization runs.
-   ERROR HANDLING:
-   - On 404 response: fetch and display the /404 page content, update URL
-   - On network error: show a brief inline "Connection lost" message in main
-   - Add a loading indicator (CSS class 'page-loading' on main) during page transitions
-
-   Include a global state manager at the TOP of router.js (before the router logic):
-   window.AppState = {
-     state: {},
-     _listeners: {},
-     set: function(key, value) { this.state[key] = value; this.emit(key, value); },
-     get: function(key) { return this.state[key]; },
-     on: function(key, fn) { (this._listeners[key] = this._listeners[key] || []).push(fn); },
-     off: function(key, fn) { this._listeners[key] = (this._listeners[key]||[]).filter(function(f){return f!==fn;}); },
-     emit: function(key, value) { (this._listeners[key]||[]).forEach(function(fn){ fn(value); }); }
-   };
-   Pages use AppState.set('auth:token', token) after login and AppState.on('auth:token', fn) to react.
-   On navigation, emit AppState.emit('navigate', newPath) so pages can clean up listeners.
-
-`)
-	}
-
-	// Task numbering adjusts based on whether SPA router was task 3.
-	nextTask := 3
-	if plan.Architecture == "spa" {
-		nextTask = 4
-	}
-
-	b.WriteString(fmt.Sprintf(`%d. OPTIONAL: CREATE DECORATIVE SVGs (manage_files, action="save", storage="assets"):
+	b.WriteString(`3. OPTIONAL: CREATE DECORATIVE SVGs (manage_files, action="save", storage="assets"):
    - Prefer CSS gradients, shapes, and borders over SVG illustrations when possible
    - Only create SVGs if the design truly benefits from them (icons, simple decorations)
    - If you do create SVGs, save each one via manage_files — pages can ONLY reference SVGs that were actually saved
@@ -247,13 +207,12 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
    - Name them descriptively: svg/hero-decoration.svg, svg/feature-icon.svg
    - Use scope="global" for SVGs reused across pages, scope="page" for single-use
 
-`, nextTask))
-	nextTask++
+`)
 
-	b.WriteString(fmt.Sprintf(`%d. STORE DESIGN DECISIONS in memory:`, nextTask))
+	b.WriteString(`4. STORE DESIGN DECISIONS in memory:`)
 	b.WriteString(`
    - manage_memory(action="remember", key="site_architecture", value="` + plan.Architecture + `")
-   - manage_memory(action="remember", key="site_blueprint", value="<brief design summary>")
+   - manage_memory(action="remember", key="design_summary", value="<brief design summary>")
 
 ## Asset Scoping Rules
 - scope="global": auto-injected on every page by the server (CSS in <head>, JS at body end)
@@ -266,109 +225,6 @@ func buildDesignPrompt(plan *SitePlan, site *models.Site) string {
 - Accessible: skip-to-content link, ARIA labels, focus styles, color contrast
 - No inline styles — everything in CSS files
 - Images: use inline SVGs or CSS shapes, no external hotlinks
-`)
-
-	return b.String()
-}
-
-// --- BLUEPRINT_PAGES stage prompt ---
-
-func buildBlueprintPrompt(plan *SitePlan, cssClassMap, layoutSummary, siteDescription string) string {
-	var b strings.Builder
-
-	b.WriteString("You are IATAN, an AI that creates detailed page blueprints. Respond with ONLY a JSON object — no markdown, no explanation, no code fences.\n\n")
-
-	b.WriteString("## Site Context\n")
-	if siteDescription != "" {
-		b.WriteString(fmt.Sprintf("- About: %s\n", siteDescription))
-	}
-	b.WriteString(fmt.Sprintf("- Architecture: %s\n", plan.Architecture))
-	if plan.DesignNotes != "" {
-		b.WriteString(fmt.Sprintf("- Design direction: %s\n", plan.DesignNotes))
-	}
-	b.WriteString(fmt.Sprintf("- Colors: primary=%s, secondary=%s, accent=%s, bg=%s, text=%s\n",
-		plan.ColorScheme.Primary, plan.ColorScheme.Secondary, plan.ColorScheme.Accent,
-		plan.ColorScheme.Background, plan.ColorScheme.Text))
-	b.WriteString(fmt.Sprintf("- Fonts: heading=%s, body=%s\n\n", plan.Typography.HeadingFont, plan.Typography.BodyFont))
-
-	b.WriteString("## Layout\n")
-	b.WriteString(layoutSummary + "\n\n")
-
-	if cssClassMap != "" {
-		b.WriteString("## Available CSS Classes\n")
-		b.WriteString(cssClassMap + "\n\n")
-	}
-
-	b.WriteString("## Pages to Blueprint\n")
-	for _, p := range plan.Pages {
-		b.WriteString(fmt.Sprintf("\n### %s — %s\n", p.Path, p.Title))
-		b.WriteString(fmt.Sprintf("- Purpose: %s\n", p.Purpose))
-		if len(p.Sections) > 0 {
-			b.WriteString(fmt.Sprintf("- Sections: %s\n", strings.Join(p.Sections, ", ")))
-		}
-		if len(p.ComponentHints) > 0 {
-			b.WriteString(fmt.Sprintf("- Component hints: %s\n", strings.Join(p.ComponentHints, ", ")))
-		}
-		if p.NeedsData && len(p.DataTables) > 0 {
-			b.WriteString(fmt.Sprintf("- Data tables: %s\n", strings.Join(p.DataTables, ", ")))
-		}
-		if len(p.LinksTo) > 0 {
-			b.WriteString(fmt.Sprintf("- Links to: %s\n", strings.Join(p.LinksTo, ", ")))
-		}
-		if p.Layout != "" && p.Layout != "default" {
-			b.WriteString(fmt.Sprintf("- Layout: %s\n", p.Layout))
-		}
-	}
-
-	b.WriteString(`
-
-## Output Format
-
-Respond with ONLY this JSON structure:
-{
-  "pages": [
-    {
-      "path": "/",
-      "html_skeleton": "<section class='hero'><!-- hero heading + CTA button --></section>\n<section class='features'><!-- 3-column grid of feature cards --></section>",
-      "component_patterns": ["hero-cta", "feature-grid-3col"],
-      "content_notes": "Professional tone, emphasize value propositions. Hero: bold headline + subtitle + primary CTA. Features: icon + title + short description per card.",
-      "data_display": "fetch /api/products, display as card grid with image, title, price"
-    }
-  ],
-  "shared_patterns": {
-    "card": "class='card' containing: optional img, h3.card-title, p.card-text, optional a.card-link",
-    "button-primary": "class='btn btn-primary' for main CTAs",
-    "button-secondary": "class='btn btn-secondary' for secondary actions",
-    "section-header": "h2 + p.section-subtitle centered above content"
-  },
-  "content_style": "Professional and approachable. Use active voice, specific details over generic statements. Paragraphs: 2-3 sentences. Section headings: action-oriented."
-}
-
-## Rules
-
-1. html_skeleton is a CONCISE structural outline using ONLY classes from the CSS reference above
-   - Use HTML comments for content descriptions, not actual content
-   - Show the section/container/grid structure, not every element
-   - Keep it under 500 chars per page — this is a skeleton, not the final HTML
-
-2. component_patterns lists the reusable UI patterns each page uses (e.g. "hero-cta", "card-grid", "form-contact")
-   - Use consistent names across pages — if page 1 uses "card-grid", page 3 should too
-   - This creates a shared vocabulary that BUILD_PAGES will follow
-
-3. content_notes describes tone, content approach, and specific guidance per page
-   - What should the hero say? What data to highlight? What calls-to-action?
-   - Be specific: "3 testimonials with name, role, quote" not just "testimonials"
-
-4. data_display (only for pages with data tables) describes how to fetch and render API data
-   - Include the exact API endpoint path
-   - Describe the display pattern (table, card grid, list, detail view)
-
-5. shared_patterns defines reusable component structures used across multiple pages
-   - Reference actual CSS classes from the stylesheet
-   - Keep definitions short — just the HTML structure pattern
-
-6. content_style sets the overall writing tone for ALL pages
-   - Be specific about voice, sentence length, heading style
 `)
 
 	return b.String()
@@ -396,9 +252,16 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
 
 	var authProviderTables []string // tables with PASSWORD column → need create_auth
 	var authProtectedTables []string // tables without PASSWORD column but HasAuth → need requires_auth on API
+	var hasOAuth, hasRoles bool
 
 	b.WriteString("## Data Tables to Create\n\n")
 	for _, t := range plan.DataTables {
+		if len(t.HasOAuth) > 0 {
+			hasOAuth = true
+		}
+		if len(t.Roles) > 0 {
+			hasRoles = true
+		}
 		colJSON, _ := json.Marshal(t.Columns)
 		b.WriteString(fmt.Sprintf("### Table: %s\n", t.Name))
 		b.WriteString(fmt.Sprintf("Columns: %s\n", string(colJSON)))
@@ -417,7 +280,12 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
 				b.WriteString("**Needs auth endpoint (create_auth): YES** — this table has a PASSWORD column\n")
 				authProviderTables = append(authProviderTables, t.Name)
 			} else {
-				b.WriteString("Needs auth protection: yes — set requires_auth=true on its API endpoint\n")
+				if t.PublicRead {
+					b.WriteString("Needs auth protection: yes — set requires_auth=true AND public_read=true on its API endpoint\n")
+					b.WriteString("  (GET requests are public, POST/PUT/DELETE require auth)\n")
+				} else {
+					b.WriteString("Needs auth protection: yes — set requires_auth=true on its API endpoint\n")
+				}
 				authProtectedTables = append(authProtectedTables, t.Name)
 			}
 		}
@@ -440,9 +308,15 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
    - id and created_at are auto-added
 
 2. Create API endpoints using manage_endpoints(action="create_api")
-   - Set public_columns to exclude sensitive fields
-   - For auth-protected tables, set requires_auth=true
-   - Example: manage_endpoints(action="create_api", path="products", table_name="products", public_columns=["id", "title", "price", "created_at"])
+   - Set public_columns to exclude sensitive fields (NEVER expose password, email, or encrypted columns)
+   - **public_read rule** — ANY table whose data appears on public-facing pages MUST have public_read=true:
+     • User/profile tables (author names, avatars, profile pages)
+     • Content tables (blog posts, products, forum threads, reviews)
+     • Category/tag tables referenced by public listings
+     Without public_read, GET returns 401 for logged-out visitors and pages break.
+     Set requires_auth=true AND public_read=true → GET is public, POST/PUT/DELETE require auth.
+   - For fully private data (admin logs, private settings): set requires_auth=true only
+   - Example: manage_endpoints(action="create_api", path="users", table_name="users", requires_auth=true, public_read=true, public_columns=["id", "username", "avatar", "created_at"])
 
 3. Create auth endpoints using manage_endpoints(action="create_auth") ONLY for tables that have a PASSWORD column
    - Requires a username_column and password_column from the SAME table
@@ -504,7 +378,10 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
    - This creates POST /api/webhooks/{path} that validates the signature and stores events
    - Only create webhooks if the site actually integrates with external services that send them
 
-10. For OAuth (social login), after creating the auth endpoint:
+`)
+
+	if hasOAuth {
+		b.WriteString(`10. For OAuth (social login), after creating the auth endpoint:
    - Ask the site owner for ALL OAuth credentials in ONE question using structured fields:
      manage_communication(action="ask", question="Please provide OAuth credentials for the providers below.", context="Register apps at these URLs and set the callback URL to /api/{auth_path}/oauth/{provider}/callback\nGoogle: https://console.cloud.google.com\nGitHub: https://github.com/settings/developers\nDiscord: https://discord.com/developers", fields="[{\"name\":\"google_client_id\",\"label\":\"Google Client ID\",\"type\":\"text\"},{\"name\":\"google_client_secret\",\"label\":\"Google Client Secret\",\"type\":\"secret\",\"secret_name\":\"google_oauth_secret\"},{\"name\":\"github_client_id\",\"label\":\"GitHub Client ID\",\"type\":\"text\"},{\"name\":\"github_client_secret\",\"label\":\"GitHub Client Secret\",\"type\":\"secret\",\"secret_name\":\"github_oauth_secret\"}]")
    - Only include fields for providers the site actually needs (check the plan)
@@ -515,19 +392,25 @@ func buildDataLayerPrompt(plan *SitePlan, site *models.Site) string {
    - GitHub: authorize=https://github.com/login/oauth/authorize, token=https://github.com/login/oauth/access_token, userinfo=https://api.github.com/user, username_field="login"
    - Discord: authorize=https://discord.com/api/oauth2/authorize, token=https://discord.com/api/oauth2/token, userinfo=https://discord.com/api/users/@me, scopes="identify email"
 
-11. For role-based access control (RBAC):
+`)
+	}
+
+	if hasRoles {
+		b.WriteString(`11. For role-based access control (RBAC):
    - Include a "role" TEXT column in the user table schema
    - Set default_role on create_auth: manage_endpoints(action="create_auth", ..., default_role="user", role_column="role")
    - For admin-only API endpoints: manage_endpoints(action="create_api", ..., requires_auth=true, required_role="admin")
    - Role is embedded in the JWT token and checked automatically by the API middleware
+
 `)
+	}
 
 	return b.String()
 }
 
 // --- BUILD_PAGES (per-page) prompt ---
 
-func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription, tableSchema, svgAssets string, contentTerms, previousWarnings []string, blueprint *SiteBlueprint) string {
+func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSummary, cssClassMap, siteDescription, apiContract, authContract, svgAssets string, contentTerms, previousWarnings []string) string {
 	var b strings.Builder
 
 	b.WriteString("You are IATAN, an AI that builds web pages. Create ONE page using manage_pages.\n\n")
@@ -557,6 +440,7 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 	}
 	if len(page.Sections) > 0 {
 		b.WriteString(fmt.Sprintf("- Sections: %s\n", strings.Join(page.Sections, ", ")))
+		b.WriteString("  Use these names as id or class on your <section> elements (e.g. <section id=\"hero\">, <section class=\"features\">). The validator checks for these.\n")
 	}
 	if len(page.LinksTo) > 0 {
 		b.WriteString(fmt.Sprintf("- Links to: %s\n", strings.Join(page.LinksTo, ", ")))
@@ -571,11 +455,10 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 	b.WriteString(fmt.Sprintf("- Architecture: %s\n", plan.Architecture))
 	b.WriteString("\n")
 
-	// Compact CSS class reference instead of full stylesheet (~80% smaller).
+	// Compact CSS class reference — avoids sending full CSS to every page build.
 	if cssClassMap != "" {
-		b.WriteString("## Global CSS Reference\n")
-		b.WriteString(cssClassMap)
-		b.WriteString("\nUse the CSS classes above as your primary toolkit. If you need a page-specific style not covered by global CSS, create a page-scoped CSS file via manage_files(action=\"save\", storage=\"assets\", scope=\"page\") and list it in the page's assets array.\n\n")
+		b.WriteString("## CSS Class Reference (use ONLY these classes)\n")
+		b.WriteString(cssClassMap + "\n\n")
 	}
 
 	b.WriteString("## Layout\n")
@@ -593,40 +476,13 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 		b.WriteString("No SVG assets are available. Use CSS gradients, borders, and shapes for decorative elements. You can also create SVGs via manage_files(action=\"save\", storage=\"assets\") if needed.\n\n")
 	}
 
-	// Blueprint context: detailed page spec from BLUEPRINT_PAGES stage.
-	if blueprint != nil {
-		pageBP := blueprint.BlueprintForPage(page.Path)
-		if pageBP != nil {
-			b.WriteString("## Page Blueprint (use as structural guide — adapt freely)\n")
-			if pageBP.HTMLSkeleton != "" {
-				b.WriteString("HTML skeleton:\n```\n" + pageBP.HTMLSkeleton + "\n```\n")
-			}
-			if len(pageBP.ComponentPatterns) > 0 {
-				b.WriteString("Components: " + strings.Join(pageBP.ComponentPatterns, ", ") + "\n")
-			}
-			if pageBP.ContentNotes != "" {
-				b.WriteString("Content guidance: " + pageBP.ContentNotes + "\n")
-			}
-			if pageBP.DataDisplay != "" {
-				b.WriteString("Data display: " + pageBP.DataDisplay + "\n")
-			}
-			b.WriteString("\n")
-		}
-		if len(blueprint.SharedPatterns) > 0 {
-			b.WriteString("## Shared Component Patterns (use consistently across all pages)\n")
-			for name, pattern := range blueprint.SharedPatterns {
-				b.WriteString(fmt.Sprintf("- **%s**: %s\n", name, pattern))
-			}
-			b.WriteString("\n")
-		}
-		if blueprint.ContentStyle != "" {
-			b.WriteString("## Content Style\n" + blueprint.ContentStyle + "\n\n")
-		}
-	}
-
-	if tableSchema != "" {
-		b.WriteString("## Data Available (LIVE — already seeded with real data)\n")
-		b.WriteString(tableSchema + "\n\n")
+	if apiContract != "" && page.NeedsData {
+		b.WriteString("## API Reference (LIVE — already seeded with real data)\n")
+		b.WriteString(apiContract + "\n\n")
+	} else if authContract != "" {
+		// Pages without needs_data still need auth endpoints for login/signup forms.
+		b.WriteString("## Auth Endpoints (for login/register forms)\n")
+		b.WriteString(authContract + "\n\n")
 	}
 
 	if len(contentTerms) > 0 {
@@ -662,7 +518,9 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
    - No <nav>, <footer>, <html>, <head>, <body>, <main> tags
    - No <link> or <script> tags for shared assets (auto-injected by server)
    - No inline styles — use CSS classes from the global stylesheet above
-   - Use ONLY classes that exist in the stylesheet — do NOT invent new class names
+   - CRITICAL: Use ONLY CSS classes from the Global Stylesheet above. Before using any class, verify it exists in the stylesheet.
+     If you need a style not covered, create a page-scoped CSS file via manage_files(action="save", storage="assets", scope="page").
+     NEVER invent class names. The REVIEW stage flags every undefined class as a validation error.
    - Use semantic HTML: sections, articles, headings (h1 down)
    - Use CSS custom properties: var(--primary), var(--text), etc.
 
@@ -674,92 +532,63 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
    - Mobile-friendly: the CSS is mobile-first
 `)
 
-	if plan.Architecture == "spa" {
+	// Built-in JS runtime reference (App.*)
+	b.WriteString(`
+4. JavaScript Runtime (built-in — use these APIs, do NOT use raw fetch for /api/ calls):
+   // API calls (auth header automatically included if user is logged in):
+   App.fetch('/api/products')                                              // GET list → {data: [...], count, limit, offset}
+   App.fetch('/api/products/' + id)                                        // GET single
+   App.fetch('/api/products', {method:'POST', body: {title:'...'}})        // CREATE
+   App.fetch('/api/products/'+id, {method:'PUT', body: {title:'...'}})     // UPDATE
+   App.fetch('/api/products/'+id, {method:'DELETE'})                       // DELETE
+`)
+
+	if authContract != "" || (apiContract != "" && (strings.Contains(apiContract, "[AUTH]") || strings.Contains(apiContract, "/login"))) {
 		b.WriteString(`
-4. SPA Rules:
-   - Inline <script> must be wrapped in an IIFE: (function(){ ... })();
-   - Add data-page-asset attribute to inline scripts: <script data-page-asset>(function(){ ... })();</script>
-     This allows the SPA router to clean them up during navigation.
-   - The router handles navigation — just use normal <a href="/path"> links
-   - Use window.AppState for shared state across pages:
-     - AppState.set('auth:token', token) after login
-     - AppState.get('auth:token') to check auth state
-     - AppState.on('auth:token', function(token){ ... }) to react to auth changes
-     - AppState.on('navigate', function(path){ /* cleanup */ }) for page teardown
+   // Auth — App.auth appends /login and /register automatically.
+   // IMPORTANT: pass the BASE path only (see "Auth base path" in the API Reference above).
+   //   CORRECT:   App.auth.register('/api/auth', {...})
+   //   WRONG:     App.auth.register('/api/auth/register', {...})  ← doubled path!
+   App.auth.login('/api/{auth_path}', {email:'...', password:'...'})       // → POST /api/{auth_path}/login
+   App.auth.register('/api/{auth_path}', {email:'...', password:'...'})    // → POST /api/{auth_path}/register
+   App.auth.logout()                  // clears token
+   App.auth.isLoggedIn()              // boolean
+   App.auth.getRole()                 // reads role from JWT ('admin', 'user', etc.)
+   App.auth.onAuthChange(fn)          // called on login/logout
+   // OAuth: just link to /api/{auth_path}/oauth/{provider} — token captured automatically
 `)
 	}
 
-	if page.NeedsData && tableSchema != "" {
+	if plan.Architecture == "spa" {
 		b.WriteString(`
-5. Data Integration (CRITICAL):
-   - The API endpoint above is LIVE and contains real seed data — use it directly
-   - Do NOT use placeholder data, mock arrays, or TODO comments — fetch from the real API
-   - Use fetch() with the exact endpoint path shown in "Data Available" above
-   - Response format: GET /api/{path} → {"data":[...],"count":N,"limit":N,"offset":N}
-   - Single item: GET /api/{path}/{id} → bare object
-   - Filtering: /api/{path}?column=value&sort=column&order=asc|desc
-   - Aggregation: GET /api/{path}/_stats?fn=count|sum|avg|min|max&column=col&group_by=col1,col2&filter_col=value
-     Returns: {"function":"count","result":42} or with group_by: {"function":"count","data":[{"category":"A","result":10},...]}
-   - File upload: POST /api/{path}/upload with multipart/form-data, field "file"
-     Returns: {"url":"/files/uploads/...","filename":"orig.png","size":1234,"type":"image/png"}
-   - Real-time SSE: const source = new EventSource('/api/{path}/stream');
-     source.addEventListener('data.insert', (e) => { const data = JSON.parse(e.data); /* new row */ });
-     Events: data.insert, data.update, data.delete — each has {table, id} payload
-   - Real-time WebSocket: const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/{path}/ws');
-     ws.onmessage = (e) => { const msg = JSON.parse(e.data); /* handle event */ };
-     ws.send(JSON.stringify({...}));  // send data to server
-     Use SSE for one-way feeds, WebSocket for bidirectional (chat, collaboration)
-   - Example: fetch('/api/articles').then(r=>r.json()).then(res => { res.data.forEach(item => { ... }) })
-   - Always handle loading states and empty states
-   - Pagination: fetch('/api/items?limit=10&offset=0'), then increment offset by res.data.length; hide "load more" when res.data.length < limit
-   - If you create a JS asset file (via manage_files), it MUST use the real API endpoint — no placeholders or TODOs
-`)
+   // State (share data between pages):
+   App.set('cart:items', items)       // set + notify listeners
+   App.get('cart:items')              // read
+   App.on('cart:items', fn)           // subscribe to changes
 
-		// Add auth instructions if any endpoint requires auth.
-		if strings.Contains(tableSchema, "REQUIRES AUTH") || strings.Contains(tableSchema, "Auth endpoint") {
-			b.WriteString(`
-6. Auth-Protected Endpoints (CRITICAL):
-   - Endpoints marked "REQUIRES AUTH" return 401 without a valid JWT token
-   - Store the JWT token in localStorage after login: localStorage.setItem('token', data.token)
-   - Include it in every fetch to protected endpoints:
-     fetch('/api/path', { headers: { 'Authorization': 'Bearer ' + localStorage.getItem('token') } })
-   - If fetch returns 401, redirect the user to the login page
-   - The login flow: POST /api/{auth_path}/login — see "Login/register JSON field" in Data Available above for the exact JSON key
-   - Registration: POST /api/{auth_path}/register with the same JSON body format
-   - CRITICAL: The JSON key for login/register MUST match the field name shown above (e.g. "email" not "username", unless the field IS "username")
-   - Check if user is logged in before showing protected content
+   // Navigation: App.navigate('/about') or just use <a href="/about">
+   // SPA page scripts: wrap in IIFE with data-page-asset:
+   // <script data-page-asset>(function(){ ... })();</script>
 `)
-		}
-		if strings.Contains(tableSchema, "OAuth:") {
-			b.WriteString(`
-6b. OAuth / Social Login:
-   - Add OAuth buttons as simple <a> links (the server handles the redirect):
-     <a href="/api/{auth_path}/oauth/google" class="btn btn-oauth">Continue with Google</a>
-   - After OAuth callback, the server redirects to /?token={jwt}
-   - Capture the token from the URL on page load:
-     const params = new URLSearchParams(window.location.search);
-     const token = params.get('token');
-     if (token) { localStorage.setItem('auth_token', token); window.history.replaceState({}, '', '/'); }
-   - Place OAuth buttons above the regular login form with a divider ("or")
-`)
-		}
-		if strings.Contains(tableSchema, "Roles:") {
-			b.WriteString(`
-6c. Role-Based UI:
-   - Read the user's role from the JWT payload for conditional UI:
-     function getUserRole() { const t = localStorage.getItem('auth_token'); if (!t) return null; try { return JSON.parse(atob(t.split('.')[1])).role; } catch { return null; } }
-   - Show/hide admin sections based on role (display-only, API enforces the real check)
-   - Example: if (getUserRole() === 'admin') document.querySelector('.admin-panel')?.classList.remove('hidden');
-`)
-		}
 	}
 
 	b.WriteString(`
-7. Functional completeness:
-   - Every interactive element must work when clicked/submitted
-   - Example: do NOT add a "Forgot Password" link unless you implement the reset flow
-   - Example: do NOT add a "Search" input unless you implement the search functionality
-   - If a feature is beyond scope, either leave it out entirely or mark it as "Coming Soon" with the element visually disabled (e.g. a muted button with no click handler)
+   Use EXACT endpoint paths from the API Reference. Do NOT invent URLs. Do NOT use raw fetch() for /api/ calls — use App.fetch().
+   Always handle loading and empty states. Pagination: offset += res.data.length; hide "load more" when res.data.length < limit.
+
+   Auth-aware data loading:
+   - [AUTH] endpoints return 401 if not logged in. NEVER call them without checking App.auth.isLoggedIn() first.
+   - [AUTH] [PUBLIC_READ] endpoints allow GET without auth (anyone can read), but POST/PUT/DELETE require auth.
+     → Safe to call for reading data on public pages. Gate write operations behind App.auth.isLoggedIn().
+   - On public pages (homepage, listing pages), ONLY use [PUBLIC_READ] endpoints or non-auth endpoints for data.
+   - If a page needs auth-only data, check App.auth.isLoggedIn() first and show a login prompt if not authenticated.
+`)
+
+	b.WriteString(`
+5. Functional completeness:
+   - Only include interactive elements you can implement with available API endpoints
+   - If no endpoint exists for a feature, omit the feature entirely — do NOT stub it or mark it "Coming Soon"
+   - Every button, link, and form on the page must be fully functional
 `)
 
 	return b.String()
@@ -767,7 +596,7 @@ func buildPagePrompt(page PagePlan, plan *SitePlan, allPaths []string, layoutSum
 
 // --- REVIEW stage prompt ---
 
-func buildReviewPrompt(issues []string, siteDB *sql.DB, plan *SitePlan) string {
+func buildReviewPrompt(issues []string, siteDB *sql.DB, plan *SitePlan, cssClassMap string) string {
 	var b strings.Builder
 
 	b.WriteString("You are IATAN, an AI that reviews and fixes websites. Fix the issues listed below.\n\n")
@@ -802,6 +631,11 @@ func buildReviewPrompt(issues []string, siteDB *sql.DB, plan *SitePlan) string {
 		}
 	}
 	if hasCSSIssues {
+		if cssClassMap != "" {
+			b.WriteString("## Available CSS Classes (use ONLY these — do not invent new ones)\n")
+			b.WriteString(cssClassMap)
+			b.WriteString("\n\n")
+		}
 		cssContent := loadGlobalCSS(siteDB)
 		if cssContent != "" {
 			b.WriteString("## Global Stylesheet (for reference)\n```css\n")
@@ -826,6 +660,7 @@ func buildReviewPrompt(issues []string, siteDB *sql.DB, plan *SitePlan) string {
 - Don't change the design system
 - You may create missing pages if they are referenced by links or navigation
 - When fixing CSS issues, prefer updating HTML to use existing CSS classes rather than adding new ones
+- Every section from the page plan should be present in the page HTML — if a planned section is missing, add it
 `)
 
 	return b.String()
@@ -895,19 +730,11 @@ func buildChatWakePrompt(site *models.Site, siteDB *sql.DB, userMessage string) 
 		b.WriteString(manifest)
 	}
 
-	// Only include CSS when the message is about styling (saves ~500-1500 tokens).
-	lowerMsg := strings.ToLower(userMessage)
-	needsCSS := strings.Contains(lowerMsg, "css") || strings.Contains(lowerMsg, "style") ||
-		strings.Contains(lowerMsg, "color") || strings.Contains(lowerMsg, "font") ||
-		strings.Contains(lowerMsg, "design") || strings.Contains(lowerMsg, "theme") ||
-		strings.Contains(lowerMsg, "layout") || strings.Contains(lowerMsg, "look")
-	if needsCSS {
-		cssContent := loadGlobalCSS(siteDB)
-		if cssContent != "" {
-			b.WriteString("## Global Stylesheet\n```css\n")
-			b.WriteString(cssContent)
-			b.WriteString("\n```\n\n")
-		}
+	// Always include compact CSS class map so the LLM can reference styles for any fix.
+	cssClassMap := extractCSSClassMap(loadGlobalCSS(siteDB))
+	if cssClassMap != "" {
+		b.WriteString("## CSS Class Reference\n")
+		b.WriteString(cssClassMap + "\n\n")
 	}
 
 	b.WriteString(`## Instructions
@@ -994,7 +821,7 @@ func buildDataLayerFixupPrompt(issues []string, plan *SitePlan) string {
 	if len(plan.DataTables) > 0 {
 		b.WriteString("\n## Table Schemas (from plan)\n")
 		for _, t := range plan.DataTables {
-			b.WriteString(fmt.Sprintf("### %s (has_api=%v, has_auth=%v)\n", t.Name, t.HasAPI, t.HasAuth))
+			b.WriteString(fmt.Sprintf("### %s (has_api=%v, has_auth=%v, public_read=%v)\n", t.Name, t.HasAPI, t.HasAuth, t.PublicRead))
 			for _, c := range t.Columns {
 				b.WriteString(fmt.Sprintf("  - %s %s", c.Name, c.Type))
 				if c.Required {
