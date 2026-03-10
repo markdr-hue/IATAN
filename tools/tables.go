@@ -385,14 +385,18 @@ func (t *SchemaTool) describe(ctx *ToolContext, args map[string]interface{}) (*R
 		return &Result{Success: false, Error: err.Error()}, nil
 	}
 
+	// Load secure columns FIRST — before opening the PRAGMA cursor.
+	// ctx.DB has MaxOpenConns=1; opening a cursor and then querying
+	// the same pool deadlocks (the QueryRow blocks waiting for the
+	// connection held by the open rows cursor).
+	secureCols, _ := loadSecureColumns(ctx, tableName)
+
 	// Get column info via PRAGMA.
 	rows, err := ctx.DB.Query(fmt.Sprintf("PRAGMA table_info(%s)", physicalName))
 	if err != nil {
 		return nil, fmt.Errorf("describing table: %w", err)
 	}
 	defer rows.Close()
-
-	secureCols, _ := loadSecureColumns(ctx, tableName)
 
 	var columns []map[string]interface{}
 	for rows.Next() {

@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/markdr-hue/IATAN/llm"
 )
@@ -58,7 +59,7 @@ func New(name, apiKey string, opts ...Option) *Client {
 		name:       name,
 		apiKey:     apiKey,
 		endpoint:   defaultEndpoint,
-		httpClient: http.DefaultClient,
+		httpClient: &http.Client{Timeout: 6 * time.Minute},
 	}
 	for _, o := range opts {
 		o(c)

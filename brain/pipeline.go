@@ -27,6 +27,7 @@ const (
 	idleThreshold         = 3
 	maxStageRetries       = 3
 	llmTimeout            = 5 * time.Minute
+	toolTimeout           = 2 * time.Minute
 )
 
 // PipelineWorker is a goroutine that autonomously builds a site using a
@@ -578,7 +579,9 @@ func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.T
 			Encryptor: w.deps.Encryptor,
 		}
 
-		result, toolErr := w.deps.ToolExecutor.Execute(ctx, toolCtx, tc.Name, args)
+		toolExecCtx, toolCancel := context.WithTimeout(ctx, toolTimeout)
+		result, toolErr := w.deps.ToolExecutor.Execute(toolExecCtx, toolCtx, tc.Name, args)
+		toolCancel()
 		if toolErr != nil {
 			w.logger.Error("tool failed", "tool", tc.Name, "error", toolErr)
 			result = fmt.Sprintf(`{"error": "tool %s failed: %s"}`, tc.Name, toolErr.Error())
