@@ -54,7 +54,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			},
 			"table_name": map[string]interface{}{
 				"type":        "string",
-				"description": "Dynamic table to map to (must already exist)",
+				"description": "Dynamic table to map to (must already exist). Required for create_api, create_auth, and verify_password.",
 			},
 			"methods": map[string]interface{}{
 				"type":        "array",
@@ -68,7 +68,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			},
 			"requires_auth": map[string]interface{}{
 				"type":        "boolean",
-				"description": "If true, API requests must include a valid bearer token (default: false). Only for create_api.",
+				"description": "If true, requests must include a valid bearer token (default: false). For create_api, create_upload, and create_stream.",
 			},
 			"public_read": map[string]interface{}{
 				"type":        "boolean",

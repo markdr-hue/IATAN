@@ -221,6 +221,7 @@ func (t *FilesTool) Parameters() map[string]interface{} {
 			"old_filename": map[string]interface{}{"type": "string", "description": "Current filename (rename)"},
 			"new_filename": map[string]interface{}{"type": "string", "description": "New filename (rename)"},
 			"version":      map[string]interface{}{"type": "integer", "description": "Version number to restore (rollback)"},
+			"limit":        map[string]interface{}{"type": "number", "description": "Max entries to return (for history action, default: 10)"},
 		},
 		"required": []string{"action"},
 	}

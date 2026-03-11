@@ -131,7 +131,7 @@ type SchemaTool struct{}
 
 func (t *SchemaTool) Name() string { return "manage_schema" }
 func (t *SchemaTool) Description() string {
-	return "Manage dynamic table schemas. Actions: create (create table), alter (add/drop columns), describe (show columns), list (list tables), drop (delete table and related endpoints). Note: 'id' and 'created_at' columns are auto-added — do NOT include them in your column definitions."
+	return "Manage dynamic table schemas. Actions: create (create table), alter (add/drop columns), describe (show columns), list (list tables), drop (delete table and related endpoints — requires owner approval). Dropping columns via alter also requires owner approval. Note: 'id' and 'created_at' columns are auto-added — do NOT include them in your column definitions."
 }
 func (t *SchemaTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -559,7 +559,7 @@ type DataTool struct{}
 
 func (t *DataTool) Name() string { return "manage_data" }
 func (t *DataTool) Description() string {
-	return "Manage dynamic table data. Actions: query (select rows), insert (single row via 'data' or bulk via 'rows' array), update (by id), delete (by id), count, aggregate (sum/avg/min/max with optional group_by). PASSWORD columns are auto-hashed, ENCRYPTED columns are auto-encrypted."
+	return "Manage dynamic table data. Actions: query (select rows), insert (single row via 'data' or bulk via 'rows' array, max 100 rows per call), update (by id), delete (by id), count, aggregate (sum/avg/min/max with optional group_by). PASSWORD columns are auto-hashed on insert and never returned in query results — use manage_endpoints verify_password to check credentials. ENCRYPTED columns are auto-encrypted. Query returns max 50 rows by default (specify limit to override)."
 }
 func (t *DataTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -594,7 +594,7 @@ func (t *DataTool) Parameters() map[string]interface{} {
 					"direction": map[string]interface{}{"type": "string", "enum": []string{"ASC", "DESC"}},
 				},
 			},
-			"limit": map[string]interface{}{"type": "number", "description": "Maximum number of rows for query"},
+			"limit": map[string]interface{}{"type": "number", "description": "Maximum number of rows for query (default: 50)"},
 			"data": map[string]interface{}{
 				"type":        "object",
 				"description": "Key-value pairs for single-row insert/update",

@@ -453,9 +453,15 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 		iteration = i
 
 		// Compress tool results the LLM has already seen to save context tokens.
+		// Exempt schema and endpoint results — their outputs contain column names
+		// and paths that are needed for correct JS/page code in later iterations.
 		if i > 0 {
 			for j := 0; j < seenUpTo; j++ {
 				if messages[j].Role == llm.RoleTool && len(messages[j].Content) > 500 {
+					// Check if this is a schema or endpoint result worth preserving.
+					if len(messages[j].Content) <= 2000 && (strings.Contains(messages[j].Content, "schema_def") || strings.Contains(messages[j].Content, "endpoint")) {
+						continue
+					}
 					messages[j].Content = truncate(messages[j].Content, 300)
 				}
 			}
@@ -550,7 +556,7 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 	return
 }
 
-// callLLM makes a single LLM call without tools (used by PLAN stage).
+// callLLM makes a single LLM call without tools (used by ANALYZE/BLUEPRINT stages).
 func (w *PipelineWorker) callLLM(ctx context.Context, provider llm.Provider, modelID, systemPrompt, userMessage string, maxTokens int) (string, int, error) {
 	llmLogger := llm.NewDBLLMLogger(w.siteDB.Writer())
 	iteration := 0
@@ -558,15 +564,41 @@ func (w *PipelineWorker) callLLM(ctx context.Context, provider llm.Provider, mod
 
 	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
 
-	llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
-	defer llmCancel()
-
-	resp, err := loggedProvider.Complete(llmCtx, llm.CompletionRequest{
-		Model:     modelID,
-		System:    systemPrompt,
-		Messages:  messages,
-		MaxTokens: maxTokens,
-	})
+	var resp *llm.CompletionResponse
+	var err error
+	for attempt := 0; attempt < maxLLMRetries; attempt++ {
+		llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
+		resp, err = loggedProvider.Complete(llmCtx, llm.CompletionRequest{
+			Model:       modelID,
+			System:      systemPrompt,
+			Messages:    messages,
+			MaxTokens:   maxTokens,
+			CacheSystem: true,
+		})
+		llmCancel()
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		errMsg := err.Error()
+		isRateLimit := strings.Contains(errMsg, "API error 429") ||
+			strings.Contains(errMsg, "API error 529") ||
+			strings.Contains(errMsg, "overloaded")
+		var backoff time.Duration
+		if isRateLimit {
+			backoff = time.Duration(15*(attempt+1)) * time.Second
+			w.logger.Warn("callLLM rate limited, backing off", "attempt", attempt, "backoff", backoff)
+		} else {
+			backoff = time.Duration(2*(attempt+1)) * time.Second
+			w.logger.Warn("callLLM failed, retrying", "attempt", attempt, "error", err, "backoff", backoff)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(backoff):
+		}
+	}
 	if err != nil {
 		return "", 0, err
 	}
@@ -720,15 +752,15 @@ func toolProgressMessage(toolName string, args map[string]interface{}) string {
 			return fmt.Sprintf("Saved layout: **%s**", name)
 		}
 	// manage_pages excluded — BUILD_PAGES stage has its own per-page messages.
-	case "manage_tables":
-		table, _ := args["table"].(string)
+	case "manage_schema":
+		table, _ := args["table_name"].(string)
 		if action == "create" && table != "" {
 			return fmt.Sprintf("Created table: **%s**", table)
 		}
 	case "manage_endpoints":
-		table, _ := args["table"].(string)
-		if action == "create" && table != "" {
-			return fmt.Sprintf("Created API endpoint: **/api/%s**", table)
+		path, _ := args["path"].(string)
+		if strings.HasPrefix(action, "create_") && path != "" {
+			return fmt.Sprintf("Created endpoint: **/api/%s** (%s)", path, action)
 		}
 	}
 	return ""

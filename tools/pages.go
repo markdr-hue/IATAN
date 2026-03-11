@@ -236,7 +236,7 @@ func (t *PagesTool) patch(ctx *ToolContext, args map[string]interface{}) (*Resul
 			notFound = append(notFound, p.Search)
 			continue
 		}
-		modified = strings.Replace(modified, p.Search, p.Replace, 1)
+		modified = strings.ReplaceAll(modified, p.Search, p.Replace)
 		if len(p.Search) > 60 {
 			applied = append(applied, p.Search[:60]+"...")
 		} else {

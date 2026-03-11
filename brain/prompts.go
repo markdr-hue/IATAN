@@ -80,6 +80,7 @@ func buildPlatformCapabilitiesRef() string {
 - GET /api/page?path=/foo returns {content, title, layout, page_css, page_js, params}.
 - Useful for building client-side routers that load page content without full page reloads.
 - page_css and page_js contain URLs of page-scoped assets to load dynamically.
+- SPA router requirements: (1) intercept internal link clicks, (2) call GET /api/page?path=X, (3) replace <main> innerHTML with response content, (4) load page_css/page_js dynamically and remove previous page's scripts, (5) update document.title, (6) handle popstate for browser back/forward.
 
 ### Email (manage_email tool)
 - Configure provider (sendgrid, mailgun, resend, ses, generic), then send or save templates.
@@ -119,7 +120,8 @@ func buildPlatformCapabilitiesRef() string {
 - Register external service providers with base_url and authentication credentials.
 - Used by email and payment tools to make authenticated API calls to external services.
 - Auth types: bearer (API key in Authorization header), api_key_header (custom header), basic (username:password), none.
-- Example: manage_providers(action="add", name="sendgrid", base_url="https://api.sendgrid.com", auth_type="bearer", api_key="SG.xxx")
+- Store API keys first with manage_secrets, then reference by name.
+- Example: manage_providers(action="add", name="sendgrid", base_url="https://api.sendgrid.com", auth_type="bearer", secret_name="sendgrid_api_key")
 
 ### OAuth (manage_endpoints tool, action: create_oauth)
 - Add social login (Google, GitHub, etc.) to an existing auth endpoint.
@@ -150,16 +152,16 @@ func buildAnalyzePrompt(site *models.Site, ownerName, answers string) string {
 	b.WriteString("## Site Info\n")
 	b.WriteString(fmt.Sprintf("- Name: %s\n", site.Name))
 	if site.Description != nil && *site.Description != "" {
-		b.WriteString(fmt.Sprintf("- Description: <user_input>%s</user_input>\n", *site.Description))
+		b.WriteString(fmt.Sprintf("- Description: \"%s\"\n", *site.Description))
 	}
 	if site.Direction != nil && *site.Direction != "" {
-		b.WriteString(fmt.Sprintf("- Owner Direction: <user_input>%s</user_input>\n", *site.Direction))
+		b.WriteString(fmt.Sprintf("- Owner Direction: \"%s\"\n", *site.Direction))
 	}
 	b.WriteString("\n")
 
 	if answers != "" {
 		b.WriteString("## Owner's Answers to Your Questions\n")
-		b.WriteString(fmt.Sprintf("<user_input>%s</user_input>\n\n", answers))
+		b.WriteString(fmt.Sprintf("\"%s\"\n\n", answers))
 	}
 
 	b.WriteString(buildPlatformCapabilitiesRef())
@@ -263,13 +265,21 @@ Analyze what the user wants and produce a JSON Analysis object. Focus on BEHAVIO
 7. Scheduled tasks: if the site needs periodic automation (daily emails, data cleanup, sync), define scheduled_tasks.
    - Include cron_expression or interval_seconds.
    - If no tasks needed, omit scheduled_tasks or leave empty.
-8. design_mood: a brief creative direction (2-4 words) that captures the visual feel.
+8. design_mood: a brief creative direction (2-4 words) that captures the visual feel. Common archetypes: corporate-clean, playful-colorful, dark-moody, minimal-elegant, retro-vintage, tech-modern, organic-natural, bold-editorial. You can combine or invent your own.
 9. Questions: only ask if the description is too vague to determine core behaviors. Keep to 2-3 max.
 10. Architecture — decide based on user intent:
    - "multi-page": traditional websites with multiple HTML pages and full page loads. DEFAULT for most sites.
    - "spa": app-like sites with client-side routing and shared state between views. For dashboards, chat apps, tools.
    - "single-page": everything on ONE page with no navigation. For landing pages, calculators, single-screen tools.
    - When in doubt, choose "multi-page".
+
+## Required Fields
+All of these MUST be present in your output:
+- app_type (string), architecture ("spa"|"multi-page"|"single-page"), core_behaviors (string array),
+  requires_auth (bool), auth_strategy ("jwt"|"localStorage-only"|"none"), design_mood (string)
+
+## Optional Fields (default to empty array if omitted)
+- realtime_needs, data_needs, webhook_needs, scheduled_tasks, exclusions, questions
 `)
 
 	return b.String()
@@ -286,10 +296,10 @@ func buildBlueprintPrompt(analysis *Analysis, site *models.Site) string {
 	b.WriteString("## Site Info\n")
 	b.WriteString(fmt.Sprintf("- Name: %s\n", site.Name))
 	if site.Description != nil && *site.Description != "" {
-		b.WriteString(fmt.Sprintf("- About: <user_input>%s</user_input>\n", *site.Description))
+		b.WriteString(fmt.Sprintf("- About: \"%s\"\n", *site.Description))
 	}
 	if site.Direction != nil && *site.Direction != "" {
-		b.WriteString(fmt.Sprintf("- Owner Direction: <user_input>%s</user_input>\n", *site.Direction))
+		b.WriteString(fmt.Sprintf("- Owner Direction: \"%s\"\n", *site.Direction))
 	}
 	b.WriteString("\n")
 
@@ -363,6 +373,7 @@ Transform the Analysis into a complete Blueprint. This is the build spec that dr
    - All hex values (#rrggbb)
 4. Google Fonts that match the design mood.
 5. Typography scale: 1.0-2.0 (tighter for dense UIs, wider for editorial).
+5b. Optional: include "design_tokens": {"border_radius": "8px", "spacing_unit": "8px", "shadow": "soft|hard|none", "density": "compact|comfortable|spacious"} for consistent visual feel across builds.
 6. data_tables: map from Analysis.data_needs. IMPORTANT: use "name" (not "table_name") for the table name field.
    - Each entry MUST have a non-empty "name", "purpose", and at least one column.
    - Column types: TEXT, INTEGER, REAL, BOOLEAN, PASSWORD, ENCRYPTED.
@@ -371,7 +382,7 @@ Transform the Analysis into a complete Blueprint. This is the build spec that dr
    - endpoint.action must be one of: create_api, create_auth, create_websocket, create_stream, create_upload.
    - Do NOT create endpoints not implied by the Analysis.
    - Respect Analysis.exclusions — if "no auth endpoints" is listed, do NOT add create_auth endpoints.
-8. Pages: include tech_notes for EVERY page. Tech_notes should be specific technical instructions:
+8. Pages: include tech_notes for pages with API calls, state management, or complex interactions. Keep minimal or omit for simple static pages. Tech_notes should be specific technical instructions:
    - Which API endpoints to call and how
    - How to handle state and navigation
    - What NOT to do (e.g., "do NOT navigate to separate pages for each channel")
@@ -380,6 +391,17 @@ Transform the Analysis into a complete Blueprint. This is the build spec that dr
 11. Webhooks: map from Analysis.webhook_needs. Include name, direction, url (outgoing), and event_types.
 12. Scheduled tasks: map from Analysis.scheduled_tasks. Write a clear prompt that tells the brain what to do when the task fires.
 13. Keep pages minimal. Most single-purpose apps need 2-3 pages.
+
+## Required Fields
+All of these MUST be present in your output:
+- app_type, auth_strategy, architecture, color_scheme (object with primary/secondary/accent/background/surface/text/text_muted),
+  typography (object with heading_font/body_font/scale), pages (array, at least one at "/"), nav_items (array)
+
+## Required if applicable (include if Analysis has corresponding data)
+- endpoints (from Analysis.data_needs + realtime_needs), data_tables (from Analysis.data_needs)
+
+## Optional (default to empty if omitted)
+- exclusions, webhooks, scheduled_tasks, questions, design_notes
 `)
 
 	return b.String()
@@ -397,10 +419,10 @@ func buildBuildPrompt(bp *Blueprint, site *models.Site) string {
 	b.WriteString("## Site Context\n")
 	b.WriteString(fmt.Sprintf("- Name: %s\n", site.Name))
 	if site.Description != nil && *site.Description != "" {
-		b.WriteString(fmt.Sprintf("- About: <user_input>%s</user_input>\n", *site.Description))
+		b.WriteString(fmt.Sprintf("- About: \"%s\"\n", *site.Description))
 	}
 	if site.Direction != nil && *site.Direction != "" {
-		b.WriteString(fmt.Sprintf("- Owner Direction: <user_input>%s</user_input>\n", *site.Direction))
+		b.WriteString(fmt.Sprintf("- Owner Direction: \"%s\"\n", *site.Direction))
 	}
 	b.WriteString(fmt.Sprintf("- Auth strategy: %s\n", bp.AuthStrategy))
 	b.WriteString(fmt.Sprintf("- Architecture: %s\n", bp.Architecture))
@@ -483,6 +505,7 @@ Execute in this order:
    - assets: '["pagename.js"]' to load page-scoped JS
    - Page content is HTML only — all JS lives in external files
    - Read each page's tech_notes for specific technical instructions
+   - To fix specific parts of existing pages later, use manage_pages(action="patch", patches=[{"search":"old","replace":"new"}]) instead of rewriting the full page
 `)
 
 	// Page-specific instructions from TechNotes.
@@ -524,13 +547,13 @@ Execute in this order:
 		b.WriteString(" — use the auth endpoints (POST /api/{path}/login, /register, GET /me) for authentication flows.")
 	}
 	b.WriteString(`
-5. Write real content — no lorem ipsum or placeholder text.
+5. Write real content — no lorem ipsum or placeholder text. Match content tone to the site's purpose (professional for business, conversational for community, authoritative for educational). Use specific, relevant examples rather than generic statements.
 6. Accessible: alt text, ARIA labels, proper heading hierarchy, focus styles.
 7. Every button, link, and form must be FULLY FUNCTIONAL with available endpoints. Do NOT stub features.
 8. For page-scoped assets: save with manage_files(scope="page"), then list in manage_pages assets param.
 9. Parameterized routes: the server injects window.__routeParams for /path/:param routes.
 10. JavaScript MUST be in external .js files, not inline. The platform validates .js files for syntax errors — inline scripts bypass validation and are a common source of bugs.
-11. After completing Steps 1-3 (data layer, CSS, layout), list all created endpoint paths and table names before building JS/pages. This ensures you reference correct API paths in your code.
+11. Reference the exact endpoint paths and table names from tool results when writing JS and page code. Do NOT output a summary list — use the paths directly from the tool responses.
 12. For SPA architecture: build your own client-side router in a global .js file. Use History API (pushState/popstate). The server provides a JSON API at GET /api/page?path=X returning {content, title, layout, page_css, page_js, params} — use this for SPA page loading.
 `)
 
@@ -542,7 +565,7 @@ Execute in this order:
 func buildValidateFixupPrompt(issues []string, bp *Blueprint, site *models.Site) string {
 	var b strings.Builder
 
-	b.WriteString("You are IATAN. The build completed but some blueprint items are missing. Create them now.\n\n")
+	b.WriteString("You are IATAN. The build completed but some blueprint items are missing. Create ONLY the missing items — do NOT modify, improve, or re-read existing items.\n\n")
 	b.WriteString(fmt.Sprintf("Current date: %s\n\n", time.Now().UTC().Format("2006-01-02")))
 
 	if site != nil {
@@ -663,7 +686,7 @@ func buildUpdateBlueprintPrompt(existingBP *Blueprint, site *models.Site, change
 		b.WriteString("## Site\n")
 		b.WriteString(fmt.Sprintf("- Name: %s\n", site.Name))
 		if site.Description != nil && *site.Description != "" {
-			b.WriteString(fmt.Sprintf("- About: <user_input>%s</user_input>\n", *site.Description))
+			b.WriteString(fmt.Sprintf("- About: \"%s\"\n", *site.Description))
 		}
 		b.WriteString("\n")
 	}
@@ -855,6 +878,19 @@ func buildScheduledTaskPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 		b.WriteString("## CSS Reference\n```css\n")
 		b.WriteString(css)
 		b.WriteString("\n```\n\n")
+	}
+
+	// Include exclusions from blueprint if available.
+	var bpJSON sql.NullString
+	siteDB.QueryRow("SELECT blueprint_json FROM pipeline_state WHERE id = 1").Scan(&bpJSON)
+	if bpJSON.Valid && bpJSON.String != "" {
+		if bp, err := ParseBlueprint(bpJSON.String); err == nil && len(bp.Exclusions) > 0 {
+			b.WriteString("## Exclusions — do NOT create these\n")
+			for _, ex := range bp.Exclusions {
+				b.WriteString("- " + ex + "\n")
+			}
+			b.WriteString("\n")
+		}
 	}
 
 	b.WriteString(buildPlatformCapabilitiesRef())
