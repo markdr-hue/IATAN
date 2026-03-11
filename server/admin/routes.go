@@ -62,7 +62,7 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 	siteWebhooksH := &SiteWebhooksHandler{deps: deps}
 	siteAuthEndpointsH := &SiteAuthEndpointsHandler{deps: deps}
 	siteSecretsH := &SiteSecretsHandler{deps: deps}
-	siteMemoryH := &SiteMemoryHandler{deps: deps}
+
 	siteLayoutsH := &SiteLayoutsHandler{deps: deps}
 	siteAnalyticsH := &SiteAnalyticsHandler{deps: deps}
 	siteDiagH := &SiteDiagnosticsHandler{deps: deps}
@@ -121,7 +121,7 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 				r.Get("/service-providers", svcProviders.List)
 				r.Get("/auth-endpoints", siteAuthEndpointsH.List)
 				r.Get("/secrets", siteSecretsH.List)
-				r.Get("/memory", siteMemoryH.List)
+
 				r.Get("/layouts", siteLayoutsH.List)
 				r.Get("/layouts/{layoutID}", siteLayoutsH.Get)
 				r.Get("/analytics/summary", siteAnalyticsH.Summary)
@@ -153,7 +153,7 @@ func RegisterRoutes(r chi.Router, deps *Deps, adminFS fs.FS) {
 					r.Delete("/pages/{pageID}", sitePagesH.Delete)
 					r.Delete("/auth-endpoints/{endpointID}", siteAuthEndpointsH.Delete)
 					r.Delete("/secrets/{secretID}", siteSecretsH.Delete)
-					r.Delete("/memory/{memoryID}", siteMemoryH.Delete)
+
 					r.Delete("/layouts/{layoutID}", siteLayoutsH.Delete)
 					r.Post("/service-providers/{provID}/toggle", svcProviders.Toggle)
 					r.Delete("/service-providers/{provID}", svcProviders.Delete)

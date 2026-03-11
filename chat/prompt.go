@@ -78,23 +78,6 @@ func BuildChatSystemPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 	// Data layer — API endpoints, WebSocket, SSE, uploads.
 	sb.WriteString(BuildDataLayerSummary(siteDB))
 
-	// Memory keys (just keys for awareness, not full values).
-	if rows, err := siteDB.Query("SELECT key FROM memory ORDER BY updated_at DESC LIMIT 10"); err == nil {
-		defer rows.Close()
-		var keys []string
-		for rows.Next() {
-			var key string
-			if rows.Scan(&key) == nil {
-				keys = append(keys, key)
-			}
-		}
-		if len(keys) > 0 {
-			sb.WriteString("## Memory Keys\n")
-			sb.WriteString(strings.Join(keys, ", "))
-			sb.WriteString("\n(Use manage_memory to recall details)\n\n")
-		}
-	}
-
 	// Pending questions.
 	if rows, err := siteDB.Query("SELECT question FROM questions WHERE status = 'pending' ORDER BY id LIMIT 5"); err == nil {
 		defer rows.Close()
@@ -119,7 +102,7 @@ func BuildChatSystemPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 - manage_data: query/insert/update rows in data tables
 - manage_schema: add/modify database tables and columns
 - manage_layout: fix navigation or footer
-- manage_memory: read/store site context
+
 - manage_communication: ask the owner questions or suggest a rebuild
 - After making changes, briefly confirm what you did
 - Do NOT rebuild the entire site — make targeted fixes only

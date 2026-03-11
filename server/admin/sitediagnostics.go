@@ -27,9 +27,8 @@ func (h *SiteDiagnosticsHandler) Health(w http.ResponseWriter, r *http.Request) 
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
-	var pageCount, memoryCount, tableCount int
+	var pageCount, tableCount int
 	_ = siteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE is_deleted = 0").Scan(&pageCount)
-	_ = siteDB.QueryRow("SELECT COUNT(*) FROM memory").Scan(&memoryCount)
 	_ = siteDB.QueryRow("SELECT COUNT(*) FROM dynamic_tables").Scan(&tableCount)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -47,9 +46,8 @@ func (h *SiteDiagnosticsHandler) Health(w http.ResponseWriter, r *http.Request) 
 			"num_gc":      mem.NumGC,
 		},
 		"site": map[string]interface{}{
-			"pages":    pageCount,
-			"memories": memoryCount,
-			"tables":   tableCount,
+			"pages":  pageCount,
+			"tables": tableCount,
 		},
 	})
 }
@@ -100,19 +98,6 @@ func (h *SiteDiagnosticsHandler) Integrity(w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		// Check for pages without layout
-		rows2, err := siteDB.Query(
-			"SELECT path FROM pages WHERE is_deleted = 0 AND (layout IS NULL OR layout = '')",
-		)
-		if err == nil {
-			defer rows2.Close()
-			for rows2.Next() {
-				var path string
-				if rows2.Scan(&path) == nil {
-					issues = append(issues, integrityIssue{"warning", "Page '" + path + "' has no layout assigned"})
-				}
-			}
-		}
 	}
 
 	// Check CSS/JS assets exist
@@ -123,17 +108,6 @@ func (h *SiteDiagnosticsHandler) Integrity(w http.ResponseWriter, r *http.Reques
 			issues = append(issues, integrityIssue{"warning", "No CSS/JS assets found. The site may have no styling."})
 		} else {
 			issues = append(issues, integrityIssue{"info", "No assets yet — brain is still building (stage: " + currentStage + ")"})
-		}
-	}
-
-	// Check design system memories (only flag after build is complete)
-	if buildComplete {
-		for _, key := range []string{"site_architecture", "design_summary"} {
-			var cnt int
-			_ = siteDB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = ?", key).Scan(&cnt)
-			if cnt == 0 {
-				issues = append(issues, integrityIssue{"warning", "Missing design memory: '" + key + "'"})
-			}
 		}
 	}
 

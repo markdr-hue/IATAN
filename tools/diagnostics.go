@@ -51,10 +51,9 @@ func (t *DiagnosticsTool) executeHealth(ctx *ToolContext, _ map[string]interface
 	// DB stats.
 	dbStats := ctx.DB.Stats()
 
-	// Count pages and memories for the site.
-	var pageCount, memoryCount int
+	// Count pages for the site.
+	var pageCount int
 	ctx.DB.QueryRow("SELECT COUNT(*) FROM pages").Scan(&pageCount)
-	ctx.DB.QueryRow("SELECT COUNT(*) FROM memory").Scan(&memoryCount)
 
 	return &Result{Success: true, Data: map[string]interface{}{
 		"runtime": map[string]interface{}{
@@ -76,8 +75,7 @@ func (t *DiagnosticsTool) executeHealth(ctx *ToolContext, _ map[string]interface
 			"idle":             dbStats.Idle,
 		},
 		"site_stats": map[string]interface{}{
-			"pages":    pageCount,
-			"memories": memoryCount,
+			"pages": pageCount,
 		},
 		"timestamp": time.Now(),
 	}}, nil
@@ -181,17 +179,6 @@ func (t *DiagnosticsTool) executeIntegrity(ctx *ToolContext, _ map[string]interf
 	}
 	if jsCount == 0 {
 		issues = append(issues, "No JS assets found (may be OK if no interactivity needed).")
-	}
-
-	// 5. Check design system memories
-	var archCount, designCount int
-	ctx.DB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = 'site_architecture'").Scan(&archCount)
-	ctx.DB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = 'design_summary'").Scan(&designCount)
-	if archCount == 0 {
-		issues = append(issues, "Missing 'site_architecture' memory. Design stage may not be complete.")
-	}
-	if designCount == 0 {
-		issues = append(issues, "Missing 'design_summary' memory. Design stage may not be complete.")
 	}
 
 	status := "healthy"

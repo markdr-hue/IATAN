@@ -659,7 +659,10 @@ func buildChatWakePrompt(site *models.Site, siteDB *sql.DB, userMessage string, 
 	b.WriteString(`## Instructions
 
 - Read the owner's message and determine what needs fixing
-- Use manage_pages to read and update pages
+- Prefer manage_pages(action="patch", patches='[{"search":"...","replace":"..."}]') for targeted fixes — avoids rewriting the entire page
+- Only read pages you actually need to fix. Do NOT read pages "just to check"
+- Do NOT re-read a page you already read in this conversation
+- Fix only what the owner asked for — no bonus improvements or unrelated changes
 - Use manage_files to update CSS or JS assets (scope: "global" or "page")
 - Use manage_endpoints to create/modify API, WebSocket, SSE, or upload endpoints
 - Use manage_schema to add/modify database tables and columns

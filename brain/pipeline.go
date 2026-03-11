@@ -57,7 +57,8 @@ type PipelineWorker struct {
 	idleCheckCount int
 	wakeContext   map[string]interface{}
 
-	semaphore chan struct{}
+	semaphore            chan struct{}
+	maxToolResultOverride int // if > 0, caps truncateToolResult below this size
 }
 
 // NewPipelineWorker creates a new pipeline worker for the given site.
@@ -447,8 +448,18 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 	llmLogger := llm.NewDBLLMLogger(w.siteDB.Writer())
 	loggedProvider := llm.NewLoggedProvider(provider, llmLogger, "brain", "brain", &iteration)
 
+	seenUpTo := len(messages)
 	for i := 0; i < maxIter; i++ {
 		iteration = i
+
+		// Compress tool results the LLM has already seen to save context tokens.
+		if i > 0 {
+			for j := 0; j < seenUpTo; j++ {
+				if messages[j].Role == llm.RoleTool && len(messages[j].Content) > 500 {
+					messages[j].Content = truncate(messages[j].Content, 300)
+				}
+			}
+		}
 
 		var resp *llm.CompletionResponse
 		var callErr error
@@ -534,6 +545,7 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 		messages = append(messages, assistantMsg)
 		messages = w.executeToolCalls(ctx, resp.ToolCalls, messages)
 		totalToolCalls += len(resp.ToolCalls)
+		seenUpTo = len(messages)
 	}
 	return
 }
@@ -718,11 +730,6 @@ func toolProgressMessage(toolName string, args map[string]interface{}) string {
 		if action == "create" && table != "" {
 			return fmt.Sprintf("Created API endpoint: **/api/%s**", table)
 		}
-	case "manage_memory":
-		key, _ := args["key"].(string)
-		if action == "remember" && key != "" {
-			return fmt.Sprintf("Stored: **%s**", key)
-		}
 	}
 	return ""
 }
@@ -777,7 +784,9 @@ func (w *PipelineWorker) handleChatWake(ctx context.Context, userMessage string)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
 	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(chatWakeTools))
 
+	w.maxToolResultOverride = 8000
 	_, lastModel, totalTokens, _, iterErr := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 10, 8192)
+	w.maxToolResultOverride = 0
 	if iterErr != nil {
 		w.logger.Error("chat-wake: tool loop error", "error", iterErr)
 	}
@@ -986,6 +995,9 @@ func (w *PipelineWorker) truncateToolResult(toolName string, result string) stri
 		if sizer, ok := tool.(tools.ResultSizer); ok {
 			maxSize = sizer.MaxResultSize()
 		}
+	}
+	if w.maxToolResultOverride > 0 && w.maxToolResultOverride < maxSize {
+		maxSize = w.maxToolResultOverride
 	}
 	return truncate(result, maxSize)
 }

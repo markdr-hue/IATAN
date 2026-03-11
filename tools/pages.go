@@ -22,14 +22,14 @@ type PagesTool struct{}
 
 func (t *PagesTool) Name() string { return "manage_pages" }
 func (t *PagesTool) Description() string {
-	return "Manage site pages. Actions: save (create/update page), get (read page), list (list all), delete (soft-delete), restore, history (version history), search (full-text search)."
+	return "Manage site pages. Actions: save (create/update page), patch (search/replace fix without full rewrite), get (read page), list (list all), delete (soft-delete), restore, history (version history), search (full-text search)."
 }
 
 func (t *PagesTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
 		"properties": map[string]interface{}{
-			"action":   map[string]interface{}{"type": "string", "description": "Action to perform", "enum": []string{"save", "get", "list", "delete", "restore", "history", "search"}},
+			"action":   map[string]interface{}{"type": "string", "description": "Action to perform", "enum": []string{"save", "patch", "get", "list", "delete", "restore", "history", "search"}},
 			"path":     map[string]interface{}{"type": "string", "description": "URL path for the page (e.g. /about)"},
 			"title":    map[string]interface{}{"type": "string", "description": "Page title"},
 			"content":  map[string]interface{}{"type": "string", "description": "HTML content for the page. The server wraps this with the site layout (nav/footer) and injects shared CSS/JS automatically."},
@@ -40,6 +40,7 @@ func (t *PagesTool) Parameters() map[string]interface{} {
 			"metadata": map[string]interface{}{"type": "string", "description": "JSON string of additional metadata (description, og_image, canonical, keywords)"},
 			"limit":    map[string]interface{}{"type": "number", "description": "Maximum number of results to return"},
 			"query":    map[string]interface{}{"type": "string", "description": "Search query for full-text search"},
+			"patches":  map[string]interface{}{"type": "string", "description": `JSON array of search/replace pairs for patch action: [{"search":"old text","replace":"new text"}]. Works on HTML and JS content.`},
 		},
 		"required": []string{"action"},
 	}
@@ -48,6 +49,7 @@ func (t *PagesTool) Parameters() map[string]interface{} {
 func (t *PagesTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
 	return DispatchAction(ctx, args, map[string]ActionHandler{
 		"save":    t.save,
+		"patch":   t.patch,
 		"get":     t.get,
 		"list":    t.list,
 		"delete":  t.delete,
@@ -174,6 +176,104 @@ func (t *PagesTool) save(ctx *ToolContext, args map[string]interface{}) (*Result
 			Error:   "Page saved with errors that MUST be fixed: " + strings.Join(hardErrors, "; "),
 			Data:    resultData,
 		}, nil
+	}
+	return &Result{Success: true, Data: resultData}, nil
+}
+
+// ---------------------------------------------------------------------------
+// patch — apply search/replace pairs to a page without full rewrite
+// ---------------------------------------------------------------------------
+
+func (t *PagesTool) patch(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return &Result{Success: false, Error: "path is required"}, nil
+	}
+	patchesStr, _ := args["patches"].(string)
+	if patchesStr == "" {
+		return &Result{Success: false, Error: "patches is required (JSON array of {search, replace} pairs)"}, nil
+	}
+
+	var patches []struct {
+		Search  string `json:"search"`
+		Replace string `json:"replace"`
+	}
+	if err := json.Unmarshal([]byte(patchesStr), &patches); err != nil {
+		return &Result{Success: false, Error: "patches must be a JSON array: " + err.Error()}, nil
+	}
+	if len(patches) == 0 {
+		return &Result{Success: false, Error: "patches array is empty"}, nil
+	}
+
+	// Read current page.
+	var existingID int
+	var title, content, template, status, metadata, layout, pageAssets sql.NullString
+	err := ctx.DB.QueryRow(
+		"SELECT id, title, content, template, status, metadata, layout, assets FROM pages WHERE path = ? AND is_deleted = 0",
+		path,
+	).Scan(&existingID, &title, &content, &template, &status, &metadata, &layout, &pageAssets)
+	if err != nil {
+		return &Result{Success: false, Error: "page not found"}, nil
+	}
+
+	// Capture version history before modifying.
+	var maxVer int
+	ctx.DB.QueryRow("SELECT COALESCE(MAX(version_number), 0) FROM page_versions WHERE page_id = ?", existingID).Scan(&maxVer)
+	ctx.DB.Exec(
+		`INSERT INTO page_versions (page_id, path, title, content, template, status, metadata, version_number, changed_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'brain')`,
+		existingID, path, title, content, template, status, metadata, maxVer+1,
+	)
+
+	// Apply patches sequentially.
+	modified := content.String
+	var applied, notFound []string
+	for _, p := range patches {
+		if p.Search == "" {
+			continue
+		}
+		if !strings.Contains(modified, p.Search) {
+			notFound = append(notFound, p.Search)
+			continue
+		}
+		modified = strings.Replace(modified, p.Search, p.Replace, 1)
+		if len(p.Search) > 60 {
+			applied = append(applied, p.Search[:60]+"...")
+		} else {
+			applied = append(applied, p.Search)
+		}
+	}
+
+	if len(applied) == 0 && len(notFound) > 0 {
+		return &Result{Success: false, Error: "no patches matched", Data: map[string]interface{}{"not_found": notFound}}, nil
+	}
+
+	// Sanitize and save.
+	modified = sanitizePageHTML(modified)
+	_, err = ctx.DB.Exec(
+		"UPDATE pages SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		modified, existingID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("saving patched page: %w", err)
+	}
+
+	// Post-save validation.
+	warnings := validatePageContent(modified)
+	hints := checkCoherence(path, modified, ctx.DB)
+
+	resultData := map[string]interface{}{
+		"path":    path,
+		"applied": len(applied),
+	}
+	if len(notFound) > 0 {
+		resultData["not_found"] = notFound
+	}
+	if len(warnings) > 0 {
+		resultData["warnings"] = warnings
+	}
+	if len(hints) > 0 {
+		resultData["hints"] = hints
 	}
 	return &Result{Success: true, Data: resultData}, nil
 }

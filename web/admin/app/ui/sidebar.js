@@ -93,7 +93,7 @@ export function createSidebar() {
         { id: 'webhooks', icon: 'link', label: 'Webhooks' },
         { id: 'tasks', icon: 'clock', label: 'Tasks' },
         { id: 'questions', icon: 'help-circle', label: 'Questions' },
-        { id: 'memory', icon: 'brain', label: 'Memory' },
+
         { id: 'secrets', icon: 'lock', label: 'Secrets' },
         { id: 'providers', icon: 'shield', label: 'Service Providers' },
         { id: 'analytics', icon: 'bar-chart', label: 'Analytics' },

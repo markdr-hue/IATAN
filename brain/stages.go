@@ -26,7 +26,7 @@ var (
 		"manage_files",
 		"manage_layout",
 		"manage_pages",
-		"manage_memory",
+
 		"manage_communication",
 		"manage_secrets",
 		"manage_providers",
@@ -42,7 +42,7 @@ var (
 		"manage_diagnostics",
 		"manage_analytics",
 		"manage_communication",
-		"manage_memory",
+
 	}
 
 	// chatWakeTools gives write access when owner sends a message during monitoring.
@@ -54,7 +54,7 @@ var (
 		"manage_endpoints",
 		"manage_schema",
 		"manage_diagnostics",
-		"manage_memory",
+
 		"manage_communication",
 		"manage_scheduler",
 		"manage_site",

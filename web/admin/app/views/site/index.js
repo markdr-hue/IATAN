@@ -29,7 +29,7 @@ import { renderSiteLogs } from './logs.js';
 import { renderSiteQuestions } from './questions.js';
 import { renderSiteWebhooks } from './webhooks.js';
 import { renderSiteSecrets } from './secrets.js';
-import { renderSiteMemory } from './memory.js';
+
 import { renderSiteLayouts } from './layouts.js';
 import { renderSiteAnalytics } from './analytics.js';
 import { renderSiteDiagnostics } from './diagnostics.js';
@@ -240,7 +240,7 @@ function renderContextPanel(container, panel, siteId, site) {
     webhooks: (c, id) => renderSiteWebhooks(c, id),
     logs: (c, id) => renderSiteLogs(c, id),
     secrets: (c, id) => renderSiteSecrets(c, id),
-    memory: (c, id) => renderSiteMemory(c, id),
+
     layouts: (c, id) => renderSiteLayouts(c, id),
     analytics: (c, id) => renderSiteAnalytics(c, id),
     diagnostics: (c, id) => renderSiteDiagnostics(c, id),

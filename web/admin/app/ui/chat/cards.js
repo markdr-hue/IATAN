@@ -51,9 +51,7 @@ const managerLabels = {
     create_auth: 'Creating auth endpoint', list_auth: 'Listing auth endpoints', delete_auth: 'Removing auth endpoint',
     verify_password: 'Verifying password',
   },
-  manage_memory: {
-    remember: 'Saving to memory', recall: 'Recalling memory', list: 'Listing memories', forget: 'Clearing memory',
-  },
+
   manage_communication: {
     ask: 'Asking a question', check: 'Checking answers',
   },
@@ -92,7 +90,7 @@ const toolLabels = {
   manage_schema: 'Managing schema',
   manage_data: 'Managing data',
   manage_endpoints: 'Managing endpoints',
-  manage_memory: 'Managing memory',
+
   manage_communication: 'Communication',
   manage_analytics: 'Checking analytics',
   manage_diagnostics: 'Running diagnostics',
