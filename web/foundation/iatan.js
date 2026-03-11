@@ -95,6 +95,16 @@
     navigate: function(path) {
       if (window.__iatan_router) window.__iatan_router.go(path);
       else window.location.href = path;
+    },
+
+    // Page lifecycle — cleanup callbacks run on SPA navigation away.
+    _cleanupFns: [],
+    onPageLeave: function(fn) { this._cleanupFns.push(fn); },
+    _runCleanup: function() {
+      for (var i = 0; i < this._cleanupFns.length; i++) {
+        try { this._cleanupFns[i](); } catch(e) { /* ignore */ }
+      }
+      this._cleanupFns = [];
     }
   };
 
@@ -107,11 +117,6 @@
   // ---------------------------------------------------------------------------
   var hashParams = new URLSearchParams(window.location.hash.substring(1));
   var oauthToken = hashParams.get('token');
-  // Backward compat: also check query param for older redirects.
-  if (!oauthToken) {
-    var searchParams = new URLSearchParams(window.location.search);
-    oauthToken = searchParams.get('token');
-  }
   if (oauthToken) {
     localStorage.setItem('auth_token', oauthToken);
     window.history.replaceState({}, '', window.location.pathname);
@@ -122,6 +127,43 @@
   // SPA Router — only activates when window.__IATAN_SPA = true
   // ---------------------------------------------------------------------------
   if (!window.__IATAN_SPA) return;
+
+  // ---------------------------------------------------------------------------
+  // Auto-track WebSocket & EventSource for cleanup on SPA navigation.
+  // Connections opened during a page's lifetime are automatically closed
+  // when the router navigates to a different page.
+  // ---------------------------------------------------------------------------
+  var _activeWS = [], _activeES = [];
+  var _OrigWS = window.WebSocket;
+  var _OrigES = window.EventSource;
+
+  window.WebSocket = function(url, protocols) {
+    var ws = protocols !== undefined ? new _OrigWS(url, protocols) : new _OrigWS(url);
+    _activeWS.push(ws);
+    return ws;
+  };
+  window.WebSocket.prototype = _OrigWS.prototype;
+  window.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+  window.WebSocket.OPEN = _OrigWS.OPEN;
+  window.WebSocket.CLOSING = _OrigWS.CLOSING;
+  window.WebSocket.CLOSED = _OrigWS.CLOSED;
+
+  if (_OrigES) {
+    window.EventSource = function(url, opts) {
+      var es = opts !== undefined ? new _OrigES(url, opts) : new _OrigES(url);
+      _activeES.push(es);
+      return es;
+    };
+    window.EventSource.prototype = _OrigES.prototype;
+  }
+
+  function closeTrackedConnections() {
+    app._runCleanup();
+    _activeWS.forEach(function(ws) { try { ws.close(); } catch(e) {} });
+    _activeES.forEach(function(es) { try { es.close(); } catch(e) {} });
+    _activeWS = [];
+    _activeES = [];
+  }
 
   var router = {
     loading: false,
@@ -165,7 +207,10 @@
       this.loading = true;
       var thisLoad = ++this._loadId;
       var main = document.querySelector('main');
-      if (main) main.classList.add('page-loading');
+      if (main) {
+        main.classList.add('page-loading');
+        main.classList.add('page-exit');
+      }
 
       app.set('page:loading', true);
 
@@ -181,31 +226,62 @@
           if (thisLoad !== self._loadId) return;
 
           if (!data || data.error) {
-            if (main) main.innerHTML = '<div class="alert alert-error" style="margin:2rem auto;max-width:600px;">Page not found.</div>';
+            if (main) {
+              main.classList.remove('page-exit');
+              main.innerHTML = '<div class="alert alert-error" style="margin:2rem auto;max-width:600px;">Page not found.</div>';
+            }
+            return;
+          }
+
+          // If the page requires a different layout (e.g. "none" vs "default"),
+          // fall back to a full page reload so SSR renders the correct layout.
+          var currentLayout = document.body.getAttribute('data-layout') || 'default';
+          var newLayout = data.layout || 'default';
+          if (currentLayout !== newLayout) {
+            window.location.href = path;
             return;
           }
 
           // Set route params before page scripts run (e.g. {id: "4"} for /thread/:id)
           window.__routeParams = data.params || {};
 
-          // Clean up previous page assets
+          // Clean up previous page: close WS/SSE, run onPageLeave callbacks, remove assets.
+          closeTrackedConnections();
           self.removePageAssets();
 
-          // Swap content
-          if (main) main.innerHTML = data.content || '';
-
-          // Update title
+          // Update title immediately (no CSS dependency).
           document.title = data.title ? data.title + ' | ' + (document.title.split(' | ').pop()) : document.title;
 
-          // Load page-scoped CSS (wait for all sheets before running scripts)
+          // Push history immediately (no CSS dependency).
+          if (pushState) {
+            window.history.pushState(null, '', path);
+          }
+
+          // Update active nav link immediately (no CSS dependency).
+          self.updateNav(path);
+
+          // Pre-load page CSS BEFORE inserting content to prevent FOUC.
           var cssReady = Promise.resolve();
           if (data.page_css) {
             var cssPromises = data.page_css.map(function(url) { return self.loadCSS(url); });
             cssReady = Promise.all(cssPromises);
           }
 
-          // Load page-scoped JS after CSS is ready
+          // Swap content and run scripts only after CSS is ready.
           cssReady.then(function() {
+            if (thisLoad !== self._loadId) return;
+
+            if (main) {
+              main.classList.remove('page-exit');
+              main.innerHTML = data.content || '';
+              main.classList.add('page-enter');
+              // Remove animation class after it completes.
+              main.addEventListener('animationend', function handler() {
+                main.classList.remove('page-enter');
+                main.removeEventListener('animationend', handler);
+              });
+            }
+
             if (data.page_js) {
               var chain = Promise.resolve();
               data.page_js.forEach(function(url) {
@@ -217,20 +293,15 @@
             }
           });
 
-          // Push history
-          if (pushState) {
-            window.history.pushState(null, '', path);
-          }
-
-          // Update active nav link
-          self.updateNav(path);
-
           // Notify listeners
           app.set('page', path);
           app.set('page:loading', false);
         })
         .catch(function() {
-          if (main) main.innerHTML = '<div class="alert alert-error" style="margin:2rem auto;max-width:600px;">Connection lost. Please try again.</div>';
+          if (main) {
+            main.classList.remove('page-exit');
+            main.innerHTML = '<div class="alert alert-error" style="margin:2rem auto;max-width:600px;">Connection lost. Please try again.</div>';
+          }
           app.set('page:loading', false);
         })
         .finally(function() {
@@ -270,16 +341,32 @@
     evalInlineScripts: function(container) {
       if (!container) return;
       var scripts = container.querySelectorAll('script:not([src])');
+      if (scripts.length === 0) return;
+
       for (var i = 0; i < scripts.length; i++) {
         var oldScript = scripts[i];
+        var body = oldScript.textContent;
+        if (!body || !body.trim()) continue;
+
         var newScript = document.createElement('script');
-        newScript.textContent = oldScript.textContent;
+
+        // Auto-wrap in function scope to prevent top-level const/let/class
+        // "already declared" errors on SPA re-navigation. Scripts already
+        // wrapped in an IIFE are passed through unchanged.
+        var trimmed = body.trim();
+        var isIIFE = /^\(function\s*\(/.test(trimmed) || /^\(\(\)\s*=>/.test(trimmed);
+        newScript.textContent = isIIFE ? body : '(function(){' + body + '})();';
+
         // Copy attributes
         for (var j = 0; j < oldScript.attributes.length; j++) {
           newScript.setAttribute(oldScript.attributes[j].name, oldScript.attributes[j].value);
         }
         oldScript.parentNode.replaceChild(newScript, oldScript);
       }
+
+      // Dispatch synthetic DOMContentLoaded after all scripts have executed,
+      // so listeners registered during script execution receive the event.
+      document.dispatchEvent(new Event('DOMContentLoaded'));
     },
 
     updateNav: function(path) {

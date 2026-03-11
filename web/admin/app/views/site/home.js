@@ -58,7 +58,7 @@ export function renderSiteHome(container, siteId) {
 
   // Any tool execution → debounced summary refresh (tokens, pages, visitors)
   unwatchers.push(state.watch('toolExecuted', (evt) => {
-    if (!evt || evt.site_id !== siteId) return;
+    if (!evt || String(evt.site_id) !== String(siteId)) return;
     debouncedRefreshSummary();
   }));
 
@@ -71,7 +71,7 @@ export function renderSiteHome(container, siteId) {
 
   // Brain mode changes (building → monitoring → complete)
   unwatchers.push(state.watch('brainModeChanged', (data) => {
-    if (!data || data.site_id !== siteId) return;
+    if (!data || String(data.site_id) !== String(siteId)) return;
     if (brainModeEl) brainModeEl.textContent = `Mode: ${data.mode}`;
   }));
 
@@ -157,13 +157,6 @@ export function renderSiteHome(container, siteId) {
 
     const el = h('div', { className: 'stat-card stat-card--compact' }, children);
     return { el, valueEl, subEl };
-  }
-
-  async function refreshPages(sid) {
-    try {
-      const pages = await get(`/admin/api/sites/${sid}/pages`);
-      if (pagesValueEl) pagesValueEl.textContent = String(pages.length);
-    } catch { /* ignore */ }
   }
 
   async function refreshSummary(sid) {

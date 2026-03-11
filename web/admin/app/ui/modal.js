@@ -44,8 +44,8 @@ export function show(title, content, actions = []) {
     actions.map(a =>
       h('button', {
         className: a.className || 'btn',
-        onClick: () => {
-          const result = a.onClick();
+        onClick: async () => {
+          const result = await Promise.resolve(a.onClick());
           if (result !== false) close();
         },
       }, a.label)

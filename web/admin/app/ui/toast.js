@@ -58,6 +58,10 @@ function dismiss(toast) {
       toast.parentNode.removeChild(toast);
     }
   });
+  // Fallback: remove if transitionend never fires
+  setTimeout(() => {
+    if (toast.parentNode) toast.parentNode.removeChild(toast);
+  }, 500);
 }
 
 export function success(msg) { show(msg, 'success'); }

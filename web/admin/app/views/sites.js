@@ -14,7 +14,8 @@ import { icon } from '../ui/icon.js';
 import * as toast from '../ui/toast.js';
 import * as modal from '../ui/modal.js';
 import * as state from '../core/state.js';
-import { emptyState } from '../ui/helpers.js';
+import { emptyState, formatPublicUrl } from '../ui/helpers.js';
+import { createModelPicker } from '../ui/model-picker.js';
 
 export async function renderSites(container) {
   clear(container);
@@ -94,12 +95,7 @@ export async function renderSites(container) {
           ]),
         ]),
         h('td', {}, (() => {
-          const sys = state.get('systemStatus') || {};
-          const publicPort = sys.public_port || 5000;
-          const needsPort = !site.domain || site.domain.includes('localhost');
-          const host = site.domain || 'localhost';
-          const url = needsPort ? `http://${host}:${publicPort}` : `http://${host}`;
-          const label = needsPort ? `${host}:${publicPort}` : host;
+          const { url, label } = formatPublicUrl(site, state.get('systemStatus'));
           return h('a', {
             href: url,
             target: '_blank',
@@ -179,51 +175,8 @@ export async function renderSites(container) {
       // If catalog fails, modal still works but model picker will be empty
     }
 
-    let selectedProvider = providers.length > 0 ? providers[0] : null;
-    let selectedModel = null;
-
-    const providerSelect = h('select', { className: 'input' });
-    const modelSelect = h('select', { className: 'input' });
-
-    providers.forEach((p, i) => {
-      const opt = h('option', { value: String(p.id) }, p.name);
-      if (i === 0) opt.selected = true;
-      providerSelect.appendChild(opt);
-    });
-
-    function updateModels() {
-      modelSelect.innerHTML = '';
-      selectedModel = null;
-      if (!selectedProvider || !selectedProvider.models) return;
-
-      selectedProvider.models.forEach((m) => {
-        const opt = h('option', { value: String(m.id) }, m.display_name);
-        if (m.is_default) {
-          opt.selected = true;
-          selectedModel = m;
-        }
-        modelSelect.appendChild(opt);
-      });
-
-      if (!selectedModel && selectedProvider.models.length > 0) {
-        selectedModel = selectedProvider.models[0];
-        modelSelect.options[0].selected = true;
-      }
-    }
-
-    providerSelect.addEventListener('change', () => {
-      const id = parseInt(providerSelect.value, 10);
-      selectedProvider = providers.find(p => p.id === id) || null;
-      updateModels();
-    });
-
-    modelSelect.addEventListener('change', () => {
-      if (!selectedProvider) return;
-      const mid = parseInt(modelSelect.value, 10);
-      selectedModel = selectedProvider.models.find(m => m.id === mid) || null;
-    });
-
-    updateModels();
+    const picker = createModelPicker(providers);
+    const { providerSelect, modelSelect } = picker;
 
     const content = h('div', {}, [
       h('div', { className: 'form-group' }, [
@@ -259,6 +212,7 @@ export async function renderSites(container) {
             toast.warning('Site name is required');
             return false;
           }
+          const selectedModel = picker.getSelectedModel();
           if (!selectedModel) {
             toast.warning('Please select a model');
             return false;

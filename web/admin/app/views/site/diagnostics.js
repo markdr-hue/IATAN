@@ -70,7 +70,8 @@ function renderResults(container, health, integrity, errors) {
   ]));
 
   // Integrity section
-  container.appendChild(sectionHeader('Integrity Check', integrity.ok ? 'check' : 'alert-circle'));
+  const hasRealIssues = (integrity.issues || []).some(i => i.level === 'error' || i.level === 'warning');
+  container.appendChild(sectionHeader('Integrity Check', integrity.ok ? 'check' : hasRealIssues ? 'alert-circle' : 'info'));
   const issues = integrity.issues || [];
   if (issues.length === 0) {
     container.appendChild(h('div', { className: 'card mb-3' }, [
@@ -81,15 +82,17 @@ function renderResults(container, health, integrity, errors) {
     ]));
   } else {
     for (const issue of issues) {
-      const isError = issue.level === 'error';
+      const levelIcon = issue.level === 'error' ? 'alert-circle' : issue.level === 'info' ? 'info' : 'alert-triangle';
+      const levelColor = issue.level === 'error' ? 'var(--danger)' : issue.level === 'info' ? 'var(--info)' : 'var(--warning)';
+      const badgeClass = issue.level === 'error' ? 'badge--danger' : issue.level === 'info' ? 'badge--info' : 'badge--warning';
       container.appendChild(h('div', { className: 'card mb-2' }, [
         h('div', { className: 'flex items-center gap-2' }, [
           h('span', {
-            innerHTML: icon(isError ? 'alert-circle' : 'alert-triangle'),
-            style: { color: isError ? 'var(--danger)' : 'var(--warning)' },
+            innerHTML: icon(levelIcon),
+            style: { color: levelColor },
           }),
           h('span', { className: 'text-sm' }, issue.message),
-          h('span', { className: `badge ${isError ? 'badge--danger' : 'badge--warning'}` }, issue.level),
+          h('span', { className: `badge ${badgeClass}` }, issue.level),
         ]),
       ]));
     }

@@ -14,6 +14,7 @@ import { icon } from '../../ui/icon.js';
 import * as toast from '../../ui/toast.js';
 import * as modal from '../../ui/modal.js';
 import * as state from '../../core/state.js';
+import { createModelPicker } from '../../ui/model-picker.js';
 
 export async function renderSiteSettings(container, siteId, site) {
   clear(container);
@@ -44,67 +45,13 @@ export async function renderSiteSettings(container, siteId, site) {
     // ignore
   }
 
-  let selectedProvider = null;
-  let selectedModel = null;
-
-  const providerSelect = h('select', { className: 'input', disabled: readOnly });
-  const modelSelect = h('select', { className: 'input', disabled: readOnly });
-
-  providers.forEach((p) => {
-    const opt = h('option', { value: String(p.id) }, p.name);
-    providerSelect.appendChild(opt);
-  });
-
-  function updateModels() {
-    modelSelect.innerHTML = '';
-    selectedModel = null;
-    if (!selectedProvider || !selectedProvider.models) return;
-
-    selectedProvider.models.forEach((m) => {
-      const opt = h('option', { value: String(m.id) }, m.display_name);
-      if (m.id === site.llm_model_id) {
-        opt.selected = true;
-        selectedModel = m;
-      }
-      modelSelect.appendChild(opt);
-    });
-
-    if (!selectedModel && selectedProvider.models.length > 0) {
-      selectedModel = selectedProvider.models[0];
-      modelSelect.options[0].selected = true;
-    }
-  }
-
-  for (const p of providers) {
-    if (p.models && p.models.some(m => m.id === site.llm_model_id)) {
-      selectedProvider = p;
-      break;
-    }
-  }
-  if (!selectedProvider && providers.length > 0) {
-    selectedProvider = providers[0];
-  }
-  if (selectedProvider) {
-    providerSelect.value = String(selectedProvider.id);
-  }
-
-  providerSelect.addEventListener('change', () => {
-    const id = parseInt(providerSelect.value, 10);
-    selectedProvider = providers.find(p => p.id === id) || null;
-    updateModels();
-  });
-
-  modelSelect.addEventListener('change', () => {
-    if (!selectedProvider) return;
-    const mid = parseInt(modelSelect.value, 10);
-    selectedModel = selectedProvider.models.find(m => m.id === mid) || null;
-  });
-
-  updateModels();
+  const picker = createModelPicker(providers, { currentModelId: site.llm_model_id, disabled: readOnly });
+  const { providerSelect, modelSelect } = picker;
 
   const saveBtn = h('button', {
     className: 'btn btn--primary',
     onClick: async () => {
+      const selectedModel = picker.getSelectedModel();
       if (!selectedModel) {
         toast.warning('Please select a model');
         return;

@@ -449,12 +449,7 @@ func (h *Handler) oauthAuthorize(w http.ResponseWriter, r *http.Request, siteDB 
 		Secure:   r.TLS != nil,
 	})
 
-	// Build redirect URI from the current request host.
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	redirectURI := fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, r.Host, ae.Path, provider)
+	redirectURI := oauthRedirectURI(r, ae.Path, provider)
 
 	// Build authorization URL.
 	authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s",
@@ -538,12 +533,7 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request, siteID i
 		return
 	}
 
-	// Build redirect URI (must match authorize step).
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	redirectURI := fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, r.Host, ae.Path, provider)
+	redirectURI := oauthRedirectURI(r, ae.Path, provider)
 
 	// Exchange authorization code for access token.
 	tokenResp, err := exchangeOAuthCode(op, code, redirectURI, clientSecret)
@@ -613,6 +603,15 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request, siteID i
 type oauthTokenResponse struct {
 	AccessToken string `json:"access_token"`
 	TokenType   string `json:"token_type"`
+}
+
+// oauthRedirectURI builds the OAuth callback URI from the current request.
+func oauthRedirectURI(r *http.Request, authPath, provider string) string {
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	return fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, r.Host, authPath, provider)
 }
 
 func exchangeOAuthCode(op *oauthProviderConfig, code, redirectURI, clientSecret string) (*oauthTokenResponse, error) {

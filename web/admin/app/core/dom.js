@@ -67,14 +67,6 @@ function appendChildren(parent, children) {
 }
 
 /**
- * Mount an element into a parent.
- */
-function mount(parent, element) {
-  parent.appendChild(element);
-  return element;
-}
-
-/**
  * Clear all children from an element.
  */
 export function clear(element) {
@@ -89,7 +81,7 @@ export function clear(element) {
 export function render(parent, element) {
   clear(parent);
   if (element) {
-    mount(parent, element);
+    parent.appendChild(element);
   }
 }
 

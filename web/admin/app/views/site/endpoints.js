@@ -27,9 +27,7 @@ export async function renderSiteEndpoints(container, siteId) {
   container.appendChild(listContainer);
 
   const unwatch = state.watch('toolExecuted', (evt) => {
-    if (evt.site_id === siteId &&
-        evt.tool === 'manage_endpoints' && ['create_api', 'delete_api', 'create_auth', 'delete_auth'].includes(evt.args?.action) &&
-        evt.success) {
+    if (evt.site_id === siteId && evt.tool === 'manage_endpoints' && evt.success) {
       loadEndpoints(listContainer, siteId);
     }
   });

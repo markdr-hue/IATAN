@@ -45,7 +45,6 @@ type ServerDeps struct {
 	ProviderFactory llm.ProviderFactory
 	Logger          *slog.Logger
 	AdminFS         fs.FS // embedded admin SPA filesystem
-	FoundationJS    []byte // embedded JS runtime for public sites
 	Version         string
 }
 
@@ -81,8 +80,7 @@ func New(deps *ServerDeps) *Server {
 	s.adminRouter.Use(middleware.SecurityHeaders)
 	s.adminRouter.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// NOTE: 'unsafe-inline' in style-src is needed while the admin frontend uses inline styles.
-		// Tighten to 'self' only when inline styles are eliminated.
+			// TODO: Remove 'unsafe-inline' from style-src once inline styles are eliminated from admin frontend.
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self'; font-src 'self' https://fonts.gstatic.com")
 			next.ServeHTTP(w, r)
 		})
@@ -121,7 +119,6 @@ func New(deps *ServerDeps) *Server {
 		Bus:           deps.Bus,
 		Encryptor:     deps.Encryptor,
 		JWTManager:    deps.JWTManager,
-		FoundationJS:  deps.FoundationJS,
 		Logger:        logger.With("server", "public"),
 	}
 	public.RegisterRoutes(s.publicRouter, publicDeps)

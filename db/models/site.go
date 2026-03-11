@@ -20,15 +20,14 @@ type Site struct {
 	Status      string    `json:"status"`
 	Mode        string    `json:"mode"`
 	Config      string    `json:"config"`
-	TickCount   int       `json:"tick_count"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-const siteColumns = "id, name, domain, description, direction, llm_model_id, status, mode, config, tick_count, created_at, updated_at"
+const siteColumns = "id, name, domain, description, direction, llm_model_id, status, mode, config, created_at, updated_at"
 
 func scanSite(s *Site, row interface{ Scan(...interface{}) error }) error {
-	return row.Scan(&s.ID, &s.Name, &s.Domain, &s.Description, &s.Direction, &s.LLMModelID, &s.Status, &s.Mode, &s.Config, &s.TickCount, &s.CreatedAt, &s.UpdatedAt)
+	return row.Scan(&s.ID, &s.Name, &s.Domain, &s.Description, &s.Direction, &s.LLMModelID, &s.Status, &s.Mode, &s.Config, &s.CreatedAt, &s.UpdatedAt)
 }
 
 func CreateSite(db *sql.DB, name string, domain, description, direction *string, llmModelID int) (*Site, error) {

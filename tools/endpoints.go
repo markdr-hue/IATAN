@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/markdr-hue/IATAN/security"
@@ -165,7 +166,11 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			},
 			"write_to_table": map[string]interface{}{
 				"type":        "string",
-				"description": "Table to auto-insert incoming WebSocket messages into (optional). Only for create_websocket.",
+				"description": "Table to auto-insert incoming WebSocket messages into. JSON fields are mapped to table columns automatically. Only for create_websocket.",
+			},
+			"room_column": map[string]interface{}{
+				"type":        "string",
+				"description": "Column name used for room-based filtering. Clients connect with ?room=<value> and only receive messages where this field matches. Use for scoped real-time (e.g. room_column='drawing_id' for per-canvas collaboration). Only for create_websocket.",
 			},
 		},
 		"required": []string{"action"},
@@ -381,6 +386,29 @@ func (t *EndpointsTool) createAuth(ctx *ToolContext, args map[string]interface{}
 	}
 	if kind, ok := secureCols[passwordCol]; !ok || kind != "hash" {
 		return &Result{Success: false, Error: fmt.Sprintf("column %q in table %q is not a PASSWORD column", passwordCol, tableName)}, nil
+	}
+
+	// Verify username_column exists in the actual table schema.
+	var schemaDef string
+	if err := ctx.DB.QueryRow(
+		"SELECT schema_def FROM dynamic_tables WHERE table_name = ?", tableName,
+	).Scan(&schemaDef); err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("could not load schema for table %q", tableName)}, nil
+	}
+	var schemaMap map[string]interface{}
+	if err := json.Unmarshal([]byte(schemaDef), &schemaMap); err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("invalid schema_def for table %q", tableName)}, nil
+	}
+	if _, ok := schemaMap[usernameCol]; !ok {
+		var available []string
+		for col := range schemaMap {
+			if col != passwordCol {
+				available = append(available, col)
+			}
+		}
+		return &Result{Success: false, Error: fmt.Sprintf(
+			"username_column %q does not exist in table %q — available columns: %s",
+			usernameCol, tableName, strings.Join(available, ", "))}, nil
 	}
 
 	// Build public columns JSON.
@@ -699,19 +727,53 @@ func (t *EndpointsTool) createWebSocket(ctx *ToolContext, args map[string]interf
 		requiresAuth = ra
 	}
 
+	roomColumn := ""
+	if rc, ok := args["room_column"].(string); ok && rc != "" {
+		if !validColumnName.MatchString(rc) {
+			return &Result{Success: false, Error: fmt.Sprintf("invalid room_column name: %s", rc)}, nil
+		}
+		roomColumn = rc
+	}
+
 	_, err := ctx.DB.Exec(
-		`INSERT INTO ws_endpoints (path, event_types, receive_event_type, write_to_table, requires_auth)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO ws_endpoints (path, event_types, receive_event_type, write_to_table, requires_auth, room_column)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   event_types = excluded.event_types,
 		   receive_event_type = excluded.receive_event_type,
 		   write_to_table = excluded.write_to_table,
-		   requires_auth = excluded.requires_auth`,
-		path, string(eventTypesJSON), receiveEventType, writeToTable, requiresAuth,
+		   requires_auth = excluded.requires_auth,
+		   room_column = excluded.room_column`,
+		path, string(eventTypesJSON), receiveEventType, writeToTable, requiresAuth, roomColumn,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating websocket endpoint: %w", err)
 	}
+
+	roomSuffix := "'"
+	if roomColumn != "" {
+		roomSuffix = "?room=' + roomId"
+	}
+	usage := fmt.Sprintf(`CONNECTION:
+  const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/%s/ws%s);
+
+MESSAGE FORMAT (received via ws.onmessage):
+  { "type": "%s", "payload": { "path": "%s", "data": { ...original fields... }, "client_id": "uuid" } }
+
+HANDLING RECEIVED MESSAGES — append to DOM immediately, no page refresh:
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    const data = msg.payload.data;  // the actual message object with your table columns
+    // append data to the UI here (e.g. create a new DOM element and add it to the message list)
+  };
+
+SENDING MESSAGES:
+  ws.send(JSON.stringify({ content: "hello", nickname: nick }));
+
+CRITICAL — ECHO SUPPRESSION:
+  The server does NOT echo messages back to the sender.
+  You MUST optimistically append your own sent message to the DOM right after calling ws.send().
+  Other clients will receive the message via ws.onmessage.`, path, roomSuffix, receiveEventType, path)
 
 	result := map[string]interface{}{
 		"path":               path,
@@ -719,10 +781,13 @@ func (t *EndpointsTool) createWebSocket(ctx *ToolContext, args map[string]interf
 		"event_types":        eventTypes,
 		"receive_event_type": receiveEventType,
 		"requires_auth":      requiresAuth,
-		"usage":              "const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/" + path + "/ws'); ws.onmessage = (e) => { const data = JSON.parse(e.data); ... }; ws.send(JSON.stringify({content: 'hello'}));",
+		"usage":              usage,
 	}
 	if writeToTable != "" {
 		result["write_to_table"] = writeToTable
+	}
+	if roomColumn != "" {
+		result["room_column"] = roomColumn
 	}
 	return &Result{Success: true, Data: result}, nil
 }

@@ -200,10 +200,12 @@ func (m *BrainManager) cleanupLLMLogs() {
 	for _, site := range sites {
 		siteDB, err := m.deps.SiteDBManager.Open(site.ID)
 		if err != nil {
+			m.logger.Warn("log cleanup: failed to open site db", "site_id", site.ID, "error", err)
 			continue
 		}
 		result, err := siteDB.ExecWrite("DELETE FROM llm_log WHERE created_at < datetime('now', '-30 days')")
 		if err != nil {
+			m.logger.Warn("log cleanup: delete failed", "site_id", site.ID, "error", err)
 			continue
 		}
 		if n, _ := result.RowsAffected(); n > 0 {

@@ -32,14 +32,12 @@ import (
 var Version = "0.2.0"
 
 func main() {
-	// 1. Load config
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
 
-	// 2. Init logger
 	initLogger(cfg.LogLevel)
 
 	slog.Info("IATAN_GO starting",
@@ -48,7 +46,6 @@ func main() {
 		"public_port", cfg.PublicPort,
 	)
 
-	// 3. Open DB (runs migrations)
 	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		slog.Error("failed to open database", "error", err)
@@ -56,7 +53,6 @@ func main() {
 	}
 	defer database.Close()
 
-	// 4. Init security
 	encryptor, err := security.NewEncryptor(cfg.EncryptionKey)
 	if err != nil {
 		slog.Error("failed to init encryptor", "error", err)
@@ -66,17 +62,12 @@ func main() {
 	jwtMgr := security.NewJWTManager(cfg.JWTSecret, 24*time.Hour)
 	jwtMgr.SecureCookies = cfg.CaddyEnabled // Caddy implies TLS
 
-	// 4b. Init site database manager
 	siteDBMgr := db.NewSiteDBManager(cfg.DataDir)
 	defer siteDBMgr.CloseAll()
 
-	// 5. Init event bus
 	bus := events.NewBus()
-
-	// 5b. Init outgoing webhook dispatcher
 	_ = webhooks.NewDispatcher(siteDBMgr, bus)
 
-	// 6. Init registries and register all tools
 	llmRegistry := llm.NewRegistry()
 	toolRegistry := tools.NewRegistry()
 	tools.RegisterAll(toolRegistry)
@@ -84,7 +75,6 @@ func main() {
 
 	slog.Info("tools registered", "count", len(toolRegistry.List()))
 
-	// 7. Provider factory for creating LLM providers on-the-fly
 	providerFactory := func(name, providerType, apiKey, baseURL string) llm.Provider {
 		switch strings.ToLower(providerType) {
 		case "anthropic":
@@ -104,12 +94,10 @@ func main() {
 		}
 	}
 
-	// 8. First-run seed (providers from firstrun.json)
 	if err := llm.LoadFirstRunWithFactory(cfg.FirstRunPath, database.DB, encryptor, llmRegistry, providerFactory); err != nil {
 		slog.Debug("firstrun seed skipped", "reason", err)
 	}
 
-	// 9. Init brain manager
 	brainDeps := &brain.Deps{
 		DB:              database.DB,
 		SiteDBManager:   siteDBMgr,
@@ -160,7 +148,6 @@ func main() {
 		})
 	})
 
-	// 10. Init chat handler
 	chatDeps := chat.SessionDeps{
 		DB:            database.DB,
 		SiteDBManager: siteDBMgr,
@@ -173,7 +160,6 @@ func main() {
 	}
 	chatHandler := chat.NewChatHandler(chatDeps)
 
-	// 11. Check if first run
 	userCount, err := models.CountUsers(database.DB)
 	if err != nil {
 		slog.Error("failed to count users", "error", err)
@@ -186,32 +172,25 @@ func main() {
 		slog.Info("existing installation detected", "users", userCount)
 	}
 
-	// 12. Auto-start brain workers for active sites
 	if err := brainMgr.AutoStart(); err != nil {
 		slog.Error("brain auto-start failed", "error", err)
 	}
 
-	// 12b. Start the task scheduler
 	brainMgr.StartScheduler()
-
-	// 12c. Start LLM log cleanup (daily, 30-day retention)
 	brainMgr.StartLogCleanup()
 
-	// 13. Init Caddy (optional)
 	caddyMgr := caddy.NewManager(cfg, database.DB, slog.Default())
 	caddyMgr.SubscribeToEvents(bus)
 	if err := caddyMgr.Start(); err != nil {
 		slog.Error("caddy start failed", "error", err)
 	}
 
-	// 14. Prepare embedded admin filesystem
 	adminSubFS, err := fs.Sub(adminFS, "web/admin")
 	if err != nil {
 		slog.Error("failed to create admin sub-filesystem", "error", err)
 		os.Exit(1)
 	}
 
-	// 15. Create and start HTTP servers
 	srv := server.New(&server.ServerDeps{
 		Config:          cfg,
 		DB:              database,
@@ -226,7 +205,6 @@ func main() {
 		ProviderFactory: providerFactory,
 		Logger:          slog.Default(),
 		AdminFS:         adminSubFS,
-		FoundationJS:    foundationJS,
 		Version:         Version,
 	})
 

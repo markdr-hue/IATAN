@@ -7,8 +7,11 @@ package chat
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 )
 
 // BuildChatSystemPrompt creates a compact system prompt for user chat sessions
@@ -23,6 +26,8 @@ func BuildChatSystemPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 		sb.WriteString(customPrompt)
 		sb.WriteString("\n\n")
 	}
+
+	sb.WriteString(fmt.Sprintf("Current date: %s\n\n", time.Now().UTC().Format("2006-01-02")))
 
 	// Owner personalization.
 	var ownerName string
@@ -70,6 +75,9 @@ func BuildChatSystemPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 		sb.WriteString("\n")
 	}
 
+	// Data layer — API endpoints, WebSocket, SSE, uploads.
+	sb.WriteString(BuildDataLayerSummary(siteDB))
+
 	// Memory keys (just keys for awareness, not full values).
 	if rows, err := siteDB.Query("SELECT key FROM memory ORDER BY updated_at DESC LIMIT 10"); err == nil {
 		defer rows.Close()
@@ -104,7 +112,136 @@ func BuildChatSystemPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 		}
 	}
 
-	sb.WriteString("You can use the available tools to look up details, manage pages, data, etc.\n")
+	sb.WriteString(`## Tool Guide
+- manage_pages: read/update page HTML and JS
+- manage_files: update CSS or JS assets (scope: "global" or "page")
+- manage_endpoints: create/modify API, WebSocket, SSE, or upload endpoints
+- manage_data: query/insert/update rows in data tables
+- manage_schema: add/modify database tables and columns
+- manage_layout: fix navigation or footer
+- manage_memory: read/store site context
+- manage_communication: ask the owner questions or suggest a rebuild
+- After making changes, briefly confirm what you did
+- Do NOT rebuild the entire site — make targeted fixes only
+`)
+
+	return sb.String()
+}
+
+// BuildDataLayerSummary generates a concise summary of the site's API endpoints,
+// WebSocket endpoints, SSE streams, and upload endpoints for inclusion in prompts.
+// Exported so brain/prompts.go can reuse it for the chat-wake prompt.
+func BuildDataLayerSummary(siteDB *sql.DB) string {
+	var sb strings.Builder
+
+	// CRUD API endpoints.
+	var apiLines []string
+	if rows, err := siteDB.Query(`
+		SELECT e.path, e.requires_auth, e.public_read, COALESCE(t.schema_def, '{}')
+		FROM api_endpoints e
+		LEFT JOIN dynamic_tables t ON e.table_name = t.table_name
+		ORDER BY e.path`); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var path, schemaDef string
+			var requiresAuth, publicRead bool
+			if rows.Scan(&path, &requiresAuth, &publicRead, &schemaDef) != nil {
+				continue
+			}
+
+			// Parse schema fields.
+			fields := ""
+			if schemaDef != "" && schemaDef != "{}" {
+				var cols map[string]string
+				if json.Unmarshal([]byte(schemaDef), &cols) == nil {
+					var ff []string
+					for col, typ := range cols {
+						if strings.EqualFold(typ, "PASSWORD") {
+							continue
+						}
+						ff = append(ff, col)
+					}
+					sort.Strings(ff)
+					fields = " — fields: " + strings.Join(ff, ", ")
+				}
+			}
+
+			flags := ""
+			if requiresAuth && publicRead {
+				flags = " [AUTH] [PUBLIC_READ]"
+			} else if requiresAuth {
+				flags = " [AUTH]"
+			}
+
+			apiLines = append(apiLines, fmt.Sprintf("/api/%s%s%s", path, flags, fields))
+		}
+	}
+
+	// WebSocket endpoints.
+	var wsLines []string
+	if rows, err := siteDB.Query("SELECT path, COALESCE(room_column, '') FROM ws_endpoints"); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var path, roomCol string
+			if rows.Scan(&path, &roomCol) != nil {
+				continue
+			}
+			room := ""
+			if roomCol != "" {
+				room = fmt.Sprintf(" (rooms by %s)", roomCol)
+			}
+			wsLines = append(wsLines, fmt.Sprintf("/api/%s/ws%s", path, room))
+		}
+	}
+
+	// SSE stream endpoints.
+	var sseLines []string
+	if rows, err := siteDB.Query("SELECT path, COALESCE(event_types, '') FROM stream_endpoints"); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var path, events string
+			if rows.Scan(&path, &events) != nil {
+				continue
+			}
+			sseLines = append(sseLines, fmt.Sprintf("/api/%s/stream — events: %s", path, events))
+		}
+	}
+
+	// Upload endpoints.
+	var uploadLines []string
+	if rows, err := siteDB.Query("SELECT path, COALESCE(allowed_types, '') FROM upload_endpoints"); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var path, types string
+			if rows.Scan(&path, &types) != nil {
+				continue
+			}
+			uploadLines = append(uploadLines, fmt.Sprintf("POST /api/%s/upload — accepts: %s", path, types))
+		}
+	}
+
+	// Only emit section if there's something to show.
+	if len(apiLines) == 0 && len(wsLines) == 0 && len(sseLines) == 0 && len(uploadLines) == 0 {
+		return ""
+	}
+
+	sb.WriteString("## Data Layer\n")
+	if len(apiLines) > 0 {
+		sb.WriteString("### API Endpoints\n")
+		sb.WriteString(strings.Join(apiLines, "\n") + "\n\n")
+	}
+	if len(wsLines) > 0 {
+		sb.WriteString("### WebSocket Endpoints\n")
+		sb.WriteString(strings.Join(wsLines, "\n") + "\n\n")
+	}
+	if len(sseLines) > 0 {
+		sb.WriteString("### SSE Stream Endpoints\n")
+		sb.WriteString(strings.Join(sseLines, "\n") + "\n\n")
+	}
+	if len(uploadLines) > 0 {
+		sb.WriteString("### Upload Endpoints\n")
+		sb.WriteString(strings.Join(uploadLines, "\n") + "\n\n")
+	}
 
 	return sb.String()
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,19 @@ const (
 	maxStageRetries       = 3
 	llmTimeout            = 5 * time.Minute
 	toolTimeout           = 2 * time.Minute
+	maxLLMRetries         = 3
+	maxContinuations      = 2
 )
+
+// stageTimeouts defines the maximum wall-clock time each stage may run.
+var stageTimeouts = map[PipelineStage]time.Duration{
+	StageAnalyze:         5 * time.Minute,
+	StageBlueprint:       5 * time.Minute,
+	StageBuild:           60 * time.Minute,
+	StageValidate:        20 * time.Minute,
+	StageComplete:        1 * time.Minute,
+	StageUpdateBlueprint: 5 * time.Minute,
+}
 
 // PipelineWorker is a goroutine that autonomously builds a site using a
 // deterministic stage pipeline. It replaces the tick-based BrainWorker.
@@ -41,7 +54,7 @@ type PipelineWorker struct {
 
 	mu            sync.RWMutex
 	state         BrainState
-	idleTickCount int
+	idleCheckCount int
 	wakeContext   map[string]interface{}
 
 	semaphore chan struct{}
@@ -114,7 +127,9 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 		// But if error_count was high (repeated failures), keep the pause to avoid
 		// burning tokens on the same failure after restart.
 		var prevErrorCount int
-		w.siteDB.DB.QueryRow("SELECT error_count FROM pipeline_state WHERE id = 1").Scan(&prevErrorCount)
+		if err := w.siteDB.DB.QueryRow("SELECT error_count FROM pipeline_state WHERE id = 1").Scan(&prevErrorCount); err != nil {
+			w.logger.Warn("could not read previous error_count, assuming 0", "error", err)
+		}
 		if prevErrorCount >= maxStageRetries {
 			w.logger.Warn("auto-recovery skipped: previous error_count was high, manual resume required", "error_count", prevErrorCount)
 			w.setState(StatePaused)
@@ -158,6 +173,7 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 
 	// Execute stages sequentially from current stage.
 	stage := state.Stage
+
 	stageRetries := 0
 	for {
 		if ctx.Err() != nil {
@@ -186,21 +202,28 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 					w.logger.Error("stage panic", "stage", stage, "panic", r)
 				}
 			}()
+
+			// Per-stage timeout prevents any single stage from running indefinitely.
+			stageCtx := ctx
+			if timeout, ok := stageTimeouts[stage]; ok {
+				var cancel context.CancelFunc
+				stageCtx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+
 			switch stage {
-			case StagePlan:
-				nextStage, stageErr = w.runPlan(ctx)
-			case StageDesign:
-				nextStage, stageErr = w.runDesign(ctx)
-			case StageDataLayer:
-				nextStage, stageErr = w.runDataLayer(ctx)
-			case StageBuildPages:
-				nextStage, stageErr = w.runBuildPages(ctx)
-			case StageReview:
-				nextStage, stageErr = w.runReview(ctx)
+			case StageAnalyze:
+				nextStage, stageErr = w.runAnalyze(stageCtx)
+			case StageBlueprint:
+				nextStage, stageErr = w.runBlueprint(stageCtx)
+			case StageBuild:
+				nextStage, stageErr = w.runBuild(stageCtx)
+			case StageValidate:
+				nextStage, stageErr = w.runValidate(stageCtx)
 			case StageComplete:
-				nextStage, stageErr = w.runComplete(ctx)
-			case StageUpdatePlan:
-				nextStage, stageErr = w.runUpdatePlan(ctx)
+				nextStage, stageErr = w.runComplete(stageCtx)
+			case StageUpdateBlueprint:
+				nextStage, stageErr = w.runUpdateBlueprint(stageCtx)
 			default:
 				stageErr = fmt.Errorf("unknown pipeline stage: %s", stage)
 			}
@@ -317,9 +340,14 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 	switch cmd.Type {
 	case CommandWake:
 		w.mu.Lock()
-		w.idleTickCount = 0
+		w.idleCheckCount = 0
 		if cmd.Payload != nil {
-			w.wakeContext = cmd.Payload
+			// Deep-copy to prevent races if the sender retains a reference.
+			cp := make(map[string]interface{}, len(cmd.Payload))
+			for k, v := range cmd.Payload {
+				cp[k] = v
+			}
+			w.wakeContext = cp
 		}
 		w.mu.Unlock()
 		// If paused waiting for answers, resume the pipeline.
@@ -351,7 +379,7 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 	case CommandUpdate:
 		// Trigger incremental update with change description.
 		w.mu.Lock()
-		w.idleTickCount = 0
+		w.idleCheckCount = 0
 		w.mu.Unlock()
 		w.setState(StateBuilding)
 		desc := ""
@@ -359,7 +387,7 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 			desc = d
 		}
 		w.siteDB.ExecWrite("UPDATE pipeline_state SET update_description = ? WHERE id = 1", desc)
-		if err := AdvanceStage(w.siteDB, StageUpdatePlan); err != nil {
+		if err := AdvanceStage(w.siteDB, StageUpdateBlueprint); err != nil {
 			w.logger.Error("failed to set update stage", "error", err)
 		}
 
@@ -373,7 +401,7 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 	case CommandChat:
 		if w.State() == StateMonitoring {
 			w.mu.Lock()
-			w.idleTickCount = 0
+			w.idleCheckCount = 0
 			w.mu.Unlock()
 
 			// If the command carries a user message, run a chat-wake with
@@ -400,7 +428,7 @@ func (w *PipelineWorker) monitoringInterval() time.Duration {
 	}
 
 	w.mu.RLock()
-	idle := w.idleTickCount
+	idle := w.idleCheckCount
 	w.mu.RUnlock()
 
 	if idle >= idleThreshold {
@@ -415,6 +443,7 @@ func (w *PipelineWorker) monitoringInterval() time.Duration {
 // repeat until no more tool calls or maxIter reached.
 func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider, modelID, systemPrompt string, messages []llm.Message, toolDefs []llm.ToolDef, maxIter, maxTokens int) (lastContent, lastModel string, totalTokens, totalToolCalls int, err error) {
 	iteration := 0
+	continuationCount := 0
 	llmLogger := llm.NewDBLLMLogger(w.siteDB.Writer())
 	loggedProvider := llm.NewLoggedProvider(provider, llmLogger, "brain", "brain", &iteration)
 
@@ -423,7 +452,7 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 
 		var resp *llm.CompletionResponse
 		var callErr error
-		for attempt := 0; attempt < 2; attempt++ {
+		for attempt := 0; attempt < maxLLMRetries; attempt++ {
 			llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
 			resp, callErr = loggedProvider.Complete(llmCtx, llm.CompletionRequest{
 				Model:       modelID,
@@ -437,11 +466,27 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 			if callErr == nil {
 				break
 			}
-			if attempt == 0 && ctx.Err() == nil {
-				w.logger.Warn("LLM call failed, retrying", "iteration", i, "error", callErr)
-				continue
+			if ctx.Err() != nil {
+				break
 			}
-			break
+
+			errMsg := callErr.Error()
+			isRateLimit := strings.Contains(errMsg, "API error 429") ||
+				strings.Contains(errMsg, "API error 529") ||
+				strings.Contains(errMsg, "overloaded")
+
+			var backoff time.Duration
+			if isRateLimit {
+				backoff = time.Duration(15*(attempt+1)) * time.Second
+				w.logger.Warn("LLM rate limited, backing off", "iteration", i, "attempt", attempt, "backoff", backoff)
+			} else {
+				backoff = time.Duration(2*(attempt+1)) * time.Second
+				w.logger.Warn("LLM call failed, retrying", "iteration", i, "attempt", attempt, "error", callErr, "backoff", backoff)
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(backoff):
+			}
 		}
 		if callErr != nil {
 			return "", "", totalTokens, totalToolCalls, fmt.Errorf("LLM call failed at iteration %d: %w", i, callErr)
@@ -470,8 +515,12 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 
 		if len(resp.ToolCalls) == 0 {
 			if resp.StopReason == "max_tokens" {
-				// LLM was cut off mid-generation. Ask it to continue.
-				w.logger.Warn("LLM hit max_tokens, requesting continuation", "iteration", i)
+				continuationCount++
+				if continuationCount >= maxContinuations {
+					w.logger.Warn("LLM hit max_tokens too many times, stopping", "iteration", i, "continuations", continuationCount)
+					break
+				}
+				w.logger.Warn("LLM hit max_tokens, requesting continuation", "iteration", i, "continuation", continuationCount)
 				messages = append(messages, assistantMsg)
 				messages = append(messages, llm.Message{
 					Role:    llm.RoleUser,
@@ -618,8 +667,64 @@ func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.T
 		if w.deps.Bus != nil {
 			w.deps.Bus.Publish(events.NewEvent(events.EventBrainToolResult, w.siteID, resultPayload))
 		}
+
+		// Publish human-readable progress for successful write operations.
+		if toolErr == nil {
+			if msg := toolProgressMessage(tc.Name, args); msg != "" {
+				w.publishBrainMessage(msg)
+			}
+		}
 	}
 	return messages
+}
+
+// toolProgressMessage returns a human-readable message for successful write
+// operations (file saves, layout saves, page saves, etc.). Returns "" for
+// read-only operations or tools that don't need progress reporting.
+func toolProgressMessage(toolName string, args map[string]interface{}) string {
+	action, _ := args["action"].(string)
+	switch toolName {
+	case "manage_files":
+		filename, _ := args["filename"].(string)
+		if filename == "" {
+			return ""
+		}
+		switch action {
+		case "save":
+			scope, _ := args["scope"].(string)
+			if scope == "" {
+				scope = "page"
+			}
+			return fmt.Sprintf("Created **%s** (%s)", filename, scope)
+		case "delete":
+			return fmt.Sprintf("Deleted **%s**", filename)
+		}
+	case "manage_layout":
+		name, _ := args["name"].(string)
+		if name == "" {
+			name = "default"
+		}
+		if action == "save" {
+			return fmt.Sprintf("Saved layout: **%s**", name)
+		}
+	// manage_pages excluded — BUILD_PAGES stage has its own per-page messages.
+	case "manage_tables":
+		table, _ := args["table"].(string)
+		if action == "create" && table != "" {
+			return fmt.Sprintf("Created table: **%s**", table)
+		}
+	case "manage_endpoints":
+		table, _ := args["table"].(string)
+		if action == "create" && table != "" {
+			return fmt.Sprintf("Created API endpoint: **/api/%s**", table)
+		}
+	case "manage_memory":
+		key, _ := args["key"].(string)
+		if action == "remember" && key != "" {
+			return fmt.Sprintf("Stored: **%s**", key)
+		}
+	}
+	return ""
 }
 
 // executeScheduledTask runs a scheduled task with a custom prompt.
@@ -667,7 +772,8 @@ func (w *PipelineWorker) handleChatWake(ctx context.Context, userMessage string)
 	}
 
 	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
-	prompt := buildChatWakePrompt(site, w.siteDB.DB, userMessage)
+	bp, _ := w.loadBlueprint()
+	prompt := buildChatWakePrompt(site, w.siteDB.DB, userMessage, bp)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
 	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(chatWakeTools))
 
@@ -795,6 +901,11 @@ func (w *PipelineWorker) publishBrainMessage(content string) {
 
 func (w *PipelineWorker) publishBrainError(errMsg string) {
 	w.publishBrainMessage("**Pipeline Error:** " + errMsg)
+	if w.deps.Bus != nil {
+		w.deps.Bus.Publish(events.NewEvent(events.EventBrainError, w.siteID, map[string]interface{}{
+			"error": errMsg,
+		}))
+	}
 }
 
 func (w *PipelineWorker) finalizeTaskRun(runID int64, taskID int, success bool, errMsg string) {
@@ -853,6 +964,11 @@ func payloadInt64(payload map[string]interface{}, key string) int64 {
 	}
 	if v, ok := payload[key].(int); ok {
 		return int64(v)
+	}
+	if v, ok := payload[key].(string); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
 	}
 	return 0
 }

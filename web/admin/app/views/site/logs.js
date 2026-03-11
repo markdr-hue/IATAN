@@ -12,7 +12,7 @@ import { get } from '../../core/http.js';
 import { icon } from '../../ui/icon.js';
 import * as toast from '../../ui/toast.js';
 import * as state from '../../core/state.js';
-import { emptyState } from '../../ui/helpers.js';
+import { emptyState, formatNum } from '../../ui/helpers.js';
 
 export async function renderSiteLogs(container, siteId) {
   clear(container);
@@ -430,14 +430,6 @@ export async function renderSiteLogs(container, siteId) {
       URL.revokeObjectURL(a.href);
     })
     .catch(err => toast.error('CSV export failed: ' + err.message));
-  }
-
-  // --- Helpers ---
-  function formatNum(n) {
-    if (n == null || n === 0) return '0';
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-    if (n >= 10_000) return (n / 1_000).toFixed(1) + 'K';
-    return n.toLocaleString();
   }
 
   // --- Real-time SSE watchers ---

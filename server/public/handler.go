@@ -113,12 +113,12 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 		pagePath = "/"
 	}
 
-	var content, title, metadata, pageAssets sql.NullString
+	var content, title, metadata, layoutName, pageAssets sql.NullString
 	var routeParams map[string]string
 	err = siteDB.QueryRow(
-		"SELECT title, content, metadata, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+		"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
 		pagePath,
-	).Scan(&title, &content, &metadata, &pageAssets)
+	).Scan(&title, &content, &metadata, &layoutName, &pageAssets)
 	if err != nil {
 		// Try parameterized route match: /thread/4 → /thread/:id
 		templatePath, params, paramErr := findParamPage(siteDB.DB, pagePath)
@@ -127,9 +127,9 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		err = siteDB.QueryRow(
-			"SELECT title, content, metadata, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
+			"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
 			templatePath,
-		).Scan(&title, &content, &metadata, &pageAssets)
+		).Scan(&title, &content, &metadata, &layoutName, &pageAssets)
 		if err != nil {
 			writePublicError(w, http.StatusNotFound, "page not found")
 			return
@@ -146,12 +146,19 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 	cleaned = footBlockRe.ReplaceAllString(cleaned, "")
 	cleanContent, contentCSS, contentJS := stripForSPA(cleaned)
 
+	// Normalize layout name for the SPA router (NULL/empty → "default").
+	respLayout := layoutName.String
+	if respLayout == "" {
+		respLayout = "default"
+	}
+
 	resp := map[string]interface{}{
 		"path":     pagePath,
 		"title":    title.String,
 		"content":  strings.TrimSpace(cleanContent),
 		"metadata": metadata.String,
 		"site_id":  site.ID,
+		"layout":   respLayout,
 	}
 	if routeParams != nil {
 		resp["params"] = routeParams
@@ -162,6 +169,21 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 		dbCSS, dbJS := parsePageAssetURLs(pageAssets.String)
 		contentCSS = append(dbCSS, contentCSS...)
 		contentJS = append(dbJS, contentJS...)
+	}
+	// Append version hash to asset URLs for cache-busting.
+	versionHash := getAssetVersionHash(siteDB.DB)
+	if versionHash != "" {
+		vSuffix := "?v=" + versionHash
+		for i, url := range contentCSS {
+			if strings.HasPrefix(url, "/assets/") && !strings.Contains(url, "?") {
+				contentCSS[i] = url + vSuffix
+			}
+		}
+		for i, url := range contentJS {
+			if strings.HasPrefix(url, "/assets/") && !strings.Contains(url, "?") {
+				contentJS[i] = url + vSuffix
+			}
+		}
 	}
 	if len(contentCSS) > 0 {
 		resp["page_css"] = dedupStrings(contentCSS)
@@ -297,9 +319,28 @@ func loadLayout(siteDB *sql.DB, name string) *layoutData {
 	return &ld
 }
 
-// autoInjectAssets queries global-scoped CSS/JS assets and returns link/script tags.
-// Page-scoped assets are injected separately per page via injectPageAssets.
+// getAssetVersionHash returns a short content-based hash for cache-busting.
+// It uses the most recent created_at timestamp across all assets so URLs
+// change whenever any asset is updated, forcing browsers to re-fetch.
+func getAssetVersionHash(siteDB *sql.DB) string {
+	var maxCreatedAt sql.NullString
+	siteDB.QueryRow("SELECT MAX(created_at) FROM assets").Scan(&maxCreatedAt)
+	if !maxCreatedAt.Valid || maxCreatedAt.String == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(maxCreatedAt.String))
+	return fmt.Sprintf("%x", h[:4]) // 8 hex chars
+}
+
+// autoInjectAssets queries global-scoped CSS/JS assets and returns link/script tags
+// with versioned URLs for cache-busting.
 func autoInjectAssets(siteDB *sql.DB) (cssLinks, jsScripts string) {
+	versionHash := getAssetVersionHash(siteDB)
+	vSuffix := ""
+	if versionHash != "" {
+		vSuffix = "?v=" + versionHash
+	}
+
 	rows, err := siteDB.Query(
 		"SELECT filename FROM assets WHERE scope = 'global' AND (filename LIKE '%.css' OR filename LIKE '%.js') ORDER BY filename",
 	)
@@ -315,23 +356,26 @@ func autoInjectAssets(siteDB *sql.DB) (cssLinks, jsScripts string) {
 			continue
 		}
 		if strings.HasSuffix(strings.ToLower(fn), ".css") {
-			css.WriteString(`  <link rel="stylesheet" href="/assets/` + fn + `">` + "\n")
+			css.WriteString(`  <link rel="stylesheet" href="/assets/` + fn + vSuffix + `">` + "\n")
 		} else if strings.HasSuffix(strings.ToLower(fn), ".js") {
-			js.WriteString(`  <script src="/assets/` + fn + `"></script>` + "\n")
+			js.WriteString(`  <script src="/assets/` + fn + vSuffix + `"></script>` + "\n")
 		}
 	}
 	return css.String(), js.String()
 }
 
-// injectPageAssets generates link/script tags for page-scoped assets.
-// pageAssetsJSON is a JSON array of filenames, e.g. ["charts.js","maps.css"].
-func injectPageAssets(pageAssetsJSON string) (cssLinks, jsScripts string) {
+// injectPageAssets generates link/script tags for page-scoped assets with versioned URLs.
+func injectPageAssets(pageAssetsJSON, versionHash string) (cssLinks, jsScripts string) {
 	if pageAssetsJSON == "" || pageAssetsJSON == "null" {
 		return "", ""
 	}
 	var filenames []string
 	if err := json.Unmarshal([]byte(pageAssetsJSON), &filenames); err != nil {
 		return "", ""
+	}
+	vSuffix := ""
+	if versionHash != "" {
+		vSuffix = "?v=" + versionHash
 	}
 	var css, js strings.Builder
 	for _, fn := range filenames {
@@ -341,9 +385,9 @@ func injectPageAssets(pageAssetsJSON string) (cssLinks, jsScripts string) {
 		}
 		lower := strings.ToLower(fn)
 		if strings.HasSuffix(lower, ".css") {
-			css.WriteString(`  <link rel="stylesheet" href="/assets/` + fn + `">` + "\n")
+			css.WriteString(`  <link rel="stylesheet" href="/assets/` + fn + vSuffix + `">` + "\n")
 		} else if strings.HasSuffix(lower, ".js") {
-			js.WriteString(`  <script src="/assets/` + fn + `"></script>` + "\n")
+			js.WriteString(`  <script src="/assets/` + fn + vSuffix + `"></script>` + "\n")
 		}
 	}
 	return css.String(), js.String()
@@ -390,8 +434,9 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 	// Auto-inject global-scoped CSS/JS assets from the assets table.
 	cssLinks, jsScripts := autoInjectAssets(siteDB)
 
-	// Page-scoped assets (only for this page).
-	pageCSSLinks, pageJSScripts := injectPageAssets(pageAssetsJSON)
+	// Page-scoped assets (only for this page) — with version hash for cache-busting.
+	versionHash := getAssetVersionHash(siteDB)
+	pageCSSLinks, pageJSScripts := injectPageAssets(pageAssetsJSON, versionHash)
 
 	var b strings.Builder
 	b.WriteString("<!DOCTYPE html>\n")
@@ -451,7 +496,9 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 		b.WriteString("\n")
 	}
 
+
 	b.WriteString("</head>\n")
+
 	b.WriteString("<body>\n")
 
 	if layout != nil {
@@ -472,19 +519,10 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 			b.WriteString("\n")
 		}
 	} else {
-		// No layout — render content directly (fallback for pre-layout sites).
+		// No layout — still wrap in <main> so SPA router has a target element.
+		b.WriteString("<main>\n")
 		b.WriteString(cleanContent)
-	}
-
-	// Detect SPA architecture from site config.
-	var siteConfig struct {
-		Architecture string `json:"architecture"`
-	}
-	json.Unmarshal([]byte(site.Config), &siteConfig)
-
-	// Inject SPA flag before foundation JS if architecture is SPA.
-	if siteConfig.Architecture == "spa" {
-		b.WriteString("<script>window.__IATAN_SPA=true;</script>\n")
+		b.WriteString("\n</main>\n")
 	}
 
 	// Inject route params for parameterized pages (e.g. /thread/:id → {id: "4"}).
@@ -493,13 +531,6 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 		b.WriteString(fmt.Sprintf("<script>window.__routeParams=%s;</script>\n", paramsJSON))
 	} else {
 		b.WriteString("<script>window.__routeParams={};</script>\n")
-	}
-
-	// Inject built-in foundation JS runtime (App.fetch, App.auth, SPA router, etc.).
-	if len(h.deps.FoundationJS) > 0 {
-		b.WriteString("<script>")
-		b.Write(h.deps.FoundationJS)
-		b.WriteString("</script>\n")
 	}
 
 	// Auto-injected global JS assets (after footer/layout).
@@ -1020,7 +1051,9 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 		ct = "application/octet-stream"
 	}
 
-	// ETag for cache busting — browsers revalidate when assets change.
+	// ETag retained for correctness, but versioned URLs (?v=hash) are the
+	// primary cache-busting mechanism. Immutable caching means browsers won't
+	// even revalidate until the URL changes.
 	etag := fmt.Sprintf(`"%x"`, sha256.Sum256(data))[:18] + `"`
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
@@ -1029,7 +1062,7 @@ func (h *Handler) ServeAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
@@ -1152,7 +1185,7 @@ func (h *Handler) ServeFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
+	w.Header().Set("Cache-Control", "public, max-age=86400, must-revalidate")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
@@ -1363,6 +1396,7 @@ func (h *Handler) validateSiteToken(siteID int, token string) bool {
 // reservedParams are query parameters with special meaning that are not column filters.
 var reservedParams = map[string]bool{
 	"limit": true, "offset": true, "sort": true, "order": true,
+	"search": true, "stats": true,
 }
 
 // apiList handles GET /api/{path} — list rows with pagination and filtering.
@@ -1426,6 +1460,7 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB
 	args := append(whereArgs, limit, offset)
 	rows, err := siteDB.Query(query, args...)
 	if err != nil {
+		slog.Error("public API list query failed", "table", physTable, "query", query, "error", err)
 		writePublicError(w, http.StatusInternalServerError, "query error")
 		return
 	}
@@ -1441,6 +1476,28 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB
 	})
 }
 
+// rowIDColumn returns the column name and value to use for single-row lookups.
+// Numeric IDs match the auto-increment "id" column; non-numeric values (UUIDs,
+// slugs) are looked up against a "uuid" or "slug" column if one exists.
+func rowIDColumn(siteDB *sql.DB, physTable, rowID string) (col string, val interface{}) {
+	if _, err := strconv.ParseInt(rowID, 10, 64); err == nil {
+		return "id", rowID
+	}
+	// Non-numeric — check for uuid/slug columns in the table.
+	for _, candidate := range []string{"uuid", "slug"} {
+		var cnt int
+		err := siteDB.QueryRow(
+			fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name = ?", physTable),
+			candidate,
+		).Scan(&cnt)
+		if err == nil && cnt > 0 {
+			return candidate, rowID
+		}
+	}
+	// Fallback to id (will likely return 0 rows, yielding a 404).
+	return "id", rowID
+}
+
 // apiGetOne handles GET /api/{path}/{id} — get single row.
 func (h *Handler) apiGetOne(w http.ResponseWriter, _ *http.Request, siteDB *sql.DB, physTable, rowID string, ep *apiEndpoint) {
 	cols := h.visibleColumns(ep)
@@ -1448,8 +1505,9 @@ func (h *Handler) apiGetOne(w http.ResponseWriter, _ *http.Request, siteDB *sql.
 		cols = "*"
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE id = ?", cols, physTable)
-	rows, err := siteDB.Query(query, rowID)
+	lookupCol, lookupVal := rowIDColumn(siteDB, physTable, rowID)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", cols, physTable, lookupCol)
+	rows, err := siteDB.Query(query, lookupVal)
 	if err != nil {
 		writePublicError(w, http.StatusInternalServerError, "query error")
 		return
@@ -1567,9 +1625,10 @@ func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.
 		setClauses = append(setClauses, col+" = ?")
 		values = append(values, val)
 	}
-	values = append(values, rowID)
+	lookupCol, lookupVal := rowIDColumn(siteDB, physTable, rowID)
+	values = append(values, lookupVal)
 
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", physTable, strings.Join(setClauses, ", "))
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?", physTable, strings.Join(setClauses, ", "), lookupCol)
 	result, err := siteDB.Exec(query, values...)
 	if err != nil {
 		slog.Error("public API update failed", "table", physTable, "error", err)
@@ -1595,8 +1654,9 @@ func (h *Handler) apiUpdate(w http.ResponseWriter, r *http.Request, siteDB *sql.
 
 // apiDelete handles DELETE /api/{path}/{id} — delete a row.
 func (h *Handler) apiDelete(w http.ResponseWriter, siteDB *sql.DB, physTable, rowID string, _ *apiEndpoint, siteID int, endpointPath string) {
-	query := fmt.Sprintf("DELETE FROM %s WHERE id = ?", physTable)
-	result, err := siteDB.Exec(query, rowID)
+	lookupCol, lookupVal := rowIDColumn(siteDB, physTable, rowID)
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", physTable, lookupCol)
+	result, err := siteDB.Exec(query, lookupVal)
 	if err != nil {
 		writePublicError(w, http.StatusInternalServerError, "delete failed")
 		return
@@ -1641,12 +1701,14 @@ func (h *Handler) visibleColumns(ep *apiEndpoint) string {
 
 // scanRowsToMaps converts sql.Rows into a slice of maps.
 func (h *Handler) scanRowsToMaps(rows *sql.Rows) []map[string]interface{} {
+	defer rows.Close() // safe even if caller also defers Close
+
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil
 	}
 
-	var results []map[string]interface{}
+	results := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		values := make([]interface{}, len(columns))
 		valuePtrs := make([]interface{}, len(columns))
@@ -1976,18 +2038,20 @@ type wsEndpointConfig struct {
 	EventTypes       []string
 	ReceiveEventType string
 	WriteToTable     string
+	RoomColumn       string
 	RequiresAuth     bool
+	// Cached column schema for write_to_table (maps column name → type).
+	tableColumns map[string]string
 }
 
 func (h *Handler) loadWSEndpoint(siteDB *sql.DB, path string) (*wsEndpointConfig, error) {
 	var ws wsEndpointConfig
 	var eventTypesJSON string
-	var writeToTable sql.NullString
-	var receiveEventType sql.NullString
+	var writeToTable, receiveEventType sql.NullString
 	err := siteDB.QueryRow(
-		"SELECT path, event_types, receive_event_type, write_to_table, requires_auth FROM ws_endpoints WHERE path = ?",
+		"SELECT path, event_types, receive_event_type, write_to_table, requires_auth, COALESCE(room_column, '') FROM ws_endpoints WHERE path = ?",
 		path,
-	).Scan(&ws.Path, &eventTypesJSON, &receiveEventType, &writeToTable, &ws.RequiresAuth)
+	).Scan(&ws.Path, &eventTypesJSON, &receiveEventType, &writeToTable, &ws.RequiresAuth, &ws.RoomColumn)
 	if err != nil {
 		return nil, err
 	}
@@ -1999,6 +2063,16 @@ func (h *Handler) loadWSEndpoint(siteDB *sql.DB, path string) (*wsEndpointConfig
 	}
 	if writeToTable.Valid {
 		ws.WriteToTable = writeToTable.String
+	}
+
+	// Pre-load table column schema for structured write_to_table inserts.
+	if ws.WriteToTable != "" && validTableName.MatchString(ws.WriteToTable) {
+		var schemaDef sql.NullString
+		siteDB.QueryRow("SELECT schema_def FROM dynamic_tables WHERE table_name = ?", ws.WriteToTable).Scan(&schemaDef)
+		if schemaDef.Valid && schemaDef.String != "" {
+			ws.tableColumns = make(map[string]string)
+			json.Unmarshal([]byte(schemaDef.String), &ws.tableColumns)
+		}
 	}
 	return &ws, nil
 }
@@ -2040,11 +2114,19 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 
 	clientID := uuid.New().String()
 
+	// Room filtering: if room_column is set, read ?room= from the client.
+	roomValue := ""
+	if ws.RoomColumn != "" {
+		roomValue = r.URL.Query().Get("room")
+	}
+
 	// Build a set of allowed event types for outbound messages.
 	allowedTypes := make(map[events.EventType]bool)
 	for _, et := range ws.EventTypes {
 		allowedTypes[events.EventType(et)] = true
 	}
+	// Also allow the receive event type so clients see each other's messages.
+	allowedTypes[events.EventType(ws.ReceiveEventType)] = true
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -2056,6 +2138,19 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 		}
 		if !allowedTypes[e.Type] {
 			return
+		}
+		// Echo suppression: don't send events back to the originating client.
+		if cid, _ := e.Payload["client_id"].(string); cid == clientID {
+			return
+		}
+		// Room filtering: only forward events matching the client's room.
+		if ws.RoomColumn != "" && roomValue != "" {
+			if data, ok := e.Payload["data"].(map[string]interface{}); ok {
+				eventRoom := fmt.Sprintf("%v", data[ws.RoomColumn])
+				if eventRoom != roomValue {
+					return
+				}
+			}
 		}
 		select {
 		case eventCh <- e:
@@ -2075,9 +2170,9 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 			}
 
 			// Validate JSON.
-			var msgData interface{}
-			if err := json.Unmarshal(data, &msgData); err != nil {
-				continue // skip non-JSON messages
+			var msgMap map[string]interface{}
+			if err := json.Unmarshal(data, &msgMap); err != nil {
+				continue // skip non-JSON or non-object messages
 			}
 
 			// Publish to event bus.
@@ -2086,17 +2181,14 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 				siteID,
 				map[string]interface{}{
 					"path":      endpointPath,
-					"data":      msgData,
+					"data":      msgMap,
 					"client_id": clientID,
 				},
 			))
 
-			// Optional: write to table.
+			// Optional: write to table with structured column mapping.
 			if ws.WriteToTable != "" && validTableName.MatchString(ws.WriteToTable) {
-				siteDB.ExecWrite(
-					fmt.Sprintf("INSERT INTO %s (data, created_at) VALUES (?, datetime('now'))", ws.WriteToTable),
-					string(data),
-				)
+				wsWriteToTable(siteDB, ws, msgMap)
 			}
 		}
 	}()
@@ -2126,6 +2218,52 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 			}
 		}
 	}
+}
+
+// wsWriteToTable inserts a WebSocket message into the configured table,
+// mapping JSON fields to table columns using the cached schema.
+func wsWriteToTable(siteDB *db.SiteDB, ws *wsEndpointConfig, msgMap map[string]interface{}) {
+	if len(ws.tableColumns) == 0 {
+		// No schema cached — fall back to legacy data column.
+		raw, _ := json.Marshal(msgMap)
+		siteDB.ExecWrite(
+			fmt.Sprintf("INSERT INTO %s (data, created_at) VALUES (?, datetime('now'))", ws.WriteToTable),
+			string(raw),
+		)
+		return
+	}
+
+	// Map incoming JSON fields to table columns.
+	var cols []string
+	var placeholders []string
+	var vals []interface{}
+	for colName := range ws.tableColumns {
+		if colName == "id" || colName == "created_at" {
+			continue
+		}
+		val, exists := msgMap[colName]
+		if !exists {
+			continue
+		}
+		cols = append(cols, colName)
+		placeholders = append(placeholders, "?")
+		vals = append(vals, val)
+	}
+
+	if len(cols) == 0 {
+		return // no matching fields
+	}
+
+	// Always include created_at.
+	cols = append(cols, "created_at")
+	placeholders = append(placeholders, "datetime('now')")
+
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		ws.WriteToTable,
+		strings.Join(cols, ", "),
+		strings.Join(placeholders, ", "),
+	)
+	siteDB.ExecWrite(query, vals...)
 }
 
 // ---------------------------------------------------------------------------

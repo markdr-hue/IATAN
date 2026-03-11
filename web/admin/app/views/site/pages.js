@@ -132,8 +132,12 @@ async function showPagePreview(container, page, siteId) {
       },
     }, 'Delete');
 
-    const preview = h('div', { className: 'page-preview' });
-    preview.innerHTML = full.content || '<p style="opacity:0.5">No content</p>';
+    const preview = h('iframe', {
+      sandbox: '',
+      className: 'page-preview',
+      style: { width: '100%', border: 'none', minHeight: '400px', background: '#fff', borderRadius: '6px' },
+    });
+    preview.srcdoc = full.content || '<p style="opacity:0.5">No content</p>';
 
     container.appendChild(back);
     container.appendChild(h('div', { className: 'flex items-center gap-2 mb-2' }, [

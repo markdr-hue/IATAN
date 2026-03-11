@@ -68,37 +68,49 @@ func (h *SiteDiagnosticsHandler) Integrity(w http.ResponseWriter, r *http.Reques
 
 	var issues []integrityIssue
 
+	// Check current pipeline stage — suppress structural warnings during early build
+	// stages where layouts/assets/memories haven't been created yet.
+	var currentStage string
+	_ = siteDB.QueryRow("SELECT stage FROM pipeline_state WHERE id = 1").Scan(&currentStage)
+	buildComplete := currentStage == "MONITORING" || currentStage == "COMPLETE" || currentStage == ""
+
 	// Check layout exists
 	var layoutCount int
 	_ = siteDB.QueryRow("SELECT COUNT(*) FROM layouts").Scan(&layoutCount)
 	if layoutCount == 0 {
-		issues = append(issues, integrityIssue{"error", "No layouts found. The site has no page structure."})
-	}
-
-	// Check pages reference valid layouts
-	rows, err := siteDB.Query(
-		"SELECT p.path, p.layout FROM pages p WHERE p.is_deleted = 0 AND p.layout != '' AND p.layout NOT IN (SELECT name FROM layouts)",
-	)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var path, layout string
-			if rows.Scan(&path, &layout) == nil {
-				issues = append(issues, integrityIssue{"warning", "Page '" + path + "' references missing layout '" + layout + "'"})
-			}
+		if buildComplete {
+			issues = append(issues, integrityIssue{"error", "No layouts found. The site has no page structure."})
+		} else {
+			issues = append(issues, integrityIssue{"info", "No layouts yet — brain is still building (stage: " + currentStage + ")"})
 		}
 	}
 
-	// Check for pages without layout
-	rows2, err := siteDB.Query(
-		"SELECT path FROM pages WHERE is_deleted = 0 AND (layout IS NULL OR layout = '')",
-	)
-	if err == nil {
-		defer rows2.Close()
-		for rows2.Next() {
-			var path string
-			if rows2.Scan(&path) == nil {
-				issues = append(issues, integrityIssue{"warning", "Page '" + path + "' has no layout assigned"})
+	// Check pages reference valid layouts (only meaningful after layouts exist)
+	if layoutCount > 0 {
+		rows, err := siteDB.Query(
+			"SELECT p.path, p.layout FROM pages p WHERE p.is_deleted = 0 AND p.layout != '' AND p.layout NOT IN (SELECT name FROM layouts)",
+		)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var path, layout string
+				if rows.Scan(&path, &layout) == nil {
+					issues = append(issues, integrityIssue{"warning", "Page '" + path + "' references missing layout '" + layout + "'"})
+				}
+			}
+		}
+
+		// Check for pages without layout
+		rows2, err := siteDB.Query(
+			"SELECT path FROM pages WHERE is_deleted = 0 AND (layout IS NULL OR layout = '')",
+		)
+		if err == nil {
+			defer rows2.Close()
+			for rows2.Next() {
+				var path string
+				if rows2.Scan(&path) == nil {
+					issues = append(issues, integrityIssue{"warning", "Page '" + path + "' has no layout assigned"})
+				}
 			}
 		}
 	}
@@ -107,15 +119,21 @@ func (h *SiteDiagnosticsHandler) Integrity(w http.ResponseWriter, r *http.Reques
 	var assetCount int
 	_ = siteDB.QueryRow("SELECT COUNT(*) FROM assets").Scan(&assetCount)
 	if assetCount == 0 {
-		issues = append(issues, integrityIssue{"warning", "No CSS/JS assets found. The site may have no styling."})
+		if buildComplete {
+			issues = append(issues, integrityIssue{"warning", "No CSS/JS assets found. The site may have no styling."})
+		} else {
+			issues = append(issues, integrityIssue{"info", "No assets yet — brain is still building (stage: " + currentStage + ")"})
+		}
 	}
 
-	// Check design system memories
-	for _, key := range []string{"site_architecture", "design_summary"} {
-		var cnt int
-		_ = siteDB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = ?", key).Scan(&cnt)
-		if cnt == 0 {
-			issues = append(issues, integrityIssue{"warning", "Missing design memory: '" + key + "'"})
+	// Check design system memories (only flag after build is complete)
+	if buildComplete {
+		for _, key := range []string{"site_architecture", "design_summary"} {
+			var cnt int
+			_ = siteDB.QueryRow("SELECT COUNT(*) FROM memory WHERE key = ?", key).Scan(&cnt)
+			if cnt == 0 {
+				issues = append(issues, integrityIssue{"warning", "Missing design memory: '" + key + "'"})
+			}
 		}
 	}
 

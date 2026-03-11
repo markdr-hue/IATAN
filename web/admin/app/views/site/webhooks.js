@@ -71,18 +71,26 @@ export async function renderSiteWebhooks(container, siteId) {
         h('button', {
           className: `btn btn--sm ${wh.is_enabled ? 'btn--warning' : 'btn--success'}`,
           onClick: async () => {
-            await post(`/admin/api/sites/${siteId}/webhooks/${wh.id}/toggle`);
-            toast.success(wh.is_enabled ? 'Disabled' : 'Enabled');
-            renderSiteWebhooks(container, siteId);
+            try {
+              await post(`/admin/api/sites/${siteId}/webhooks/${wh.id}/toggle`);
+              toast.success(wh.is_enabled ? 'Disabled' : 'Enabled');
+              renderSiteWebhooks(container, siteId);
+            } catch (err) {
+              toast.error('Failed to toggle webhook: ' + err.message);
+            }
           },
         }, wh.is_enabled ? 'Disable' : 'Enable'),
         h('button', {
           className: 'btn btn--sm btn--danger',
           onClick: () => {
             modal.confirmDanger('Delete Webhook', `Delete webhook "${wh.name}"?`, async () => {
-              await del(`/admin/api/sites/${siteId}/webhooks/${wh.id}`);
-              toast.success('Deleted');
-              renderSiteWebhooks(container, siteId);
+              try {
+                await del(`/admin/api/sites/${siteId}/webhooks/${wh.id}`);
+                toast.success('Deleted');
+                renderSiteWebhooks(container, siteId);
+              } catch (err) {
+                toast.error('Failed to delete webhook: ' + err.message);
+              }
             });
           },
         }, 'Delete'),

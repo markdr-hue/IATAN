@@ -32,7 +32,7 @@ func (t *PagesTool) Parameters() map[string]interface{} {
 			"action":   map[string]interface{}{"type": "string", "description": "Action to perform", "enum": []string{"save", "get", "list", "delete", "restore", "history", "search"}},
 			"path":     map[string]interface{}{"type": "string", "description": "URL path for the page (e.g. /about)"},
 			"title":    map[string]interface{}{"type": "string", "description": "Page title"},
-			"content":  map[string]interface{}{"type": "string", "description": "MAIN-CONTENT-ONLY HTML. No nav, footer, or shared asset links (the server auto-injects those from the layout and assets tables). No <!DOCTYPE>/<html>/<head>/<body> tags."},
+			"content":  map[string]interface{}{"type": "string", "description": "HTML content for the page. The server wraps this with the site layout (nav/footer) and injects shared CSS/JS automatically."},
 			"template": map[string]interface{}{"type": "string", "description": "Template name to use for rendering"},
 			"status":   map[string]interface{}{"type": "string", "description": "Page status: published or draft", "enum": []string{"published", "draft"}},
 			"layout":   map[string]interface{}{"type": "string", "description": `Layout name for this page. Default: uses "default" layout. Use "none" for no layout wrapping.`},
@@ -120,6 +120,9 @@ func (t *PagesTool) save(ctx *ToolContext, args map[string]interface{}) (*Result
 		assetsArg = pageAssets
 	}
 
+	// Sanitize: strip dangerous event handlers and javascript: URIs from content.
+	content = sanitizePageHTML(content)
+
 	// Upsert the page.
 	_, err = ctx.DB.Exec(
 		`INSERT INTO pages (path, title, content, template, status, metadata, layout, assets, is_deleted, updated_at)
@@ -142,17 +145,35 @@ func (t *PagesTool) save(ctx *ToolContext, args map[string]interface{}) (*Result
 	}
 
 	// Post-save validation: warn about missing asset references, inline styles, JS issues.
-	warnings := validatePageContent(content, ctx.DB)
+	warnings := validatePageContent(content)
+
+	// Classify into hard errors (must fix) and soft warnings (informational).
+	var hardErrors, softWarnings []string
+	for _, w := range warnings {
+		if strings.Contains(w, "but no id=") || strings.Contains(w, "syntax error") || strings.Contains(w, "brace") {
+			hardErrors = append(hardErrors, w)
+		} else {
+			softWarnings = append(softWarnings, w)
+		}
+	}
 
 	// Coherence hints: check layout nav and internal links.
 	hints := checkCoherence(path, content, ctx.DB)
 
 	resultData := map[string]interface{}{"path": path, "title": title, "status": status}
-	if len(warnings) > 0 {
-		resultData["warnings"] = warnings
+	if len(softWarnings) > 0 {
+		resultData["warnings"] = softWarnings
 	}
 	if len(hints) > 0 {
 		resultData["hints"] = hints
+	}
+	if len(hardErrors) > 0 {
+		resultData["errors"] = hardErrors
+		return &Result{
+			Success: false,
+			Error:   "Page saved with errors that MUST be fixed: " + strings.Join(hardErrors, "; "),
+			Data:    resultData,
+		}, nil
 	}
 	return &Result{Success: true, Data: resultData}, nil
 }
@@ -389,8 +410,6 @@ var (
 	// Detects unguarded querySelector/querySelectorAll: result used with . but no ?. and not inside an if-check.
 	// Matches: querySelector(...).something or querySelectorAll(...).something (without ?.)
 	unguardedQSRe = regexp.MustCompile(`querySelector(?:All)?\([^)]+\)\.(?:[a-zA-Z])`)
-	// Detects top-level const/let/class declarations that cause re-declaration errors in SPA navigation.
-	globalDeclRe = regexp.MustCompile(`(?m)^(?:const|let|class)\s+\w+`)
 )
 
 func extractScriptContent(content string) string {
@@ -404,81 +423,56 @@ func extractScriptContent(content string) string {
 	return strings.Join(parts, "\n")
 }
 
-func validatePageContent(content string, db *sql.DB) []string {
+func validatePageContent(content string) []string {
 	var warnings []string
-	lower := strings.ToLower(content)
 
-	// Determine site architecture for SPA-specific validation.
-	var siteArch string
-	_ = db.QueryRow("SELECT value FROM memory WHERE key = 'site_architecture'").Scan(&siteArch)
-
-	// Warn if page contains layout-level content (nav, footer) — these belong in manage_layout.
-	if strings.Contains(lower, "<nav") {
-		warnings = append(warnings, "Page contains <nav> — navigation should be in the layout (manage_layout), not in individual pages")
-	}
-	if strings.Contains(lower, "<footer") {
-		warnings = append(warnings, "Page contains <footer> — footer should be in the layout (manage_layout), not in individual pages")
-	}
-
-	// Warn if page includes shared asset references (auto-injected by the server).
-	if strings.Contains(lower, `rel="stylesheet"`) && strings.Contains(lower, "/assets/") {
-		warnings = append(warnings, "Page contains <link rel='stylesheet'> for /assets/ — shared CSS is auto-injected by the server. Remove these links.")
-	}
-	if strings.Contains(lower, `<script`) && strings.Contains(lower, `src="`) && strings.Contains(lower, "/assets/") {
-		warnings = append(warnings, "Page contains <script src='/assets/'> — shared JS is auto-injected by the server. Remove these tags.")
-	}
-
-	if strings.Contains(lower, "style=\"") {
-		warnings = append(warnings, "Page contains inline styles — prefer shared CSS classes")
-	}
-	if strings.Contains(lower, "<style>") || strings.Contains(lower, "<style ") {
-		warnings = append(warnings, "Page contains a <style> block — prefer adding styles to shared CSS")
-	}
+	// Structural warnings (nav, footer, inline styles, shared asset links, style blocks)
+	// removed — the server handles all of these silently via stripDocumentShell,
+	// stripSharedAssetRefs, and extractAssetTags. Flagging them caused unnecessary
+	// fix loops that wasted tokens without improving quality.
 
 	scriptContent := extractScriptContent(content)
-	if scriptContent != "" {
-		opens := strings.Count(scriptContent, "{")
-		closes := strings.Count(scriptContent, "}")
-		if opens != closes {
-			warnings = append(warnings, fmt.Sprintf("Possible JS syntax error: %d open braces vs %d close braces", opens, closes))
-		}
+	if scriptContent == "" {
+		return nil
+	}
 
-		// Collect all IDs defined in the HTML.
-		htmlIDs := map[string]bool{}
-		for _, m := range htmlIDRe.FindAllStringSubmatch(content, -1) {
-			if len(m) > 1 {
-				htmlIDs[m[1]] = true
-			}
-		}
+	// JS brace balance check.
+	opens := strings.Count(scriptContent, "{")
+	closes := strings.Count(scriptContent, "}")
+	if opens != closes {
+		warnings = append(warnings, fmt.Sprintf("Possible JS syntax error: %d open braces vs %d close braces", opens, closes))
+	}
 
-		// Check getElementById('xxx') references against actual IDs.
-		referencedIDs := map[string]bool{}
-		for _, m := range getByIdRe.FindAllStringSubmatch(scriptContent, -1) {
-			if len(m) > 1 {
-				referencedIDs[m[1]] = true
-			}
+	// Collect all IDs defined in the HTML.
+	htmlIDs := map[string]bool{}
+	for _, m := range htmlIDRe.FindAllStringSubmatch(content, -1) {
+		if len(m) > 1 {
+			htmlIDs[m[1]] = true
 		}
-		// Check querySelector('#xxx') references.
-		for _, m := range querySelectorRe.FindAllStringSubmatch(scriptContent, -1) {
-			if len(m) > 1 {
-				referencedIDs[m[1]] = true
-			}
-		}
-		for id := range referencedIDs {
-			if !htmlIDs[id] {
-				warnings = append(warnings, fmt.Sprintf("JS references element #%s but no id=\"%s\" found in HTML — will cause TypeError at runtime", id, id))
-			}
-		}
+	}
 
-		// Detect unguarded querySelector().property (missing ?. operator).
-		if unguardedQSRe.MatchString(scriptContent) {
-			warnings = append(warnings, "querySelector() result used without ?. — add optional chaining to avoid TypeError when element is missing")
+	// Check getElementById('xxx') references against actual IDs.
+	referencedIDs := map[string]bool{}
+	for _, m := range getByIdRe.FindAllStringSubmatch(scriptContent, -1) {
+		if len(m) > 1 {
+			referencedIDs[m[1]] = true
 		}
+	}
+	// Check querySelector('#xxx') references.
+	for _, m := range querySelectorRe.FindAllStringSubmatch(scriptContent, -1) {
+		if len(m) > 1 {
+			referencedIDs[m[1]] = true
+		}
+	}
+	for id := range referencedIDs {
+		if !htmlIDs[id] {
+			warnings = append(warnings, fmt.Sprintf("JS references element #%s but no id=\"%s\" found in HTML — will cause TypeError at runtime", id, id))
+		}
+	}
 
-		// SPA: detect top-level const/let/class declarations that fail on re-execution.
-		if siteArch == "spa" && globalDeclRe.MatchString(scriptContent) {
-			warnings = append(warnings, "SPA page has top-level const/let/class in inline <script> — wrap in an IIFE: (function(){ ... })(); to prevent 'Identifier already declared' errors on navigation")
-		}
+	// Detect unguarded querySelector().property (missing ?. operator).
+	if unguardedQSRe.MatchString(scriptContent) {
+		warnings = append(warnings, "querySelector() result used without ?. — add optional chaining to avoid TypeError when element is missing")
 	}
 
 	return warnings
@@ -526,6 +520,22 @@ func checkCoherence(pagePath, content string, db *sql.DB) []string {
 	return hints
 }
 
+// sanitizePageHTML strips dangerous attributes (on* event handlers, javascript: URIs)
+// from HTML content to prevent XSS. Preserves all other HTML structure since pages
+// are intentionally HTML content built by the AI brain.
+var (
+	onEventAttrRe   = regexp.MustCompile(`(?i)\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)`)
+	jsURIRe         = regexp.MustCompile(`(?i)(href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')`)
+	dataURIScriptRe = regexp.MustCompile(`(?i)(href|src)\s*=\s*(?:"data:text/html[^"]*"|'data:text/html[^']*')`)
+)
+
+func sanitizePageHTML(content string) string {
+	content = onEventAttrRe.ReplaceAllString(content, "")
+	content = jsURIRe.ReplaceAllString(content, "")
+	content = dataURIScriptRe.ReplaceAllString(content, "")
+	return content
+}
+
 func (t *PagesTool) MaxResultSize() int { return 16000 }
 
 func (t *PagesTool) Summarize(result string) string {
@@ -555,7 +565,7 @@ func (t *PagesTool) Summarize(result string) string {
 		parts = append(parts, fmt.Sprintf(`"success":true,"path":"%s"`, path))
 		if hasW {
 			wJSON, _ := json.Marshal(warnings)
-			parts = append(parts, fmt.Sprintf(`"warnings":%s,"ACTION_REQUIRED":"Fix these warnings"`, wJSON))
+			parts = append(parts, fmt.Sprintf(`"warnings":%s`, wJSON))
 		}
 		if hasH {
 			hJSON, _ := json.Marshal(hints)

@@ -151,8 +151,6 @@ func (s *Scheduler) checkDueTasksForSite(ctx context.Context, siteDB *db.SiteDB,
 		}
 		tasks = append(tasks, t)
 	}
-	rows.Close()
-
 	for _, t := range tasks {
 		s.logger.Info("dispatching scheduled task", "task_id", t.id, "task_name", t.name, "site_id", siteID)
 

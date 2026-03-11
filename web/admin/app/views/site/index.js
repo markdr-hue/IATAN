@@ -14,6 +14,7 @@ import { icon } from '../../ui/icon.js';
 import * as toast from '../../ui/toast.js';
 import * as state from '../../core/state.js';
 import { setPanelSwitcher } from '../../ui/chat/cards.js';
+import { formatPublicUrl } from '../../ui/helpers.js';
 
 import { renderSiteHome } from './home.js';
 import { renderSitePages } from './pages.js';
@@ -144,12 +145,7 @@ export async function renderSiteDetail(container, params) {
       h('h2', { className: 'site-header__name' }, site.name),
       stateBadge,
       (() => {
-        const sys = state.get('systemStatus') || {};
-        const publicPort = sys.public_port || 5000;
-        const needsPort = !site.domain || site.domain.includes('localhost');
-        const host = site.domain || 'localhost';
-        const url = needsPort ? `http://${host}:${publicPort}` : `http://${host}`;
-        const label = needsPort ? `${host}:${publicPort}` : host;
+        const { url, label } = formatPublicUrl(site, state.get('systemStatus'));
         return h('a', {
           href: url,
           target: '_blank',
@@ -232,60 +228,27 @@ function renderContextPanel(container, panel, siteId, site) {
     _panelCleanup = null;
   }
 
-  let cleanup = null;
+  const panels = {
+    pages: (c, id) => renderSitePages(c, id),
+    assets: (c, id) => renderSiteAssets(c, id),
+    tables: (c, id) => renderSiteTables(c, id),
+    endpoints: (c, id) => renderSiteEndpoints(c, id),
+    files: (c, id) => renderSiteFiles(c, id),
+    tasks: (c, id) => renderSiteTasks(c, id),
+    questions: (c, id) => renderSiteQuestions(c, id),
+    providers: (c, id) => renderSiteProviders(c, id),
+    webhooks: (c, id) => renderSiteWebhooks(c, id),
+    logs: (c, id) => renderSiteLogs(c, id),
+    secrets: (c, id) => renderSiteSecrets(c, id),
+    memory: (c, id) => renderSiteMemory(c, id),
+    layouts: (c, id) => renderSiteLayouts(c, id),
+    analytics: (c, id) => renderSiteAnalytics(c, id),
+    diagnostics: (c, id) => renderSiteDiagnostics(c, id),
+    settings: (c, id) => renderSiteSettings(c, id, site),
+  };
 
-  switch (panel) {
-    case 'pages':
-      cleanup = renderSitePages(container, siteId);
-      break;
-    case 'assets':
-      cleanup = renderSiteAssets(container, siteId);
-      break;
-    case 'tables':
-      cleanup = renderSiteTables(container, siteId);
-      break;
-    case 'endpoints':
-      cleanup = renderSiteEndpoints(container, siteId);
-      break;
-    case 'files':
-      cleanup = renderSiteFiles(container, siteId);
-      break;
-    case 'tasks':
-      cleanup = renderSiteTasks(container, siteId);
-      break;
-    case 'questions':
-      cleanup = renderSiteQuestions(container, siteId);
-      break;
-    case 'providers':
-      cleanup = renderSiteProviders(container, siteId);
-      break;
-    case 'webhooks':
-      cleanup = renderSiteWebhooks(container, siteId);
-      break;
-    case 'logs':
-      cleanup = renderSiteLogs(container, siteId);
-      break;
-    case 'secrets':
-      cleanup = renderSiteSecrets(container, siteId);
-      break;
-    case 'memory':
-      cleanup = renderSiteMemory(container, siteId);
-      break;
-    case 'layouts':
-      cleanup = renderSiteLayouts(container, siteId);
-      break;
-    case 'analytics':
-      cleanup = renderSiteAnalytics(container, siteId);
-      break;
-    case 'diagnostics':
-      cleanup = renderSiteDiagnostics(container, siteId);
-      break;
-    case 'settings':
-      cleanup = renderSiteSettings(container, siteId, site);
-      break;
-    default:
-      cleanup = renderSitePages(container, siteId);
-  }
+  const renderFn = panels[panel] || panels.pages;
+  const cleanup = renderFn(container, siteId);
 
   // cleanup may be a Promise (from async render fns) that resolves to a function
   if (cleanup && typeof cleanup.then === 'function') {

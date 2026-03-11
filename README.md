@@ -70,7 +70,7 @@ chmod +x ./iatan && ./iatan
 - Email sending (SendGrid, Mailgun, Resend, SES, or any REST provider)
 - Payment flows (Stripe, PayPal, Mollie, Square, or any provider)
 - Aggregation queries (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
-- Webhooks (20+ event types, HMAC-SHA256 signatures, retry with backoff)
+- Webhooks (HMAC-SHA256 signatures, retry with backoff)
 - Scheduled tasks (cron-based, AI-managed)
 - Service providers (connect any external API with stored credentials)
 - Encrypted secrets (AES-256-GCM for API keys and credentials)
@@ -80,7 +80,6 @@ chmod +x ./iatan && ./iatan
 - Crash recovery (pipeline checkpoint, resumes exactly where it left off)
 - Version history (pages and files with rollback)
 - LLM logging with token stats, CSV export, and prompt caching
-- Built-in JS runtime (`App.fetch`, SPA router, state management, auth helpers)
 
 ---
 
@@ -90,15 +89,14 @@ Every site goes through the same deterministic build process:
 
 | Stage | What Happens |
 |---|---|
-| **PLAN** | Analyzes your description, asks clarifying questions if needed, produces a structured JSON site plan |
-| **DESIGN** | Creates CSS theme, layout system, and shared assets. Sets up the SPA router |
-| **DATA LAYER** | Tables, schemas, auth, OAuth, API endpoints with RBAC (skipped if not needed) |
-| **BUILD PAGES** | One focused LLM call per page, built sequentially with shared context |
-| **REVIEW** | Go-based HTML/CSS/link validation + LLM fix cycle |
+| **ANALYZE** | Analyzes your description, asks clarifying questions if needed, produces a structured Analysis JSON |
+| **BLUEPRINT** | Creates detailed build specification (pages, endpoints, tables, design) |
+| **BUILD** | Single-phase: creates all data tables, endpoints, CSS, layout, and pages |
+| **VALIDATE** | Blueprint conformance check — verifies all planned items were created |
 | **COMPLETE** | Notifies the owner, switches to monitoring mode |
 | **MONITORING** | Adaptive health checks (5-15 min), self-healing |
 
-Updates use an incremental path: only affected pages and components get rebuilt via a PlanPatch.
+Updates use an incremental path: only affected pages and components get rebuilt via a BlueprintPatch.
 
 ---
 
@@ -171,7 +169,7 @@ The admin panel runs on port **5001**. If your server is publicly accessible, bl
 
 ## About Me
 
-- Full-time single dad of 3, with a full-time job to match.
+- Full-time single dad of 3, they give me purpose.
 - My ideas and perspective tend to be a bit unconventional, which means I'm often misunderstood or out of step with the people around me.
 - I frequently question whether I see the world differently from everyone else. I've made peace with the fact that the answer is probably yes.
 

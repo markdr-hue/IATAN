@@ -349,7 +349,7 @@ CREATE TABLE IF NOT EXISTS layouts (
 -- Pipeline state: singleton row tracking current build progress
 CREATE TABLE IF NOT EXISTS pipeline_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    stage TEXT NOT NULL DEFAULT 'PLAN',
+    stage TEXT NOT NULL DEFAULT 'ANALYZE',
     plan_json TEXT,
     blueprint_json TEXT,
     update_description TEXT,

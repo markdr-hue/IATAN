@@ -23,6 +23,29 @@ export function formatBytes(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+/**
+ * Build a public-facing URL and display label for a site.
+ * @param {Object} site - Site object with `domain` property.
+ * @param {Object} [systemStatus] - System status with `public_port`.
+ * @returns {{ url: string, label: string }}
+ */
+export function formatPublicUrl(site, systemStatus) {
+  const publicPort = (systemStatus && systemStatus.public_port) || 5000;
+  const host = site.domain || 'localhost';
+  const needsPort = !site.domain || host.includes('localhost');
+  const url = needsPort ? `http://${host}:${publicPort}` : `http://${host}`;
+  const label = needsPort ? `${host}:${publicPort}` : host;
+  return { url, label };
+}
+
+/** Human-readable number with abbreviated large values. */
+export function formatNum(n) {
+  if (n == null || n === 0) return '0';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 10_000) return (n / 1_000).toFixed(1) + 'K';
+  return n.toLocaleString();
+}
+
 /** Human-readable duration from seconds. */
 export function formatInterval(seconds) {
   if (seconds < 60) return `${seconds}s`;

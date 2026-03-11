@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS sites (
     mode TEXT NOT NULL DEFAULT 'building',
     llm_model_id INTEGER NOT NULL,
     config TEXT DEFAULT '{}',
-    tick_count INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

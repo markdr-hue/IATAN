@@ -10,7 +10,7 @@
  * and answer acknowledgment flow.
  */
 
-import { h, render, clear } from '../../core/dom.js';
+import { h, render } from '../../core/dom.js';
 import { get } from '../../core/http.js';
 import * as state from '../../core/state.js';
 import { createFeed } from '../../ui/chat/feed.js';
@@ -205,6 +205,7 @@ export function renderSiteChat(container, siteId) {
 
   let oldestTimestamp = null;
   let hasOlderMessages = true;
+  let loadingEarlier = false;
 
   function renderMessages(messages, prepend = false) {
     // First pass: build a map of tool_call_id → result content from role="tool" messages
@@ -306,7 +307,16 @@ export function renderSiteChat(container, siteId) {
   }
 
   async function loadEarlierMessages() {
-    if (!oldestTimestamp || !hasOlderMessages) return;
+    if (!oldestTimestamp || !hasOlderMessages || loadingEarlier) return;
+    loadingEarlier = true;
+
+    // Show loading state on the button.
+    const btnEl = feed.element.querySelector('.load-earlier-btn button');
+    if (btnEl) {
+      btnEl.textContent = 'Loading...';
+      btnEl.disabled = true;
+    }
+
     try {
       const messages = await get(`/admin/api/chat/${siteId}/history?before=${encodeURIComponent(oldestTimestamp)}`);
       if (!messages || messages.length === 0) {
@@ -318,13 +328,26 @@ export function renderSiteChat(container, siteId) {
       oldestTimestamp = messages[0].created_at;
       hasOlderMessages = messages.length >= 50;
 
+      // Preserve scroll position: capture height before prepending.
+      const prevHeight = feed.element.scrollHeight;
+
       renderMessages(messages, true);
+
+      // Restore scroll so the user's current view stays stable.
+      feed.element.scrollTop += feed.element.scrollHeight - prevHeight;
 
       if (hasOlderMessages) {
         addLoadEarlierButton();
       }
     } catch (err) {
-      // Silently handle load failures
+      console.error('Load earlier messages failed:', err);
+      // Restore button so user can retry.
+      if (btnEl) {
+        btnEl.textContent = 'Load earlier messages';
+        btnEl.disabled = false;
+      }
+    } finally {
+      loadingEarlier = false;
     }
   }
 
@@ -390,14 +413,6 @@ export function renderSiteChat(container, siteId) {
         );
       }
       feed.scrollToBottom();
-    }));
-
-    unwatchers.push(state.watch('brainTick', (data) => {
-      if (!data || String(data.site_id) !== String(siteId)) return;
-      if (data.status === 'starting') {
-        removeEmptyState();
-        updateBrainStatus('thinking');
-      }
     }));
 
     // Watch for new questions asked by brain

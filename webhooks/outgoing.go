@@ -68,7 +68,8 @@ func (d *Dispatcher) handleEvent(event events.Event) {
 		eventType,
 	)
 	if err != nil {
-		return // no subscriptions or query error, silently skip
+		slog.Warn("webhook dispatch: subscription lookup failed", "event", eventType, "error", err)
+		return
 	}
 	defer rows.Close()
 
@@ -91,8 +92,6 @@ func (d *Dispatcher) handleEvent(event events.Event) {
 		}
 		targets = append(targets, t)
 	}
-	rows.Close()
-
 	// Deliver to each target in a goroutine (non-blocking).
 	for _, t := range targets {
 		go d.deliver(t.id, t.name, t.url, t.secret, event)

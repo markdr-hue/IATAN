@@ -13,7 +13,7 @@ import { navigate } from '../core/router.js';
 import { icon } from '../ui/icon.js';
 import * as state from '../core/state.js';
 import * as toast from '../ui/toast.js';
-import { emptyState } from '../ui/helpers.js';
+import { emptyState, formatPublicUrl } from '../ui/helpers.js';
 
 export async function renderDashboard(container) {
   clear(container);
@@ -126,11 +126,7 @@ export async function renderDashboard(container) {
           ]),
           h('td', {}, (() => {
             if (!site.domain) return '--';
-            const sys = state.get('systemStatus') || {};
-            const publicPort = sys.public_port || 5000;
-            const needsPort = site.domain.includes('localhost');
-            const url = needsPort ? `http://${site.domain}:${publicPort}` : `http://${site.domain}`;
-            const label = needsPort ? `${site.domain}:${publicPort}` : site.domain;
+            const { url, label } = formatPublicUrl(site, state.get('systemStatus'));
             return h('a', {
               href: url,
               target: '_blank',

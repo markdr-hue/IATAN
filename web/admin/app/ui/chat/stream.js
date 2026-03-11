@@ -9,6 +9,7 @@
  */
 
 import { createStreamingMessage, createToolCall } from './message.js';
+import { TOKEN_KEY } from '../../core/http.js';
 
 /**
  * Map common technical error messages to friendly, human-readable ones.
@@ -43,7 +44,7 @@ export function humanizeError(msg) {
  * @returns {{ abort: Function }}
  */
 export function startStream(url, body, callbacks = {}) {
-  const token = localStorage.getItem('iatan_token');
+  const token = localStorage.getItem(TOKEN_KEY);
   const controller = new AbortController();
 
   fetch(url, {
@@ -55,6 +56,15 @@ export function startStream(url, body, callbacks = {}) {
     body,
     signal: controller.signal,
   }).then(async (response) => {
+    let finished = false;
+
+    function fireDone() {
+      if (!finished) {
+        finished = true;
+        if (callbacks.onDone) callbacks.onDone();
+      }
+    }
+
     if (!response.ok) {
       const text = await response.text();
       let msg;
@@ -110,7 +120,7 @@ export function startStream(url, body, callbacks = {}) {
               if (callbacks.onToolResult) callbacks.onToolResult(parsed);
             } catch { /* ignore */ }
           } else if (eventType === 'done') {
-            if (callbacks.onDone) callbacks.onDone();
+            fireDone();
           } else if (eventType === 'error') {
             if (callbacks.onError) callbacks.onError(humanizeError(data));
           }
@@ -127,8 +137,8 @@ export function startStream(url, body, callbacks = {}) {
       }
     }
 
-    // Stream complete
-    if (callbacks.onDone) callbacks.onDone();
+    // Stream complete — guard prevents double-fire if server sent done event
+    fireDone();
   }).catch((err) => {
     if (err.name !== 'AbortError') {
       if (callbacks.onError) callbacks.onError(err.message);

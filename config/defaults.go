@@ -6,11 +6,11 @@
 package config
 
 const (
-	DefaultAdminPort      = 5001
-	DefaultPublicPort     = 5000
+	DefaultAdminPort      = 5001  // Admin panel HTTP server port
+	DefaultPublicPort     = 5000  // Public-facing site HTTP server port
 	DefaultDataDir        = "./data"
 	DefaultLogLevel       = "info"
 	DefaultFirstRunPath   = "./firstrun.json"
-	DefaultRateLimitRate  = 100
-	DefaultRateLimitBurst = 200
+	DefaultRateLimitRate  = 100 // Requests per second per IP (public endpoints)
+	DefaultRateLimitBurst = 200 // Burst capacity per IP (public endpoints)
 )

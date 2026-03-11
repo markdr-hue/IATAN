@@ -13,7 +13,7 @@ const THEME_KEY = 'iatan_theme';
  * Get the current theme.
  */
 export function get() {
-  return document.documentElement.getAttribute('data-theme') || 'light';
+  return document.documentElement.getAttribute('data-theme') || 'dark';
 }
 
 /**
@@ -39,7 +39,5 @@ export function toggle() {
  */
 export function init() {
   const saved = localStorage.getItem(THEME_KEY);
-  if (saved) {
-    set(saved);
-  }
+  set(saved || 'dark');
 }

@@ -26,7 +26,7 @@ export function createChatInput(onSend) {
     className: 'chat-input__send',
     innerHTML: icon('send'),
     title: 'Send message',
-    disabled: 'true',
+    disabled: true,
   });
 
   const wrapper = h('div', { className: 'chat-input__wrapper' }, [
@@ -39,7 +39,8 @@ export function createChatInput(onSend) {
   // Auto-expand textarea
   function autoResize() {
     textarea.style.height = 'auto';
-    textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
+    const MAX_INPUT_HEIGHT = 150;
+    textarea.style.height = Math.min(textarea.scrollHeight, MAX_INPUT_HEIGHT) + 'px';
     sendBtn.disabled = !textarea.value.trim();
   }
 

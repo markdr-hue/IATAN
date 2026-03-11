@@ -17,18 +17,106 @@ import (
 	"github.com/markdr-hue/IATAN/db"
 )
 
-// SitePlan is the structured output from the PLAN stage.
-type SitePlan struct {
-	Architecture   string         `json:"architecture"` // "spa" or "multi-page"
-	ColorScheme    ColorScheme    `json:"color_scheme"`
-	Typography     Typography     `json:"typography"`
-	Pages          []PagePlan     `json:"pages"`
-	NeedsDataLayer bool           `json:"needs_data_layer"`
-	DataTables     []TablePlan    `json:"data_tables,omitempty"`
-	NavItems       []string       `json:"nav_items"`
-	DesignNotes    string         `json:"design_notes"`
-	Questions      []PlanQuestion `json:"questions,omitempty"`
+// --- Analysis: output of the ANALYZE stage ---
+
+// Analysis captures what the user wants, mapped to platform capabilities.
+type Analysis struct {
+	AppType       string         `json:"app_type"`                 // "chat-app", "blog", "portfolio", etc.
+	CoreBehaviors []string       `json:"core_behaviors"`           // ["real-time messaging", "channel rooms"]
+	RequiresAuth  bool           `json:"requires_auth"`            // does this need login/register?
+	AuthStrategy  string         `json:"auth_strategy"`            // "jwt", "localStorage-only", "none"
+	RealTimeNeeds []RealTimeSpec `json:"realtime_needs,omitempty"` // WebSocket/SSE specs
+	DataNeeds     []DataSpec     `json:"data_needs,omitempty"`     // tables needed and why
+	Exclusions    []string       `json:"exclusions,omitempty"`     // ["no auth endpoints", "no OAuth"]
+	DesignMood    string         `json:"design_mood"`              // "dark-retro-terminal", "clean-modern"
+	Architecture  string         `json:"architecture,omitempty"`   // "spa", "multi-page", or "single-page"
+	Questions     []PlanQuestion `json:"questions,omitempty"`
 }
+
+type RealTimeSpec struct {
+	Purpose    string `json:"purpose"`                // "chat messages in channels"
+	Type       string `json:"type"`                   // "websocket" or "sse"
+	Path       string `json:"path"`                   // "chat"
+	RoomScoped bool   `json:"room_scoped,omitempty"`  // true = use room_column
+	RoomColumn string `json:"room_column,omitempty"`  // "channel_id"
+	WriteTable string `json:"write_table,omitempty"`  // "messages"
+}
+
+type DataSpec struct {
+	TableName  string      `json:"table_name"`
+	Purpose    string      `json:"purpose"` // "store chat messages with channel association"
+	Columns    []ColumnDef `json:"columns"`
+	NeedsAPI   bool        `json:"needs_api"`
+	NeedsAuth  bool        `json:"needs_auth"`
+	PublicRead bool        `json:"public_read,omitempty"`
+	SeedData   bool        `json:"seed_data,omitempty"`
+}
+
+// --- Blueprint: output of the BLUEPRINT stage ---
+
+// Blueprint is the complete build specification that drives the BUILD stage.
+type Blueprint struct {
+	AppType      string          `json:"app_type"`
+	AuthStrategy string          `json:"auth_strategy"`
+	Architecture string          `json:"architecture"` // "spa" or "multi-page"
+	ColorScheme  ColorScheme     `json:"color_scheme"`
+	Typography   Typography      `json:"typography"`
+	DesignNotes  string          `json:"design_notes"`
+	Endpoints    []EndpointSpec  `json:"endpoints,omitempty"`
+	DataTables   []TableSpec     `json:"data_tables,omitempty"`
+	Pages        []PageBlueprint `json:"pages"`
+	NavItems     []string        `json:"nav_items"`
+	Exclusions   []string        `json:"exclusions,omitempty"`
+	Questions    []PlanQuestion  `json:"questions,omitempty"`
+}
+
+type EndpointSpec struct {
+	Action       string   `json:"action"`                   // "create_api", "create_auth", "create_websocket", "create_stream", "create_upload"
+	Path         string   `json:"path"`                     // "messages", "chat", "uploads"
+	TableName    string   `json:"table_name,omitempty"`     // which table to bind
+	RequiresAuth bool     `json:"requires_auth,omitempty"`
+	PublicRead   bool     `json:"public_read,omitempty"`
+	RoomColumn   string   `json:"room_column,omitempty"`    // WebSocket: column for room scoping
+	WriteTable   string   `json:"write_to_table,omitempty"` // WebSocket: table to write messages to
+	EventTypes   []string `json:"event_types,omitempty"`    // Stream/WebSocket: event types
+	// Auth-specific
+	UsernameCol string `json:"username_column,omitempty"`
+	PasswordCol string `json:"password_column,omitempty"`
+}
+
+type TableSpec struct {
+	Name     string      `json:"name"`
+	Purpose  string      `json:"purpose"`
+	Columns  []ColumnDef `json:"columns"`
+	SeedData bool        `json:"seed_data,omitempty"`
+}
+
+type PageBlueprint struct {
+	Path           string   `json:"path"`
+	Title          string   `json:"title"`
+	Purpose        string   `json:"purpose"`
+	Sections       []string `json:"sections"`
+	LinksTo        []string `json:"links_to,omitempty"`
+	Layout         string   `json:"layout,omitempty"`
+	ComponentHints []string `json:"component_hints,omitempty"`
+	UsesEndpoints  []string `json:"uses_endpoints,omitempty"` // ["GET /api/messages", "WS /api/chat/ws"]
+	UsesAuth       bool     `json:"uses_auth,omitempty"`
+	TechNotes      string   `json:"tech_notes"`               // technical build instructions for this page
+	DataTables     []string `json:"data_tables,omitempty"`
+}
+
+// BlueprintPatch describes incremental changes for an UPDATE_BLUEPRINT flow.
+type BlueprintPatch struct {
+	AddPages     []PageBlueprint `json:"add_pages,omitempty"`
+	ModifyPages  []PageBlueprint `json:"modify_pages,omitempty"`
+	RemovePages  []string        `json:"remove_pages,omitempty"`
+	AddEndpoints []EndpointSpec  `json:"add_endpoints,omitempty"`
+	AddTables    []TableSpec     `json:"add_tables,omitempty"`
+	UpdateCSS    bool            `json:"update_css"`
+	UpdateNav    bool            `json:"update_nav"`
+}
+
+// --- Shared types (kept from v1) ---
 
 type ColorScheme struct {
 	Primary    string `json:"primary"`
@@ -46,19 +134,6 @@ type Typography struct {
 	Scale       string `json:"scale"` // e.g. "1.25" (major third)
 }
 
-type PagePlan struct {
-	Path           string   `json:"path"`
-	Title          string   `json:"title"`
-	Purpose        string   `json:"purpose"`
-	Sections       []string `json:"sections"`
-	LinksTo        []string `json:"links_to,omitempty"`
-	NeedsData      bool     `json:"needs_data"`
-	DataTables     []string `json:"data_tables,omitempty"`
-	PageAssets     []string `json:"page_assets,omitempty"`
-	Layout         string   `json:"layout,omitempty"`          // layout name: "default", "none", "blog", etc.
-	ComponentHints []string `json:"component_hints,omitempty"` // e.g. ["hero-cta", "feature-grid", "testimonial-cards"]
-}
-
 type ColumnDef struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
@@ -66,45 +141,29 @@ type ColumnDef struct {
 	Required bool   `json:"required,omitempty"`
 }
 
-type TablePlan struct {
-	Name       string      `json:"name"`
-	Columns    []ColumnDef `json:"columns"`
-	HasAPI     bool        `json:"has_api"`
-	HasAuth    bool        `json:"has_auth"`
-	PublicRead bool        `json:"public_read,omitempty"` // GET public, POST/PUT/DELETE require auth
-	HasOAuth   []string    `json:"has_oauth,omitempty"`   // e.g. ["google", "github"]
-	Roles      []string    `json:"roles,omitempty"`       // e.g. ["user", "admin"]
-	SeedData   bool        `json:"seed_data"`
-}
-
 type PlanQuestion struct {
 	Question string   `json:"question"`
 	Options  []string `json:"options,omitempty"`
 }
 
-// PlanPatch describes incremental changes for an UPDATE flow.
-type PlanPatch struct {
-	AddPages    []PagePlan  `json:"add_pages,omitempty"`
-	ModifyPages []PagePlan  `json:"modify_pages,omitempty"`
-	RemovePages []string    `json:"remove_pages,omitempty"`
-	UpdateNav   bool        `json:"update_nav"`
-	UpdateCSS   bool        `json:"update_css"`
-	AddTables   []TablePlan `json:"add_tables,omitempty"`
-}
+// --- Pipeline state ---
 
 // PipelineState is the singleton row in pipeline_state tracking build progress.
 type PipelineState struct {
 	Stage             PipelineStage
-	PlanJSON          string
+	AnalysisJSON      string // stored in plan_json column
+	BlueprintJSON     string // stored in blueprint_json column
 	CurrentPageIndex  int
 	ErrorCount        int
 	LastError         string
 	Paused            bool
 	PauseReason       string
-	UpdateDescription string // what the owner wants changed (for UPDATE_PLAN)
+	UpdateDescription string // what the owner wants changed (for UPDATE_BLUEPRINT)
 	StartedAt         time.Time
 	UpdatedAt         time.Time
 }
+
+// --- JSON parsing ---
 
 var jsonFenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)```")
 
@@ -127,8 +186,6 @@ func extractJSON(raw string) string {
 	}
 
 	// Fallback: find the first { and last } to extract JSON object.
-	// Handles cases where the regex fails (backticks inside JSON strings)
-	// or the LLM adds prose before/after the JSON.
 	if start := strings.Index(raw, "{"); start >= 0 {
 		if end := strings.LastIndex(raw, "}"); end > start {
 			return raw[start : end+1]
@@ -138,122 +195,214 @@ func extractJSON(raw string) string {
 	return raw
 }
 
-// ParseSitePlan parses a SitePlan from raw LLM output, stripping markdown fences.
-func ParseSitePlan(raw string) (*SitePlan, error) {
+// ParseAnalysis parses an Analysis from raw LLM output.
+func ParseAnalysis(raw string) (*Analysis, error) {
 	raw = extractJSON(raw)
-	var plan SitePlan
-	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
-		return nil, fmt.Errorf("invalid plan JSON: %w", err)
+	var a Analysis
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		return nil, fmt.Errorf("invalid analysis JSON: %w", err)
 	}
-	return &plan, nil
+	return &a, nil
 }
 
-// ParsePlanPatch parses a PlanPatch from raw LLM output.
-func ParsePlanPatch(raw string) (*PlanPatch, error) {
+// ParseBlueprint parses a Blueprint from raw LLM output.
+func ParseBlueprint(raw string) (*Blueprint, error) {
 	raw = extractJSON(raw)
-	var patch PlanPatch
+	var bp Blueprint
+	if err := json.Unmarshal([]byte(raw), &bp); err != nil {
+		return nil, fmt.Errorf("invalid blueprint JSON: %w", err)
+	}
+	return &bp, nil
+}
+
+// ParseBlueprintPatch parses a BlueprintPatch from raw LLM output.
+func ParseBlueprintPatch(raw string) (*BlueprintPatch, error) {
+	raw = extractJSON(raw)
+	var patch BlueprintPatch
 	if err := json.Unmarshal([]byte(raw), &patch); err != nil {
-		return nil, fmt.Errorf("invalid patch JSON: %w", err)
+		return nil, fmt.Errorf("invalid blueprint patch JSON: %w", err)
 	}
 	return &patch, nil
 }
 
-// ValidatePlan checks a SitePlan for structural errors.
-func ValidatePlan(plan *SitePlan) []string {
+// MarshalJSON serializes any struct to JSON string.
+func marshalToJSON(v interface{}) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// --- Validation ---
+
+// ValidateAnalysis checks an Analysis for structural errors.
+func ValidateAnalysis(a *Analysis) []string {
+	var errs []string
+	if a.AppType == "" {
+		errs = append(errs, "app_type is required")
+	}
+	if len(a.CoreBehaviors) == 0 {
+		errs = append(errs, "core_behaviors must have at least one entry")
+	}
+	if a.AuthStrategy == "" {
+		errs = append(errs, "auth_strategy is required (use 'none' if no auth needed)")
+	}
+	if a.DesignMood == "" {
+		errs = append(errs, "design_mood is required")
+	}
+	// Architecture is optional and free-form — no restriction on valid values.
+	// Validate real-time specs.
+	for i, rt := range a.RealTimeNeeds {
+		if rt.Type != "websocket" && rt.Type != "sse" {
+			errs = append(errs, fmt.Sprintf("realtime_needs[%d].type must be 'websocket' or 'sse'", i))
+		}
+		if rt.Path == "" {
+			errs = append(errs, fmt.Sprintf("realtime_needs[%d].path is required", i))
+		}
+	}
+	// Validate data specs.
+	for i, d := range a.DataNeeds {
+		if d.TableName == "" {
+			errs = append(errs, fmt.Sprintf("data_needs[%d].table_name is required", i))
+		}
+		if len(d.Columns) == 0 {
+			errs = append(errs, fmt.Sprintf("data_needs[%d] (%s) must have at least one column", i, d.TableName))
+		}
+	}
+	return errs
+}
+
+// ValidateBlueprint checks a Blueprint for structural errors.
+func ValidateBlueprint(bp *Blueprint) []string {
 	var errs []string
 
-	if plan.Architecture != "spa" && plan.Architecture != "multi-page" {
-		errs = append(errs, fmt.Sprintf("architecture must be 'spa' or 'multi-page', got %q", plan.Architecture))
-	}
+	// Architecture is free-form — no restriction on valid values.
 
-	if len(plan.Pages) < 2 {
-		errs = append(errs, "plan must include at least 2 pages (home + 404)")
+	if len(bp.Pages) < 1 {
+		errs = append(errs, "blueprint must include at least 1 page")
 	}
 
 	// Build path set for link validation.
-	paths := make(map[string]bool, len(plan.Pages))
-	for _, p := range plan.Pages {
+	paths := make(map[string]bool, len(bp.Pages))
+	for _, p := range bp.Pages {
 		if paths[p.Path] {
 			errs = append(errs, fmt.Sprintf("duplicate page path: %s", p.Path))
 		}
 		paths[p.Path] = true
 	}
 
-	// Verify homepage exists.
 	if !paths["/"] {
-		errs = append(errs, "plan must include a homepage at path /")
+		errs = append(errs, "blueprint must include a homepage at path /")
 	}
 
-	// Verify 404 exists.
-	if !paths["/404"] {
-		errs = append(errs, "plan must include a 404 page at path /404")
+	// Auto-add listing pages for parameterised routes.
+	for _, p := range bp.Pages {
+		if !strings.Contains(p.Path, ":") {
+			continue
+		}
+		parts := strings.Split(p.Path, "/")
+		var baseParts []string
+		for _, part := range parts {
+			if strings.HasPrefix(part, ":") {
+				break
+			}
+			baseParts = append(baseParts, part)
+		}
+		basePath := strings.Join(baseParts, "/")
+		if basePath == "" {
+			basePath = "/"
+		}
+		if !paths[basePath] && basePath != "/" {
+			listingPage := PageBlueprint{
+				Path:     basePath,
+				Title:    strings.TrimPrefix(basePath, "/"),
+				Purpose:  fmt.Sprintf("Lists available items and navigates to %s with the selected ID.", p.Path),
+				Sections: []string{"listing"},
+				LinksTo:  []string{p.Path},
+			}
+			listingPage.DataTables = append(listingPage.DataTables, p.DataTables...)
+			bp.Pages = append(bp.Pages, listingPage)
+			paths[basePath] = true
+			for i, nav := range bp.NavItems {
+				if nav == p.Path {
+					bp.NavItems[i] = basePath
+				}
+			}
+		}
 	}
 
 	// Verify all links_to targets exist.
-	// Allow "/category" to match "/category/:id" (parameterised routes).
-	for _, p := range plan.Pages {
+	for _, p := range bp.Pages {
 		for _, link := range p.LinksTo {
 			if paths[link] {
 				continue
 			}
-			// Check if any path is a parameterised version of this link.
 			found := false
 			for knownPath := range paths {
-				if strings.HasPrefix(knownPath, link+"/") {
+				if strings.HasPrefix(knownPath, link+"/:") {
 					found = true
 					break
 				}
 			}
 			if !found {
-				errs = append(errs, fmt.Sprintf("page %s links_to %s which is not in the plan", p.Path, link))
+				errs = append(errs, fmt.Sprintf("page %s links_to %s which is not in the blueprint", p.Path, link))
 			}
 		}
 	}
 
-	// Verify nav_items reference valid paths (same parameterised matching as links_to).
-	for _, nav := range plan.NavItems {
+	// Verify nav_items.
+	for _, nav := range bp.NavItems {
 		if paths[nav] {
 			continue
 		}
 		found := false
 		for knownPath := range paths {
-			if strings.HasPrefix(knownPath, nav+"/") {
+			if strings.HasPrefix(knownPath, nav+"/:") {
 				found = true
 				break
 			}
 		}
 		if !found {
-			errs = append(errs, fmt.Sprintf("nav_items references %s which is not in the plan", nav))
+			errs = append(errs, fmt.Sprintf("nav_items references %s which is not in the blueprint", nav))
 		}
 	}
 
-	// Verify data tables if needed.
-	if plan.NeedsDataLayer {
-		if len(plan.DataTables) == 0 {
-			errs = append(errs, "needs_data_layer is true but no data_tables defined")
+	// Validate endpoint specs.
+	validActions := map[string]bool{
+		"create_api": true, "create_auth": true, "create_websocket": true,
+		"create_stream": true, "create_upload": true,
+	}
+	for i, ep := range bp.Endpoints {
+		if !validActions[ep.Action] {
+			errs = append(errs, fmt.Sprintf("endpoints[%d].action %q is not valid", i, ep.Action))
+		}
+		if ep.Path == "" {
+			errs = append(errs, fmt.Sprintf("endpoints[%d].path is required", i))
 		}
 	}
 
 	// Color scheme validation.
-	if plan.ColorScheme.Primary == "" || plan.ColorScheme.Background == "" || plan.ColorScheme.Text == "" {
+	if bp.ColorScheme.Primary == "" || bp.ColorScheme.Background == "" || bp.ColorScheme.Text == "" {
 		errs = append(errs, "color_scheme must include at least primary, background, and text")
-	} else {
-		// WCAG contrast check at plan time (catch bad schemes early).
-		errs = append(errs, validateColorContrast(plan)...)
 	}
 
 	// Typography validation.
-	if plan.Typography.BodyFont == "" {
+	if bp.Typography.BodyFont == "" {
 		errs = append(errs, "typography must include at least body_font")
 	}
-	if plan.Typography.Scale != "" {
-		if s, err := strconv.ParseFloat(plan.Typography.Scale, 64); err != nil || s < 1.0 || s > 2.0 {
-			errs = append(errs, fmt.Sprintf("typography scale must be a number between 1.0 and 2.0, got %q", plan.Typography.Scale))
+	if bp.Typography.Scale != "" {
+		if s, err := strconv.ParseFloat(bp.Typography.Scale, 64); err != nil || s < 1.0 || s > 2.0 {
+			errs = append(errs, fmt.Sprintf("typography scale must be between 1.0 and 2.0, got %q", bp.Typography.Scale))
 		}
 	}
 
-	// Data table column validation.
-	for _, t := range plan.DataTables {
+	// Data table validation.
+	for i, t := range bp.DataTables {
+		if t.Name == "" {
+			errs = append(errs, fmt.Sprintf("data_tables[%d].name is required", i))
+			continue
+		}
 		colNames := make(map[string]bool, len(t.Columns))
 		nonSystem := 0
 		for _, c := range t.Columns {
@@ -273,34 +422,26 @@ func ValidatePlan(plan *SitePlan) []string {
 	return errs
 }
 
-// MarshalPlan serializes a SitePlan to JSON.
-func MarshalPlan(plan *SitePlan) (string, error) {
-	b, err := json.Marshal(plan)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
 // --- Pipeline state DB operations ---
 
 // LoadPipelineState loads the singleton pipeline_state row.
-func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
+func LoadPipelineState(d *sql.DB) (*PipelineState, error) {
 	var s PipelineState
-	var planJSON, lastError, pauseReason, updateDesc sql.NullString
+	var analysisJSON, blueprintJSON, lastError, pauseReason, updateDesc sql.NullString
 	var startedAt, updatedAt sql.NullString
 
-	err := db.QueryRow(`SELECT stage, plan_json, current_page_index, error_count,
+	err := d.QueryRow(`SELECT stage, plan_json, blueprint_json, current_page_index, error_count,
 		last_error, paused, pause_reason, COALESCE(update_description, ''), started_at, updated_at
 		FROM pipeline_state WHERE id = 1`).Scan(
-		&s.Stage, &planJSON, &s.CurrentPageIndex, &s.ErrorCount,
+		&s.Stage, &analysisJSON, &blueprintJSON, &s.CurrentPageIndex, &s.ErrorCount,
 		&lastError, &s.Paused, &pauseReason, &updateDesc, &startedAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load pipeline state: %w", err)
 	}
 
-	s.PlanJSON = planJSON.String
+	s.AnalysisJSON = analysisJSON.String
+	s.BlueprintJSON = blueprintJSON.String
 	s.LastError = lastError.String
 	s.PauseReason = pauseReason.String
 	s.UpdateDescription = updateDesc.String
@@ -317,11 +458,11 @@ func LoadPipelineState(db *sql.DB) (*PipelineState, error) {
 // SavePipelineState persists the full pipeline state.
 func SavePipelineState(sdb *db.SiteDB, s *PipelineState) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = ?, plan_json = ?, current_page_index = ?,
+		stage = ?, plan_json = ?, blueprint_json = ?, current_page_index = ?,
 		error_count = ?, last_error = ?, paused = ?,
 		pause_reason = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = 1`,
-		s.Stage, s.PlanJSON, s.CurrentPageIndex,
+		s.Stage, s.AnalysisJSON, s.BlueprintJSON, s.CurrentPageIndex,
 		s.ErrorCount, s.LastError, s.Paused, s.PauseReason,
 	)
 	return err
@@ -336,7 +477,7 @@ func AdvanceStage(sdb *db.SiteDB, stage PipelineStage) error {
 // ResetPipeline resets pipeline state for a fresh build.
 func ResetPipeline(sdb *db.SiteDB) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = 'PLAN', plan_json = NULL, current_page_index = 0,
+		stage = 'ANALYZE', plan_json = NULL, blueprint_json = NULL, current_page_index = 0,
 		error_count = 0, last_error = NULL, paused = 0,
 		pause_reason = NULL, started_at = CURRENT_TIMESTAMP,
 		updated_at = CURRENT_TIMESTAMP
