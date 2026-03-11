@@ -202,6 +202,7 @@ type PipelineState struct {
 // --- JSON parsing ---
 
 var jsonFenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)```")
+var trailingCommaRe = regexp.MustCompile(`,\s*([\]}])`)
 
 // extractJSON strips markdown code fences and any leading/trailing non-JSON text
 // from raw LLM output, returning only the JSON object.
@@ -211,9 +212,16 @@ func extractJSON(raw string) string {
 		return raw
 	}
 
-	// Try regex first (handles clean markdown fences).
-	if matches := jsonFenceRe.FindStringSubmatch(raw); len(matches) > 1 {
-		return strings.TrimSpace(matches[1])
+	// Find ALL code fences — prefer the one that starts with { or [.
+	if allMatches := jsonFenceRe.FindAllStringSubmatch(raw, -1); len(allMatches) > 0 {
+		for _, m := range allMatches {
+			candidate := strings.TrimSpace(m[1])
+			if len(candidate) > 0 && (candidate[0] == '{' || candidate[0] == '[') {
+				return candidate
+			}
+		}
+		// No fence started with JSON — use the first one anyway.
+		return strings.TrimSpace(allMatches[0][1])
 	}
 
 	// Already a JSON object or array — return as-is.
@@ -231,9 +239,28 @@ func extractJSON(raw string) string {
 	return raw
 }
 
+// repairJSON fixes common LLM JSON mistakes (trailing commas, // comments).
+func repairJSON(s string) string {
+	// Strip single-line // comments (only full-line comments to avoid mangling URLs).
+	lines := strings.Split(s, "\n")
+	cleaned := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+	s = strings.Join(cleaned, "\n")
+
+	// Remove trailing commas before } or ].
+	s = trailingCommaRe.ReplaceAllString(s, "$1")
+
+	return s
+}
+
 // ParseAnalysis parses an Analysis from raw LLM output.
 func ParseAnalysis(raw string) (*Analysis, error) {
-	raw = extractJSON(raw)
+	raw = repairJSON(extractJSON(raw))
 	var a Analysis
 	if err := json.Unmarshal([]byte(raw), &a); err != nil {
 		return nil, fmt.Errorf("invalid analysis JSON: %w", err)
@@ -243,7 +270,7 @@ func ParseAnalysis(raw string) (*Analysis, error) {
 
 // ParseBlueprint parses a Blueprint from raw LLM output.
 func ParseBlueprint(raw string) (*Blueprint, error) {
-	raw = extractJSON(raw)
+	raw = repairJSON(extractJSON(raw))
 	var bp Blueprint
 	if err := json.Unmarshal([]byte(raw), &bp); err != nil {
 		return nil, fmt.Errorf("invalid blueprint JSON: %w", err)
@@ -253,7 +280,7 @@ func ParseBlueprint(raw string) (*Blueprint, error) {
 
 // ParseBlueprintPatch parses a BlueprintPatch from raw LLM output.
 func ParseBlueprintPatch(raw string) (*BlueprintPatch, error) {
-	raw = extractJSON(raw)
+	raw = repairJSON(extractJSON(raw))
 	var patch BlueprintPatch
 	if err := json.Unmarshal([]byte(raw), &patch); err != nil {
 		return nil, fmt.Errorf("invalid blueprint patch JSON: %w", err)

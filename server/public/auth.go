@@ -91,7 +91,7 @@ func (h *Handler) handleAuthRequest(w http.ResponseWriter, r *http.Request, site
 		return false // Not an auth endpoint, let DynamicAPI handle it.
 	}
 
-	physTable := fmt.Sprintf("site_%d_%s", siteID, ae.TableName)
+	physTable := ae.TableName
 
 	switch action {
 	case "register":

@@ -127,8 +127,8 @@ func (w *PipelineWorker) runAnalyze(ctx context.Context) (PipelineStage, error) 
 		// Retry with stricter prompt.
 		w.logger.Warn("analysis JSON parse failed, retrying", "error", err)
 		w.publishBrainMessage("Analysis response wasn't valid JSON, retrying...")
-		retryPrompt := prompt + fmt.Sprintf("\n\nCRITICAL: Your previous response was not valid JSON. Parse error: %s\nRespond with ONLY a JSON object, no markdown, no explanation.", err.Error())
-		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, retryPrompt, "Respond with ONLY the JSON analysis.", 4096)
+		retryUser := fmt.Sprintf("Your previous response could not be parsed. Error: %s\nRespond with ONLY a raw JSON object. No markdown code fences, no explanation text.", err.Error())
+		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, prompt, retryUser, 4096)
 		tokens += tokens2
 		if err2 != nil {
 			LogStageError(w.siteDB, logID, err2.Error())
@@ -222,9 +222,22 @@ func (w *PipelineWorker) runBlueprint(ctx context.Context) (PipelineStage, error
 		return StageBlueprint, err
 	}
 
+	// Check for answered questions (wake context), same as ANALYZE.
+	var answers string
+	w.mu.RLock()
+	if w.wakeContext != nil {
+		if a, ok := w.wakeContext["answer"].(string); ok {
+			answers = a
+		}
+	}
+	w.mu.RUnlock()
+
 	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
 	prompt := buildBlueprintPrompt(analysis, site)
 	userMsg := "Create a complete Blueprint JSON from the analysis."
+	if answers != "" {
+		userMsg = fmt.Sprintf("The owner answered your questions: %q\n\nNow create a complete Blueprint JSON from the analysis.", answers)
+	}
 
 	w.saveChatMessageOnce(llm.Message{Role: llm.RoleUser, Content: userMsg})
 
@@ -239,8 +252,8 @@ func (w *PipelineWorker) runBlueprint(ctx context.Context) (PipelineStage, error
 		// Retry.
 		w.logger.Warn("blueprint JSON parse failed, retrying", "error", err)
 		w.publishBrainMessage("Blueprint response wasn't valid JSON, retrying...")
-		retryPrompt := prompt + fmt.Sprintf("\n\nCRITICAL: Your previous response was not valid JSON. Parse error: %s\nRespond with ONLY a JSON object.", err.Error())
-		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, retryPrompt, "Respond with ONLY the JSON blueprint.", 8192)
+		retryUser := fmt.Sprintf("Your previous response could not be parsed. Error: %s\nRespond with ONLY a raw JSON object. No markdown code fences, no explanation text.", err.Error())
+		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, prompt, retryUser, 8192)
 		tokens += tokens2
 		if err2 != nil {
 			LogStageError(w.siteDB, logID, err2.Error())
@@ -297,6 +310,11 @@ func (w *PipelineWorker) runBlueprint(ctx context.Context) (PipelineStage, error
 	w.publishBrainMessage(fmt.Sprintf("Blueprint ready: %d pages, %d endpoints, %d tables, %s",
 		len(bp.Pages), len(bp.Endpoints), len(bp.DataTables), bp.Architecture))
 	LogStageComplete(w.siteDB, logID, tokens, 0, 0, time.Since(start))
+
+	// Clear wake context after successful blueprint.
+	w.mu.Lock()
+	w.wakeContext = nil
+	w.mu.Unlock()
 
 	return StageBuild, nil
 }
@@ -497,8 +515,20 @@ func (w *PipelineWorker) runUpdateBlueprint(ctx context.Context) (PipelineStage,
 
 	patch, err := ParseBlueprintPatch(content)
 	if err != nil {
-		LogStageError(w.siteDB, logID, err.Error())
-		return StageUpdateBlueprint, fmt.Errorf("patch JSON invalid: %w", err)
+		w.logger.Warn("blueprint patch JSON parse failed, retrying", "error", err)
+		w.publishBrainMessage("Patch response wasn't valid JSON, retrying...")
+		retryUser := fmt.Sprintf("Your previous response could not be parsed. Error: %s\nRespond with ONLY a raw JSON object. No markdown code fences, no explanation text.", err.Error())
+		content, tokens2, err2 := w.callLLM(ctx, provider, modelID, prompt, retryUser, 4096)
+		tokens += tokens2
+		if err2 != nil {
+			LogStageError(w.siteDB, logID, err2.Error())
+			return StageUpdateBlueprint, err2
+		}
+		patch, err = ParseBlueprintPatch(content)
+		if err != nil {
+			LogStageError(w.siteDB, logID, err.Error())
+			return StageUpdateBlueprint, fmt.Errorf("patch JSON still invalid after retry: %w", err)
+		}
 	}
 
 	if existingBP == nil {
@@ -528,6 +558,20 @@ func (w *PipelineWorker) runUpdateBlueprint(ctx context.Context) (PipelineStage,
 		if !existingPaths[mod.Path] {
 			w.logger.Warn("blueprint patch: modify_pages references non-existent path", "path", mod.Path)
 		}
+	}
+
+	// Validate patch against exclusions.
+	if len(existingBP.Exclusions) > 0 {
+		exclusionSet := strings.Join(existingBP.Exclusions, " ")
+		var filtered []EndpointSpec
+		for _, ep := range patch.AddEndpoints {
+			if ep.Action == "create_auth" && strings.Contains(exclusionSet, "no auth") {
+				w.logger.Warn("blueprint patch: skipping create_auth endpoint — conflicts with exclusion", "path", ep.Path)
+				continue
+			}
+			filtered = append(filtered, ep)
+		}
+		patch.AddEndpoints = filtered
 	}
 
 	// Apply patch.
