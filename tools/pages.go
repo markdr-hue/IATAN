@@ -164,7 +164,7 @@ func (t *PagesTool) save(ctx *ToolContext, args map[string]interface{}) (*Result
 
 	resultData := map[string]interface{}{"path": path, "title": title, "status": status}
 	if len(softWarnings) > 0 {
-		resultData["warnings"] = softWarnings
+		resultData["ATTENTION_JS_ISSUES"] = softWarnings
 	}
 	if len(hints) > 0 {
 		resultData["hints"] = hints

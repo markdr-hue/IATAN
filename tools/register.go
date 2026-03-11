@@ -20,9 +20,6 @@ func RegisterAll(r *Registry) {
 	// Endpoints (unified: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, verify_password)
 	r.Register(&EndpointsTool{})
 
-	// Memory (unified: remember, recall, list, forget)
-	r.Register(&MemoryTool{})
-
 	// Communication (unified: ask, check)
 	r.Register(&CommunicationTool{})
 

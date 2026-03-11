@@ -1461,7 +1461,11 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB
 	rows, err := siteDB.Query(query, args...)
 	if err != nil {
 		slog.Error("public API list query failed", "table", physTable, "query", query, "error", err)
-		writePublicError(w, http.StatusInternalServerError, "query error")
+		if strings.Contains(err.Error(), "no such column") {
+			writePublicError(w, http.StatusBadRequest, "invalid filter column: "+err.Error())
+		} else {
+			writePublicError(w, http.StatusInternalServerError, "query error")
+		}
 		return
 	}
 	defer rows.Close()

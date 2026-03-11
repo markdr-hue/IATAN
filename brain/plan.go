@@ -27,10 +27,27 @@ type Analysis struct {
 	AuthStrategy  string         `json:"auth_strategy"`            // "jwt", "localStorage-only", "none"
 	RealTimeNeeds []RealTimeSpec `json:"realtime_needs,omitempty"` // WebSocket/SSE specs
 	DataNeeds     []DataSpec     `json:"data_needs,omitempty"`     // tables needed and why
-	Exclusions    []string       `json:"exclusions,omitempty"`     // ["no auth endpoints", "no OAuth"]
-	DesignMood    string         `json:"design_mood"`              // "dark-retro-terminal", "clean-modern"
-	Architecture  string         `json:"architecture,omitempty"`   // "spa", "multi-page", or "single-page"
-	Questions     []PlanQuestion `json:"questions,omitempty"`
+	Exclusions     []string         `json:"exclusions,omitempty"`      // ["no auth endpoints", "no OAuth"]
+	DesignMood     string           `json:"design_mood"`               // "dark-retro-terminal", "clean-modern"
+	Architecture   string           `json:"architecture,omitempty"`    // "spa", "multi-page", or "single-page"
+	WebhookNeeds   []WebhookNeed   `json:"webhook_needs,omitempty"`   // planned webhooks
+	ScheduledTasks []TaskNeed      `json:"scheduled_tasks,omitempty"` // planned scheduled tasks
+	Questions      []PlanQuestion  `json:"questions,omitempty"`
+}
+
+type WebhookNeed struct {
+	Name      string   `json:"name"`                 // "stripe-events"
+	Direction string   `json:"direction"`             // "incoming" or "outgoing"
+	Purpose   string   `json:"purpose"`               // "receive Stripe payment notifications"
+	URL       string   `json:"url,omitempty"`          // outgoing only
+	Events    []string `json:"event_types,omitempty"`  // ["payment.completed", "data.insert"]
+}
+
+type TaskNeed struct {
+	Name           string `json:"name"`                        // "daily-digest"
+	Purpose        string `json:"purpose"`                     // "send daily summary email to owner"
+	CronExpression string `json:"cron_expression,omitempty"`   // "0 8 * * *"
+	IntervalSec    int    `json:"interval_seconds,omitempty"`  // alternative: every N seconds
 }
 
 type RealTimeSpec struct {
@@ -64,10 +81,27 @@ type Blueprint struct {
 	DesignNotes  string          `json:"design_notes"`
 	Endpoints    []EndpointSpec  `json:"endpoints,omitempty"`
 	DataTables   []TableSpec     `json:"data_tables,omitempty"`
-	Pages        []PageBlueprint `json:"pages"`
-	NavItems     []string        `json:"nav_items"`
-	Exclusions   []string        `json:"exclusions,omitempty"`
-	Questions    []PlanQuestion  `json:"questions,omitempty"`
+	Pages          []PageBlueprint `json:"pages"`
+	NavItems       []string        `json:"nav_items"`
+	Exclusions     []string        `json:"exclusions,omitempty"`
+	Webhooks       []WebhookSpec   `json:"webhooks,omitempty"`
+	ScheduledTasks []TaskSpec2     `json:"scheduled_tasks,omitempty"`
+	Questions      []PlanQuestion  `json:"questions,omitempty"`
+}
+
+type WebhookSpec struct {
+	Name      string   `json:"name"`
+	Direction string   `json:"direction"`            // "incoming" or "outgoing"
+	URL       string   `json:"url,omitempty"`         // outgoing only
+	Events    []string `json:"event_types,omitempty"` // events to subscribe to
+}
+
+type TaskSpec2 struct {
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	Prompt         string `json:"prompt"`                      // what the brain should do
+	CronExpression string `json:"cron_expression,omitempty"`
+	IntervalSec    int    `json:"interval_seconds,omitempty"`
 }
 
 type EndpointSpec struct {
@@ -107,13 +141,15 @@ type PageBlueprint struct {
 
 // BlueprintPatch describes incremental changes for an UPDATE_BLUEPRINT flow.
 type BlueprintPatch struct {
-	AddPages     []PageBlueprint `json:"add_pages,omitempty"`
-	ModifyPages  []PageBlueprint `json:"modify_pages,omitempty"`
-	RemovePages  []string        `json:"remove_pages,omitempty"`
-	AddEndpoints []EndpointSpec  `json:"add_endpoints,omitempty"`
-	AddTables    []TableSpec     `json:"add_tables,omitempty"`
-	UpdateCSS    bool            `json:"update_css"`
-	UpdateNav    bool            `json:"update_nav"`
+	AddPages       []PageBlueprint `json:"add_pages,omitempty"`
+	ModifyPages    []PageBlueprint `json:"modify_pages,omitempty"`
+	RemovePages    []string        `json:"remove_pages,omitempty"`
+	AddEndpoints   []EndpointSpec  `json:"add_endpoints,omitempty"`
+	AddTables      []TableSpec     `json:"add_tables,omitempty"`
+	AddWebhooks    []WebhookSpec   `json:"add_webhooks,omitempty"`
+	AddTasks       []TaskSpec2     `json:"add_scheduled_tasks,omitempty"`
+	UpdateCSS      bool            `json:"update_css"`
+	UpdateNav      bool            `json:"update_nav"`
 }
 
 // --- Shared types (kept from v1) ---

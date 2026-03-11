@@ -54,6 +54,7 @@ var (
 		"manage_endpoints",
 		"manage_schema",
 		"manage_diagnostics",
+		"manage_analytics",
 
 		"manage_communication",
 		"manage_scheduler",
@@ -65,6 +66,9 @@ var (
 		"manage_webhooks",
 		"make_http_request",
 	}
+
+	// scheduledTaskTools: same as chatWakeTools — tasks need write access but not all tools.
+	scheduledTaskTools = chatWakeTools
 )
 
 func toToolSet(names []string) map[string]bool {
@@ -371,37 +375,63 @@ func (w *PipelineWorker) runValidate(ctx context.Context) (PipelineStage, error)
 		return StageComplete, nil
 	}
 
-	missing := validateBlueprintConformance(w.siteDB.Writer(), bp)
-	if len(missing) == 0 {
-		w.publishBrainMessage("Validation passed — all blueprint items created.")
-		LogStageComplete(w.siteDB, logID, 0, 0, 0, time.Since(start))
-		return StageComplete, nil
-	}
-
-	w.publishBrainMessage(fmt.Sprintf("Validation: %d missing items, attempting to create...", len(missing)))
-
-	provider, modelID, err := w.getProvider()
-	if err != nil {
-		LogStageError(w.siteDB, logID, err.Error())
-		return StageValidate, err
-	}
-
 	totalTokens := 0
 	totalToolCalls := 0
-	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(buildTools))
 
-	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
-	prompt := buildValidateFixupPrompt(missing, bp, site)
-	messages := []llm.Message{{Role: llm.RoleUser, Content: "These blueprint items were not created during the build. Create them now:\n- " + strings.Join(missing, "\n- ")}}
-	_, _, tokens, calls, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 15, 16384)
-	totalTokens += tokens
-	totalToolCalls += calls
+	// Phase 1: Structural conformance — are all blueprint items created?
+	missing := validateBlueprintConformance(w.siteDB.Writer(), bp)
+	if len(missing) > 0 {
+		w.publishBrainMessage(fmt.Sprintf("Validation: %d missing items, attempting to create...", len(missing)))
 
-	remaining := validateBlueprintConformance(w.siteDB.Writer(), bp)
-	if len(remaining) > 0 {
-		w.publishBrainMessage(fmt.Sprintf("Validation: %d items still missing after fix attempt.", len(remaining)))
+		provider, modelID, err := w.getProvider()
+		if err != nil {
+			LogStageError(w.siteDB, logID, err.Error())
+			return StageValidate, err
+		}
+
+		toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(buildTools))
+		site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+		prompt := buildValidateFixupPrompt(missing, bp, site)
+		messages := []llm.Message{{Role: llm.RoleUser, Content: "These blueprint items were not created during the build. Create them now:\n- " + strings.Join(missing, "\n- ")}}
+		_, _, tokens, calls, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 15, 16384)
+		totalTokens += tokens
+		totalToolCalls += calls
+
+		remaining := validateBlueprintConformance(w.siteDB.Writer(), bp)
+		if len(remaining) > 0 {
+			w.publishBrainMessage(fmt.Sprintf("Validation: %d items still missing after fix attempt.", len(remaining)))
+		} else {
+			w.publishBrainMessage("Validation passed — all missing items created.")
+		}
 	} else {
-		w.publishBrainMessage("Validation passed — all missing items created.")
+		w.publishBrainMessage("Validation passed — all blueprint items created.")
+	}
+
+	// Phase 2: Quality checks — empty pages, missing assets, broken links, no CSS.
+	qualityIssues := validatePageQuality(w.siteDB.Writer(), bp)
+	if len(qualityIssues) > 0 {
+		w.publishBrainMessage(fmt.Sprintf("Quality check: %d issues found, fixing...", len(qualityIssues)))
+
+		provider, modelID, err := w.getProvider()
+		if err != nil {
+			LogStageError(w.siteDB, logID, err.Error())
+			return StageValidate, err
+		}
+
+		toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(buildTools))
+		site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
+		prompt := buildQualityFixupPrompt(qualityIssues, bp, site)
+		messages := []llm.Message{{Role: llm.RoleUser, Content: "Fix these quality issues:\n- " + strings.Join(qualityIssues, "\n- ")}}
+		_, _, tokens, calls, _ := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 15, 16384)
+		totalTokens += tokens
+		totalToolCalls += calls
+
+		remaining := validatePageQuality(w.siteDB.Writer(), bp)
+		if len(remaining) > 0 {
+			w.publishBrainMessage(fmt.Sprintf("Quality check: %d issues remain after fix attempt.", len(remaining)))
+		} else {
+			w.publishBrainMessage("Quality check passed.")
+		}
 	}
 
 	LogStageComplete(w.siteDB, logID, totalTokens, 0, totalToolCalls, time.Since(start))
@@ -524,6 +554,8 @@ func (w *PipelineWorker) runUpdateBlueprint(ctx context.Context) (PipelineStage,
 
 	existingBP.Endpoints = append(existingBP.Endpoints, patch.AddEndpoints...)
 	existingBP.DataTables = append(existingBP.DataTables, patch.AddTables...)
+	existingBP.Webhooks = append(existingBP.Webhooks, patch.AddWebhooks...)
+	existingBP.ScheduledTasks = append(existingBP.ScheduledTasks, patch.AddTasks...)
 
 	// Save updated blueprint.
 	bpJSON, _ := marshalToJSON(existingBP)

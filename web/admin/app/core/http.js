@@ -8,7 +8,6 @@
  */
 
 // Admin panel HTTP wrapper — uses 'iatan_token' for JWT storage.
-// Public runtime (web/foundation/iatan.js) uses 'auth_token' for site visitors.
 export const TOKEN_KEY = 'iatan_token';
 
 function getToken() {

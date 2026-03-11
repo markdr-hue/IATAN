@@ -379,10 +379,15 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 		resultData["scope"] = scope
 	}
 
-	// Post-save validation for JS files.
+	// Post-save validation for JS files — syntax errors block the save.
 	if strings.HasSuffix(strings.ToLower(filename), ".js") {
-		if warnings := validateJSContent(filename, fileData); len(warnings) > 0 {
-			resultData["warnings"] = warnings
+		if jsErrors := validateJSContent(filename, fileData); len(jsErrors) > 0 {
+			resultData["js_errors"] = jsErrors
+			return &Result{
+				Success: false,
+				Error:   "JS syntax errors — fix and re-save: " + jsErrors[0],
+				Data:    resultData,
+			}, nil
 		}
 	}
 

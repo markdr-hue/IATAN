@@ -7,6 +7,7 @@ package models
 
 import (
 	"database/sql"
+	"fmt"
 	"time"
 )
 
@@ -148,6 +149,13 @@ func UpdateSiteMode(db *sql.DB, id int, mode string) error {
 // DeleteSite removes the site row from the global database.
 // Per-site DB and file cleanup is handled by SiteDBManager.Delete() in the admin handler.
 func DeleteSite(db *sql.DB, id int) error {
-	_, err := db.Exec("DELETE FROM sites WHERE id = ?", id)
-	return err
+	res, err := db.Exec("DELETE FROM sites WHERE id = ?", id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("site %d not found", id)
+	}
+	return nil
 }

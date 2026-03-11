@@ -59,7 +59,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"methods": map[string]interface{}{
 				"type":        "array",
 				"items":       map[string]interface{}{"type": "string", "enum": []string{"GET", "POST", "PUT", "DELETE"}},
-				"description": "Allowed HTTP methods (default: GET, POST). Only for create_api.",
+				"description": "Allowed HTTP methods (default: GET, POST, PUT, DELETE). Only for create_api.",
 			},
 			"public_columns": map[string]interface{}{
 				"type":        "array",
@@ -94,7 +94,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"event_types": map[string]interface{}{
 				"type":        "array",
 				"items":       map[string]interface{}{"type": "string"},
-				"description": "Event types to stream (e.g. [\"data.insert\", \"data.update\", \"data.delete\"]). Only for create_stream.",
+				"description": "Event types to broadcast (e.g. [\"data.insert\", \"data.update\", \"data.delete\"]). For create_stream and create_websocket.",
 			},
 			"max_size_mb": map[string]interface{}{
 				"type":        "number",
@@ -217,8 +217,8 @@ func (t *EndpointsTool) createAPI(ctx *ToolContext, args map[string]interface{})
 		return &Result{Success: false, Error: fmt.Sprintf("dynamic table '%s' does not exist — create it first with manage_schema", tableName)}, nil
 	}
 
-	// Parse methods.
-	methods := []string{"GET", "POST"}
+	// Parse methods — default to full CRUD since endpoints are table-bound.
+	methods := []string{"GET", "POST", "PUT", "DELETE"}
 	if methodsRaw, ok := args["methods"].([]interface{}); ok && len(methodsRaw) > 0 {
 		methods = nil
 		for _, m := range methodsRaw {

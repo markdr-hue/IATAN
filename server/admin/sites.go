@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/markdr-hue/IATAN/db/models"
@@ -113,10 +114,19 @@ func (h *SitesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Normalize empty domain to NULL so the UNIQUE constraint doesn't conflict.
+	if req.Domain != nil && *req.Domain == "" {
+		req.Domain = nil
+	}
+
 	site, err := models.CreateSite(h.deps.DB.DB, req.Name, req.Domain, req.Description, req.Direction, req.LLMModelID)
 	if err != nil {
 		h.deps.Logger.Error("failed to create site", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to create site")
+		if strings.Contains(err.Error(), "UNIQUE") {
+			writeError(w, http.StatusConflict, "a site with this domain already exists")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to create site")
+		}
 		return
 	}
 
@@ -176,6 +186,10 @@ func (h *SitesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.LLMModelID <= 0 {
 		writeError(w, http.StatusBadRequest, "llm_model_id is required")
 		return
+	}
+
+	if req.Domain != nil && *req.Domain == "" {
+		req.Domain = nil
 	}
 
 	if err := models.UpdateSite(h.deps.DB.DB, siteID, req.Name, req.Domain, req.Description, req.Direction, req.LLMModelID); err != nil {
@@ -249,9 +263,16 @@ func (h *SitesHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		_ = h.deps.BrainManager.StopSite(siteID) // ignore error if not running
 	}
 
-	if err := models.DeleteSite(h.deps.DB.DB, siteID); err != nil {
+	// Delete via serialized writer to ensure the row is actually removed
+	// before we clean up files. Using raw Exec can race with other writes.
+	res, err := h.deps.DB.ExecWrite("DELETE FROM sites WHERE id = ?", siteID)
+	if err != nil {
 		h.deps.Logger.Error("failed to delete site", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to delete site")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeError(w, http.StatusNotFound, "site not found")
 		return
 	}
 

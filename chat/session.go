@@ -95,8 +95,8 @@ func (s *Session) Send(ctx context.Context, message string, onChunk llm.StreamCa
 	// 4. Convert history to messages (already in llm.Message format).
 	messages := history
 
-	// 5. Get tool definitions from registry.
-	toolDefs := s.deps.ToolRegistry.ToLLMTools()
+	// 5. Get tool definitions from registry (filtered to chat-safe set).
+	toolDefs := s.deps.ToolRegistry.ToLLMToolsFiltered(tools.ChatToolSet)
 
 	// 6. Resolve the default LLM provider from the database.
 	provider, modelID, err := s.resolveProvider()

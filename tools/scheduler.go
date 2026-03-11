@@ -33,7 +33,7 @@ type SchedulerTool struct{}
 
 func (t *SchedulerTool) Name() string { return "manage_scheduler" }
 func (t *SchedulerTool) Description() string {
-	return "Manage scheduled tasks. Actions: create, list, update, delete."
+	return "Manage scheduled tasks. Actions: create, list, update, delete. Tasks run on a cron schedule (e.g. '0 8 * * *' = daily 8am) or interval_seconds. When fired, the brain executes the prompt with full tool access — it can query data, send emails, update pages, and make HTTP requests."
 }
 
 func (t *SchedulerTool) Parameters() map[string]interface{} {

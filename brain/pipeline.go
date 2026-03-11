@@ -745,7 +745,7 @@ func (w *PipelineWorker) executeScheduledTask(ctx context.Context, prompt string
 
 	systemPrompt := buildScheduledTaskPrompt(w.deps.DB, w.siteDB.DB, w.siteID)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: prompt}}
-	toolDefs := w.deps.ToolRegistry.ToLLMTools()
+	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(scheduledTaskTools))
 	start := time.Now()
 
 	lastContent, lastModel, totalTokens, _, iterErr := w.runToolLoop(ctx, provider, modelID, systemPrompt, messages, toolDefs, 20, 2048)

@@ -64,16 +64,68 @@ func buildPlatformCapabilitiesRef() string {
 - scope="page": only loaded when the page lists it in its assets param.
 - Use manage_files(action="save", storage="assets", scope="global") for site-wide CSS/JS.
 
+### JavaScript Architecture
+- **Global assets** (scope="global"): Auto-injected on ALL pages at end of <body>. Use for shared utilities, API helpers, auth, SPA routers.
+- **Page assets** (scope="page"): Only loaded when the page lists them in its assets param. Use for page-specific logic.
+- **Load order**: Global CSS → Page CSS → Layout head → [page content] → Global JS → Page JS → Inline scripts.
+- All .js files saved via manage_files get full ES5.1 syntax validation. Syntax errors block the save — you must fix and re-save.
+- For complex apps, create a framework: app.js (state, API helpers), router.js (SPA navigation), utils.js (shared functions).
+
 ### Parameterized Routes
 - Pages with paths like /thread/:id match requests like /thread/42.
 - The server injects window.__routeParams = {id: "42"} on the page so your JS can access route params.
 - Only pages with :param segments receive this injection. Static paths like /about do not have __routeParams.
+
+### SPA JSON API
+- GET /api/page?path=/foo returns {content, title, layout, page_css, page_js, params}.
+- Useful for building client-side routers that load page content without full page reloads.
+- page_css and page_js contain URLs of page-scoped assets to load dynamically.
 
 ### Email (manage_email tool)
 - Configure provider (sendgrid, mailgun, resend, ses, generic), then send or save templates.
 
 ### Payments (manage_payments tool)
 - Configure provider (stripe, paypal, mollie, square, generic), create checkout sessions.
+
+### Webhooks (manage_webhooks tool)
+- **Incoming**: Receive external POST requests at /webhooks/{name} with HMAC-SHA256 signature validation.
+  Create with: manage_webhooks(action="create", name="stripe-events") — omit url for incoming.
+- **Outgoing**: Fire HTTP POSTs to external URLs when subscribed events occur.
+  Create with: manage_webhooks(action="create", name="notify-slack", url="https://hooks.slack.com/...")
+- **Subscribe** to event types: manage_webhooks(action="subscribe", name="stripe-events", event_types=["payment.completed", "webhook.received"])
+  Available events: data.insert, data.update, data.delete, webhook.received, payment.completed, payment.failed, ws.message.
+- Use for: payment provider notifications (Stripe/PayPal), external service integration, inter-site communication.
+
+### Scheduled Tasks (manage_scheduler tool)
+- Create tasks that run on a cron schedule or fixed interval.
+- When a task fires, the brain executes the prompt with full tool access — it can query data, send emails, modify pages, and make HTTP requests.
+- cron_expression: standard 5-field cron (e.g. "0 8 * * *" = daily at 8am, "0 */6 * * *" = every 6 hours, "0 9 * * 1" = Mondays at 9am).
+- interval_seconds: alternative to cron for simple recurring tasks (e.g. 3600 = every hour).
+- Use for: daily digest emails, data cleanup, external API sync, automated reports, periodic health checks.
+
+### External HTTP Requests (make_http_request tool)
+- Make GET/POST/PUT/DELETE/PATCH requests to external APIs.
+- Supports custom headers and JSON bodies.
+- 30-second timeout, 100KB response limit. strip_html=true extracts clean text from HTML responses.
+- Relative URLs (e.g. /api/contacts) resolve to the site's own domain — useful for testing your own endpoints.
+
+### Secrets (manage_secrets tool)
+- Store encrypted API keys, tokens, and credentials. Values are AES-encrypted and never returned.
+- Use manage_secrets(action="store", name="stripe_key", value="sk_live_...") to save.
+- Use manage_secrets(action="list") to see stored secret names (values are never shown).
+- Use for: storing provider API keys, webhook secrets, third-party tokens before configuring providers.
+
+### Service Providers (manage_providers tool)
+- Register external service providers with base_url and authentication credentials.
+- Used by email and payment tools to make authenticated API calls to external services.
+- Auth types: bearer (API key in Authorization header), api_key_header (custom header), basic (username:password), none.
+- Example: manage_providers(action="add", name="sendgrid", base_url="https://api.sendgrid.com", auth_type="bearer", api_key="SG.xxx")
+
+### OAuth (manage_endpoints tool, action: create_oauth)
+- Add social login (Google, GitHub, etc.) to an existing auth endpoint.
+- Creates: /api/{auth_path}/oauth/{provider} (redirect to OAuth provider) and /api/{auth_path}/oauth/{provider}/callback (automatic token exchange).
+- Requires: provider_name, auth_path (existing auth endpoint), client_id, client_secret, authorize_url, token_url, userinfo_url.
+- The callback automatically creates/finds the user and returns a JWT.
 
 ### Communication (manage_communication tool)
 - ask: Ask the site owner a question when you need information you cannot determine on your own (missing credentials, design preferences, ambiguous requirements).
@@ -149,6 +201,8 @@ Analyze what the user wants and produce a JSON Analysis object. Focus on BEHAVIO
     }
   ],
   "exclusions": ["no auth endpoints", "no login/register forms", "no OAuth"],
+  "webhook_needs": [],
+  "scheduled_tasks": [],
   "design_mood": "dark-retro-terminal",
   "questions": []
 }
@@ -162,6 +216,8 @@ Analyze what the user wants and produce a JSON Analysis object. Focus on BEHAVIO
   "auth_strategy": "none",
   "realtime_needs": [],
   "data_needs": [],
+  "webhook_needs": [],
+  "scheduled_tasks": [],
   "exclusions": ["no auth endpoints", "no real-time features", "no database tables"],
   "design_mood": "clean-minimal",
   "questions": []
@@ -176,6 +232,8 @@ Analyze what the user wants and produce a JSON Analysis object. Focus on BEHAVIO
   "auth_strategy": "none",
   "realtime_needs": [],
   "data_needs": [],
+  "webhook_needs": [],
+  "scheduled_tasks": [],
   "exclusions": ["no auth endpoints", "no real-time features", "no navigation between pages"],
   "design_mood": "modern-bold",
   "questions": []
@@ -199,9 +257,15 @@ Analyze what the user wants and produce a JSON Analysis object. Focus on BEHAVIO
    - If the site is purely static (portfolio, brochure, landing page), omit data_needs entirely.
 5. Exclusions: explicitly list things that should NOT be built. This prevents the builder from adding unwanted features.
    - For static sites, ALWAYS include: "no auth endpoints", "no real-time features", "no database tables".
-6. design_mood: a brief creative direction (2-4 words) that captures the visual feel.
-7. Questions: only ask if the description is too vague to determine core behaviors. Keep to 2-3 max.
-8. Architecture — decide based on user intent:
+6. Webhooks: if the site integrates with external services (payment providers, notifications), define webhook_needs.
+   - direction: "incoming" (receive external POSTs) or "outgoing" (send events to external URLs).
+   - If no webhooks needed, omit webhook_needs or leave empty.
+7. Scheduled tasks: if the site needs periodic automation (daily emails, data cleanup, sync), define scheduled_tasks.
+   - Include cron_expression or interval_seconds.
+   - If no tasks needed, omit scheduled_tasks or leave empty.
+8. design_mood: a brief creative direction (2-4 words) that captures the visual feel.
+9. Questions: only ask if the description is too vague to determine core behaviors. Keep to 2-3 max.
+10. Architecture — decide based on user intent:
    - "multi-page": traditional websites with multiple HTML pages and full page loads. DEFAULT for most sites.
    - "spa": app-like sites with client-side routing and shared state between views. For dashboards, chat apps, tools.
    - "single-page": everything on ONE page with no navigation. For landing pages, calculators, single-screen tools.
@@ -255,8 +319,9 @@ Transform the Analysis into a complete Blueprint. This is the build spec that dr
   "endpoints": [
     {"action": "create_api", "path": "resource-name", "table_name": "table_name", "requires_auth": false, "public_read": true},
     {"action": "create_auth", "path": "auth-path", "table_name": "users_table", "username_column": "username", "password_column": "password"},
-    {"action": "create_websocket", "path": "ws-path", "room_column": "channel_id", "write_to_table": "messages"},
-    {"action": "create_stream", "path": "stream-path", "event_types": ["update", "delete"]}
+    {"action": "create_websocket", "path": "ws-path", "event_types": ["data.insert"], "room_column": "channel_id", "write_to_table": "messages"},
+    {"action": "create_stream", "path": "stream-path", "event_types": ["data.insert", "data.update", "data.delete"]},
+    {"action": "create_upload", "path": "files", "allowed_types": ["image/*", "application/pdf"], "max_size_mb": 10}
   ],
   "data_tables": [
     {"name": "table_name", "purpose": "what this table stores", "columns": [{"name": "col", "type": "TEXT"}], "seed_data": false}
@@ -273,7 +338,13 @@ Transform the Analysis into a complete Blueprint. This is the build spec that dr
     }
   ],
   "nav_items": ["/"],
-  "exclusions": ["from analysis"]
+  "exclusions": ["from analysis"],
+  "webhooks": [
+    {"name": "webhook-name", "direction": "incoming|outgoing", "url": "https://... (outgoing only)", "event_types": ["data.insert", "payment.completed"]}
+  ],
+  "scheduled_tasks": [
+    {"name": "task-name", "description": "what it does", "prompt": "instructions for the brain when task fires", "cron_expression": "0 8 * * *"}
+  ]
 }
 
 ## Rules
@@ -306,7 +377,9 @@ Transform the Analysis into a complete Blueprint. This is the build spec that dr
    - What NOT to do (e.g., "do NOT navigate to separate pages for each channel")
 9. uses_endpoints: list the specific API calls this page makes.
 10. Exclusions: carry forward from Analysis. The BUILD stage checks these.
-11. Keep pages minimal. Most single-purpose apps need 2-3 pages.
+11. Webhooks: map from Analysis.webhook_needs. Include name, direction, url (outgoing), and event_types.
+12. Scheduled tasks: map from Analysis.scheduled_tasks. Write a clear prompt that tells the brain what to do when the task fires.
+13. Keep pages minimal. Most single-purpose apps need 2-3 pages.
 `)
 
 	return b.String()
@@ -366,28 +439,50 @@ Execute in this order:
    - For create_auth: include username_column and password_column.
 3. Seed data with manage_data(action="insert", rows=[...]) for tables with seed_data=true.
    - Use realistic, relevant data (5-10 rows). Vary content.
+4. Create webhooks with manage_webhooks if Blueprint has webhooks:
+   - Incoming: manage_webhooks(action="create", name="...") — omit url.
+   - Outgoing: manage_webhooks(action="create", name="...", url="...")
+   - Then subscribe: manage_webhooks(action="subscribe", name="...", event_types=["..."])
+5. Create scheduled tasks with manage_scheduler if Blueprint has scheduled_tasks:
+   - manage_scheduler(action="create", name="...", prompt="...", cron_expression="..." or interval_seconds=N)
 
 ### Step 2: DESIGN SYSTEM
-4. Create global CSS with manage_files(action="save", storage="assets", scope="global"):
+6. Create global CSS with manage_files(action="save", storage="assets", scope="global"):
    - Use Blueprint.color_scheme for your CSS custom properties / variables
    - CSS reset/normalize, base typography, component classes, responsive design
    - Design the CSS with ALL planned pages in mind
 
 ### Step 3: LAYOUTS (optional but recommended)
-5. Create a layout with manage_layout(action="save"):
+7. Create a layout with manage_layout(action="save"):
    - head_content: font imports, meta tags
    - body_before_main: navigation, header
    - body_after_main: footer
    - The server wraps page content in <main> and adds layout before/after it
    - Pages with layout="none" get no wrapping — useful for standalone pages
-6. Create any custom layouts referenced by pages.
+8. Create any custom layouts referenced by pages.
 
-### Step 4: PAGES
-7. Create each page with manage_pages(action="save"):
+### Step 4: JAVASCRIPT (before pages)
+9. Create shared/global JS as global assets (auto-injected on ALL pages, end of <body>):
+   - manage_files(action="save", storage="assets", scope="global", filename="app.js", content="...")
+   - Examples: app.js (shared state, API helpers, auth), router.js (SPA navigation), utils.js (formatters)
+   - For complex apps, split into multiple files: app.js + router.js + utils.js
+   - For SPA: build a client-side router using History API (pushState/popstate)
+10. Create page-specific JS as page-scoped assets:
+   - manage_files(action="save", storage="assets", scope="page", filename="pagename.js", content="...")
+   - Reference when saving the page: manage_pages(action="save", ..., assets='["pagename.js"]')
+
+**JavaScript rules:**
+- ALL JavaScript MUST go in external .js files. External files get full syntax validation — errors are caught before saving.
+- Only use inline <script> for tiny config (<5 lines, e.g., a global variable).
+- NEVER put fetch calls, event listeners, WebSocket logic, or DOM manipulation inline.
+
+### Step 5: PAGES
+11. Create each page with manage_pages(action="save"):
    - path, title, content (HTML that goes inside <main> when using a layout), status="published"
    - metadata: {"description": "...", "keywords": "..."}
+   - assets: '["pagename.js"]' to load page-scoped JS
+   - Page content is HTML only — all JS lives in external files
    - Read each page's tech_notes for specific technical instructions
-   - You have full freedom with JS: inline scripts, external JS files, or even a framework
 `)
 
 	// Page-specific instructions from TechNotes.
@@ -434,6 +529,9 @@ Execute in this order:
 7. Every button, link, and form must be FULLY FUNCTIONAL with available endpoints. Do NOT stub features.
 8. For page-scoped assets: save with manage_files(scope="page"), then list in manage_pages assets param.
 9. Parameterized routes: the server injects window.__routeParams for /path/:param routes.
+10. JavaScript MUST be in external .js files, not inline. The platform validates .js files for syntax errors — inline scripts bypass validation and are a common source of bugs.
+11. After completing Steps 1-3 (data layer, CSS, layout), list all created endpoint paths and table names before building JS/pages. This ensures you reference correct API paths in your code.
+12. For SPA architecture: build your own client-side router in a global .js file. Use History API (pushState/popstate). The server provides a JSON API at GET /api/page?path=X returning {content, title, layout, page_css, page_js, params} — use this for SPA page loading.
 `)
 
 	return b.String()
@@ -470,9 +568,47 @@ For each missing item, create it directly:
 - Missing stream endpoint → create with manage_endpoints(action="create_stream")
 - Missing auth endpoint → create with manage_endpoints(action="create_auth")
 - Missing layout → create with manage_layout(action="save")
+- Missing webhook → create with manage_webhooks(action="create") and subscribe with manage_webhooks(action="subscribe")
+- Missing scheduled task → create with manage_scheduler(action="create")
 
 Do NOT list, read, or query existing items. They are already built and working.
 Create ONLY what is listed as missing above, then stop.
+`)
+
+	return b.String()
+}
+
+// --- QUALITY FIXUP prompt ---
+
+func buildQualityFixupPrompt(issues []string, bp *Blueprint, site *models.Site) string {
+	var b strings.Builder
+
+	b.WriteString("You are IATAN. The build completed but a quality check found issues that must be fixed.\n\n")
+	b.WriteString(fmt.Sprintf("Current date: %s\n\n", time.Now().UTC().Format("2006-01-02")))
+
+	if site != nil {
+		b.WriteString(fmt.Sprintf("## Site: %s\n", site.Name))
+	}
+	if bp != nil {
+		b.WriteString(fmt.Sprintf("- Architecture: %s\n", bp.Architecture))
+		b.WriteString(fmt.Sprintf("- Auth: %s\n\n", bp.AuthStrategy))
+	}
+
+	b.WriteString("## Quality Issues\n")
+	for _, issue := range issues {
+		b.WriteString("- " + issue + "\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString(`## Instructions
+Fix each issue:
+- Empty page → save real content with manage_pages(action="save")
+- Missing asset → create the .js or .css file with manage_files(action="save", storage="assets")
+- Broken link → fix the link in the page with manage_pages(action="patch") or create the missing target page
+- No global CSS → create a global stylesheet with manage_files(action="save", storage="assets", scope="global")
+
+JavaScript MUST be in external .js files (manage_files), not inline in pages.
+Do NOT re-read or re-investigate existing items. Fix ONLY the issues listed above, then stop.
 `)
 
 	return b.String()
@@ -505,6 +641,8 @@ For each missing item, create it directly:
 - Missing page → create with manage_pages(action="save")
 - Missing table → create with manage_schema(action="create")
 - Missing endpoint → create with manage_endpoints
+- Missing webhook → create with manage_webhooks(action="create") and subscribe
+- Missing scheduled task → create with manage_scheduler(action="create")
 
 Do NOT list, read, or query existing items. They are already built and working.
 Create ONLY what is listed as missing above, then stop.
@@ -554,6 +692,8 @@ Create a BlueprintPatch JSON describing only the changes needed:
   "remove_pages": ["/old-page"],
   "add_endpoints": [{"action": "create_api", "path": "posts", "table_name": "posts"}],
   "add_tables": [{"name": "posts", "purpose": "...", "columns": [...]}],
+  "add_webhooks": [{"name": "...", "direction": "incoming|outgoing", "event_types": [...]}],
+  "add_scheduled_tasks": [{"name": "...", "description": "...", "prompt": "...", "cron_expression": "..."}],
   "update_nav": true,
   "update_css": false
 }
@@ -682,18 +822,49 @@ func buildChatWakePrompt(site *models.Site, siteDB *sql.DB, userMessage string, 
 func buildScheduledTaskPrompt(globalDB, siteDB *sql.DB, siteID int) string {
 	var b strings.Builder
 
-	b.WriteString("You are IATAN, executing a scheduled task. Use the available tools to complete the task.\n\n")
+	b.WriteString("You are IATAN, executing a scheduled task. Use the available tools to complete the task described in the user message.\n\n")
 	b.WriteString(fmt.Sprintf("Current date: %s\n\n", time.Now().UTC().Format("2006-01-02")))
 
 	site := loadSiteContext(globalDB, siteID)
 	if site != nil {
-		b.WriteString(fmt.Sprintf("Site: %s (mode: %s)\n\n", site.name, site.mode))
+		b.WriteString(fmt.Sprintf("## Site: %s (mode: %s)\n", site.name, site.mode))
+		if site.description != "" {
+			b.WriteString(fmt.Sprintf("- About: %s\n", site.description))
+		}
+		b.WriteString("\n")
+	}
+
+	// Blueprint summary so the LLM knows the site's structure.
+	bpSummary := loadBlueprintSummary(siteDB)
+	if bpSummary != "" {
+		b.WriteString(bpSummary)
 	}
 
 	manifest := loadSiteManifest(siteDB)
 	if manifest != "" {
 		b.WriteString(manifest)
 	}
+
+	b.WriteString(chat.BuildDataLayerSummary(siteDB))
+
+	css := loadGlobalCSS(siteDB)
+	if css != "" {
+		if len(css) > 2048 {
+			css = css[:2048] + "\n/* ... truncated ... */"
+		}
+		b.WriteString("## CSS Reference\n```css\n")
+		b.WriteString(css)
+		b.WriteString("\n```\n\n")
+	}
+
+	b.WriteString(buildPlatformCapabilitiesRef())
+
+	b.WriteString(`## Instructions
+- Execute the task described in the user message
+- Use tools as needed: query data, send emails, update pages, make HTTP requests
+- Be concise in your response — scheduled tasks run without an audience
+- If you need information from the owner, use manage_communication to ask
+`)
 
 	return b.String()
 }
@@ -851,6 +1022,45 @@ func loadPendingQuestions(db *sql.DB) []questionInfo {
 			var q questionInfo
 			return q, r.Scan(&q.question, &q.urgency) == nil
 		})
+}
+
+func loadBlueprintSummary(db *sql.DB) string {
+	var bpJSON sql.NullString
+	db.QueryRow("SELECT blueprint_json FROM pipeline_state WHERE id = 1").Scan(&bpJSON)
+	if !bpJSON.Valid || bpJSON.String == "" {
+		return ""
+	}
+	bp, err := ParseBlueprint(bpJSON.String)
+	if err != nil {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("## Blueprint Summary\n")
+	b.WriteString(fmt.Sprintf("- Type: %s, Architecture: %s, Auth: %s\n", bp.AppType, bp.Architecture, bp.AuthStrategy))
+
+	if len(bp.Endpoints) > 0 {
+		b.WriteString("- Endpoints: ")
+		for i, ep := range bp.Endpoints {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(fmt.Sprintf("%s /api/%s", ep.Action, ep.Path))
+		}
+		b.WriteString("\n")
+	}
+	if len(bp.DataTables) > 0 {
+		b.WriteString("- Tables: ")
+		for i, t := range bp.DataTables {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(t.Name)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func loadGlobalCSS(db *sql.DB) string {

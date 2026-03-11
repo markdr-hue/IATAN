@@ -7,8 +7,10 @@ package admin
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -27,8 +29,18 @@ type siteEndpoint struct {
 	Methods       string    `json:"methods"`
 	PublicColumns *string   `json:"public_columns"`
 	RequiresAuth  bool      `json:"requires_auth"`
+	PublicRead    bool      `json:"public_read"`
+	RequiredRole  *string   `json:"required_role"`
 	RateLimit     int       `json:"rate_limit"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+type updateEndpointRequest struct {
+	Methods      []string `json:"methods"`
+	RequiresAuth *bool    `json:"requires_auth"`
+	PublicRead   *bool    `json:"public_read"`
+	RequiredRole *string  `json:"required_role"`
+	RateLimit    *int     `json:"rate_limit"`
 }
 
 // List returns all API endpoints for a site.
@@ -39,7 +51,7 @@ func (h *SiteEndpointsHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := siteDB.Query(
-		`SELECT id, path, table_name, methods, public_columns, requires_auth, rate_limit, created_at
+		`SELECT id, path, table_name, methods, public_columns, requires_auth, public_read, required_role, rate_limit, created_at
 		 FROM api_endpoints ORDER BY path ASC`,
 	)
 	if err != nil {
@@ -52,12 +64,15 @@ func (h *SiteEndpointsHandler) List(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var e siteEndpoint
 		e.SiteID = siteID
-		var publicCols sql.NullString
-		if err := rows.Scan(&e.ID, &e.Path, &e.TableName, &e.Methods, &publicCols, &e.RequiresAuth, &e.RateLimit, &e.CreatedAt); err != nil {
+		var publicCols, reqRole sql.NullString
+		if err := rows.Scan(&e.ID, &e.Path, &e.TableName, &e.Methods, &publicCols, &e.RequiresAuth, &e.PublicRead, &reqRole, &e.RateLimit, &e.CreatedAt); err != nil {
 			continue
 		}
 		if publicCols.Valid {
 			e.PublicColumns = &publicCols.String
+		}
+		if reqRole.Valid {
+			e.RequiredRole = &reqRole.String
 		}
 		endpoints = append(endpoints, e)
 	}
@@ -93,4 +108,117 @@ func (h *SiteEndpointsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// Get returns a single API endpoint by ID.
+func (h *SiteEndpointsHandler) Get(w http.ResponseWriter, r *http.Request) {
+	siteID, siteDB := requireSiteDB(w, r, h.deps.SiteDBManager)
+	if siteDB == nil {
+		return
+	}
+
+	endpointID, err := strconv.Atoi(chi.URLParam(r, "endpointID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid endpoint ID")
+		return
+	}
+
+	var e siteEndpoint
+	e.SiteID = siteID
+	var publicCols, reqRole sql.NullString
+	err = siteDB.QueryRow(
+		`SELECT id, path, table_name, methods, public_columns, requires_auth, public_read, required_role, rate_limit, created_at
+		 FROM api_endpoints WHERE id = ?`, endpointID,
+	).Scan(&e.ID, &e.Path, &e.TableName, &e.Methods, &publicCols, &e.RequiresAuth, &e.PublicRead, &reqRole, &e.RateLimit, &e.CreatedAt)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+	if publicCols.Valid {
+		e.PublicColumns = &publicCols.String
+	}
+	if reqRole.Valid {
+		e.RequiredRole = &reqRole.String
+	}
+
+	writeJSON(w, http.StatusOK, e)
+}
+
+// Update modifies an existing API endpoint.
+func (h *SiteEndpointsHandler) Update(w http.ResponseWriter, r *http.Request) {
+	_, siteDB := requireSiteDB(w, r, h.deps.SiteDBManager)
+	if siteDB == nil {
+		return
+	}
+
+	endpointID, err := strconv.Atoi(chi.URLParam(r, "endpointID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid endpoint ID")
+		return
+	}
+
+	var req updateEndpointRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	var setClauses []string
+	var values []interface{}
+
+	if len(req.Methods) > 0 {
+		// Validate methods.
+		valid := map[string]bool{"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true}
+		for _, m := range req.Methods {
+			if !valid[strings.ToUpper(m)] {
+				writeError(w, http.StatusBadRequest, "invalid method: "+m)
+				return
+			}
+		}
+		methodsJSON, _ := json.Marshal(req.Methods)
+		setClauses = append(setClauses, "methods = ?")
+		values = append(values, string(methodsJSON))
+	}
+	if req.RequiresAuth != nil {
+		setClauses = append(setClauses, "requires_auth = ?")
+		values = append(values, *req.RequiresAuth)
+	}
+	if req.PublicRead != nil {
+		setClauses = append(setClauses, "public_read = ?")
+		values = append(values, *req.PublicRead)
+	}
+	if req.RequiredRole != nil {
+		setClauses = append(setClauses, "required_role = ?")
+		if *req.RequiredRole == "" {
+			values = append(values, nil)
+		} else {
+			values = append(values, *req.RequiredRole)
+		}
+	}
+	if req.RateLimit != nil {
+		setClauses = append(setClauses, "rate_limit = ?")
+		values = append(values, *req.RateLimit)
+	}
+
+	if len(setClauses) == 0 {
+		writeError(w, http.StatusBadRequest, "no fields to update")
+		return
+	}
+
+	values = append(values, endpointID)
+	query := "UPDATE api_endpoints SET " + strings.Join(setClauses, ", ") + " WHERE id = ?"
+
+	res, err := siteDB.ExecWrite(query, values...)
+	if err != nil {
+		h.deps.Logger.Error("failed to update endpoint", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to update endpoint")
+		return
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		writeError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }

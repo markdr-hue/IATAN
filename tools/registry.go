@@ -13,6 +13,28 @@ import (
 	"github.com/markdr-hue/IATAN/llm"
 )
 
+// ChatToolSet is the set of tool names available during chat sessions and
+// chat-wake. Shared between brain and chat packages to keep tool filtering consistent.
+var ChatToolSet = map[string]bool{
+	"manage_pages":         true,
+	"manage_files":         true,
+	"manage_layout":        true,
+	"manage_data":          true,
+	"manage_endpoints":     true,
+	"manage_schema":        true,
+	"manage_diagnostics":   true,
+	"manage_analytics":     true,
+	"manage_communication": true,
+	"manage_scheduler":     true,
+	"manage_site":          true,
+	"manage_secrets":       true,
+	"manage_providers":     true,
+	"manage_email":         true,
+	"manage_payments":      true,
+	"manage_webhooks":      true,
+	"make_http_request":    true,
+}
+
 // Registry holds all registered tools keyed by name.
 type Registry struct {
 	mu    sync.RWMutex

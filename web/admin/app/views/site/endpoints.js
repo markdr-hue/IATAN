@@ -8,7 +8,7 @@
  */
 
 import { h, clear } from '../../core/dom.js';
-import { get, del } from '../../core/http.js';
+import { get, put, del } from '../../core/http.js';
 import { icon } from '../../ui/icon.js';
 import * as toast from '../../ui/toast.js';
 import * as modal from '../../ui/modal.js';
@@ -83,20 +83,30 @@ function renderApiCard(ep, siteId, container) {
   let methods = [];
   try { methods = JSON.parse(ep.methods || '[]'); } catch { methods = []; }
 
-  return h('div', { className: 'card mb-3' }, [
+  const card = h('div', { className: 'card mb-3', style: { cursor: 'pointer' } }, [
     h('div', { className: 'card__header' }, [
       h('div', { className: 'flex items-center gap-2' }, [
         h('span', { innerHTML: icon('zap') }),
         h('code', { style: { fontSize: 'var(--text-sm)' } }, `/api/${ep.path}`),
       ]),
-      h('button', {
-        className: 'btn btn--ghost btn--sm',
-        title: 'Delete endpoint',
-        onClick: (e) => {
-          e.stopPropagation();
-          confirmDeleteApi(container, ep, siteId);
-        },
-      }, [h('span', { innerHTML: icon('trash') })]),
+      h('div', { className: 'flex items-center gap-1' }, [
+        h('button', {
+          className: 'btn btn--ghost btn--sm',
+          title: 'Edit endpoint',
+          onClick: (e) => {
+            e.stopPropagation();
+            showEditModal(container, ep, siteId);
+          },
+        }, [h('span', { innerHTML: icon('edit') })]),
+        h('button', {
+          className: 'btn btn--ghost btn--sm',
+          title: 'Delete endpoint',
+          onClick: (e) => {
+            e.stopPropagation();
+            confirmDeleteApi(container, ep, siteId);
+          },
+        }, [h('span', { innerHTML: icon('trash') })]),
+      ]),
     ]),
     h('div', { style: { padding: '0 12px 12px' } }, [
       h('div', { className: 'flex items-center gap-2 mb-2' }, [
@@ -118,6 +128,9 @@ function renderApiCard(ep, siteId, container) {
       ]),
     ]),
   ]);
+
+  card.addEventListener('click', () => showEditModal(container, ep, siteId));
+  return card;
 }
 
 function renderAuthCard(ep, siteId, container) {
@@ -151,6 +164,85 @@ function renderAuthCard(ep, siteId, container) {
         h('span', {}, `Login: ${ep.username_column}`),
       ]),
     ]),
+  ]);
+}
+
+const ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
+
+function showEditModal(container, ep, siteId) {
+  let methods = [];
+  try { methods = JSON.parse(ep.methods || '[]'); } catch { methods = []; }
+
+  // Method checkboxes
+  const methodChecks = ALL_METHODS.map(m => {
+    const cb = h('input', { type: 'checkbox', checked: methods.includes(m) });
+    return h('label', { className: 'flex items-center gap-1', style: { marginRight: '12px' } }, [cb, m]);
+  });
+
+  const authCheck = h('input', { type: 'checkbox', checked: ep.requires_auth });
+  const publicReadCheck = h('input', { type: 'checkbox', checked: ep.public_read });
+  const roleInput = h('input', { className: 'input', value: ep.required_role || '', placeholder: 'e.g. admin (empty = any role)' });
+  const rateInput = h('input', { className: 'input', type: 'number', value: ep.rate_limit, min: '1' });
+
+  const form = h('div', {}, [
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'text-sm text-secondary' }, 'Path'),
+      h('div', { className: 'text-sm', style: { fontFamily: 'var(--font-mono)', padding: '6px 0' } }, `/api/${ep.path}`),
+    ]),
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'text-sm text-secondary' }, 'Table'),
+      h('div', { className: 'text-sm', style: { padding: '6px 0' } }, ep.table_name),
+    ]),
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'text-sm text-secondary mb-1' }, 'Allowed Methods'),
+      h('div', { className: 'flex items-center', style: { flexWrap: 'wrap' } }, methodChecks),
+    ]),
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'flex items-center gap-2' }, [authCheck, 'Requires Authentication']),
+    ]),
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'flex items-center gap-2' }, [publicReadCheck, 'Public Read (GET without auth)']),
+    ]),
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'text-sm text-secondary' }, 'Required Role'),
+      roleInput,
+    ]),
+    h('div', { className: 'form-group mb-3' }, [
+      h('label', { className: 'text-sm text-secondary' }, 'Rate Limit (requests/min)'),
+      rateInput,
+    ]),
+  ]);
+
+  modal.show(`Edit /api/${ep.path}`, form, [
+    { label: 'Cancel', onClick: () => {} },
+    {
+      label: 'Save',
+      className: 'btn btn--primary',
+      onClick: async () => {
+        const selectedMethods = ALL_METHODS.filter((_, i) =>
+          methodChecks[i].querySelector('input').checked
+        );
+        if (selectedMethods.length === 0) {
+          toast.error('Select at least one method');
+          return false;
+        }
+
+        try {
+          await put(`/admin/api/sites/${siteId}/endpoints/${ep.id}`, {
+            methods: selectedMethods,
+            requires_auth: authCheck.checked,
+            public_read: publicReadCheck.checked,
+            required_role: roleInput.value.trim(),
+            rate_limit: parseInt(rateInput.value) || 60,
+          });
+          toast.success('Endpoint updated');
+          loadEndpoints(container, siteId);
+        } catch (err) {
+          toast.error(err.message);
+          return false;
+        }
+      },
+    },
   ]);
 }
 
