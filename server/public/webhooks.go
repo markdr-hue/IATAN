@@ -75,6 +75,8 @@ func (h *Handler) IncomingWebhook(w http.ResponseWriter, r *http.Request) {
 		expectedMAC := computeHMAC(body, []byte(secret))
 		providedMAC, err := hex.DecodeString(sig)
 		if err != nil || !hmac.Equal(providedMAC, expectedMAC) {
+			h.deps.Logger.Warn("webhook signature validation failed",
+				"webhook", webhookName, "site_id", site.ID, "remote_addr", r.RemoteAddr)
 			writePublicError(w, http.StatusUnauthorized, "invalid signature")
 			return
 		}

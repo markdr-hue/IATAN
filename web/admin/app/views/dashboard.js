@@ -181,5 +181,12 @@ export async function renderDashboard(container) {
     }
   } catch (err) {
     toast.error('Failed to load dashboard: ' + err.message);
+    clear(statsGrid);
+    statsGrid.appendChild(
+      h('div', { className: 'stat-card' }, [
+        h('div', { className: 'stat-card__value text-danger' }, 'Failed to load'),
+        h('div', { className: 'stat-card__sub' }, err.message),
+      ])
+    );
   }
 }

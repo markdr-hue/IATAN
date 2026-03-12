@@ -192,6 +192,93 @@ func validatePageQuality(db *sql.DB, bp *Blueprint) []string {
 		}
 	}
 
+	// CSS class validation: check that classes used in HTML exist in CSS.
+	issues = append(issues, validateCSSClassRefs(db, bp)...)
+
+	return issues
+}
+
+// htmlClassRe matches class="..." attributes in HTML.
+var htmlClassRe = regexp.MustCompile(`class="([^"]+)"`)
+
+// cssDefinedClassRe matches class selectors in CSS (e.g., .card, .btn-primary).
+var cssDefinedClassRe = regexp.MustCompile(`\.([\w-]+)\s*[{,:\s]`)
+
+// validateCSSClassRefs checks that CSS classes referenced in page HTML actually
+// exist in at least one CSS file. Reports only high-confidence mismatches.
+func validateCSSClassRefs(db *sql.DB, bp *Blueprint) []string {
+	// Load all CSS content (global + page-scoped).
+	cssRows, err := db.Query("SELECT filename, storage_path FROM assets WHERE filename LIKE '%.css'")
+	if err != nil {
+		return nil
+	}
+	defer cssRows.Close()
+
+	definedClasses := make(map[string]bool)
+	for cssRows.Next() {
+		var filename, storagePath string
+		cssRows.Scan(&filename, &storagePath)
+		if storagePath == "" {
+			continue
+		}
+		data, err := os.ReadFile(storagePath)
+		if err != nil {
+			continue
+		}
+		for _, m := range cssDefinedClassRe.FindAllStringSubmatch(string(data), -1) {
+			definedClasses[m[1]] = true
+		}
+	}
+
+	if len(definedClasses) == 0 {
+		return nil // No CSS files to validate against.
+	}
+
+	// Common framework/utility classes to ignore (not defined in custom CSS).
+	commonClasses := map[string]bool{
+		"active": true, "hidden": true, "disabled": true, "show": true, "hide": true,
+		"open": true, "closed": true, "selected": true, "loading": true, "error": true,
+		"success": true, "visible": true, "collapsed": true, "expanded": true,
+	}
+
+	// Check each page's HTML for class references.
+	var issues []string
+	missingCounts := make(map[string]int)
+
+	for _, page := range bp.Pages {
+		var content sql.NullString
+		db.QueryRow("SELECT content FROM pages WHERE path = ? AND is_deleted = 0", page.Path).Scan(&content)
+		if !content.Valid || content.String == "" {
+			continue
+		}
+
+		matches := htmlClassRe.FindAllStringSubmatch(content.String, -1)
+		for _, m := range matches {
+			for _, cls := range strings.Fields(m[1]) {
+				cls = strings.TrimSpace(cls)
+				if cls == "" || commonClasses[cls] || definedClasses[cls] {
+					continue
+				}
+				missingCounts[cls]++
+			}
+		}
+	}
+
+	// Only report classes that appear multiple times (reduces false positives from
+	// dynamic classes set via JS).
+	for cls, count := range missingCounts {
+		if count >= 2 {
+			issues = append(issues, fmt.Sprintf(
+				"CSS class %q used in %d pages but not defined in any CSS file — add it to global CSS or fix the class name",
+				cls, count))
+		}
+	}
+
+	// Cap at 5 issues to avoid overwhelming the fixup prompt.
+	if len(issues) > 5 {
+		issues = issues[:5]
+	}
+
 	return issues
 }
 

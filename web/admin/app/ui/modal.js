@@ -35,7 +35,7 @@ export function show(title, content, actions = []) {
 
   const body = h('div', { className: 'modal__body' });
   if (typeof content === 'string') {
-    body.innerHTML = content;
+    body.textContent = content;
   } else if (content instanceof HTMLElement) {
     body.appendChild(content);
   }

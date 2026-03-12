@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -392,10 +393,14 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 		}
 	}
 
-	// Post-save validation for CSS files.
+	// Post-save validation and summary for CSS files.
 	if strings.HasSuffix(strings.ToLower(filename), ".css") {
 		if warnings := validateCSSContent(filename, fileData); len(warnings) > 0 {
 			resultData["warnings"] = warnings
+		}
+		// Extract CSS classes and variables so the AI remembers them for page creation.
+		if summary := extractCSSSummary(string(fileData)); summary != "" {
+			resultData["css_classes"] = summary
 		}
 	}
 
@@ -852,6 +857,58 @@ func validateCSSContent(filename string, content []byte) []string {
 	return warnings
 }
 
+// cssClassRe matches class selectors like .classname at the start of a rule.
+var cssClassRe = regexp.MustCompile(`(?m)^[^{}]*?\.([\w-]+)`)
+
+// cssVarRe matches CSS custom property declarations like --color-primary: #fff.
+var cssVarRe = regexp.MustCompile(`(--[\w-]+)\s*:\s*([^;}]+)`)
+
+// extractCSSSummary extracts class names and CSS custom properties from CSS content.
+// Returns a compact summary string suitable for preserving in tool results.
+func extractCSSSummary(css string) string {
+	var vars []string
+	var classes []string
+	seen := make(map[string]bool)
+
+	// Extract custom properties.
+	for _, m := range cssVarRe.FindAllStringSubmatch(css, -1) {
+		key := m[1] + ": " + strings.TrimSpace(m[2])
+		if !seen[m[1]] {
+			vars = append(vars, key)
+			seen[m[1]] = true
+		}
+	}
+
+	// Extract class selectors (deduplicated).
+	for _, m := range cssClassRe.FindAllStringSubmatch(css, -1) {
+		cls := m[1]
+		if !seen["."+cls] {
+			classes = append(classes, "."+cls)
+			seen["."+cls] = true
+		}
+	}
+
+	var parts []string
+	if len(vars) > 0 {
+		if len(vars) > 30 {
+			vars = vars[:30]
+		}
+		parts = append(parts, "vars: "+strings.Join(vars, "; "))
+	}
+	if len(classes) > 0 {
+		if len(classes) > 40 {
+			classes = classes[:40]
+		}
+		parts = append(parts, "classes: "+strings.Join(classes, " "))
+	}
+
+	summary := strings.Join(parts, " | ")
+	if len(summary) > 1500 {
+		summary = summary[:1500]
+	}
+	return summary
+}
+
 func (t *FilesTool) MaxResultSize() int { return 16000 }
 
 func (t *FilesTool) Summarize(result string) string {
@@ -873,6 +930,14 @@ func (t *FilesTool) Summarize(result string) string {
 		filename, _ := data["filename"].(string)
 		wJSON, _ := json.Marshal(warnings)
 		return fmt.Sprintf(`{"success":true,"file":"%s","warnings":%s,"ACTION_REQUIRED":"Fix JS errors"}`, filename, wJSON)
+	}
+	// Preserve CSS class summary so the AI can reference classes when building pages.
+	if cssSummary, ok := data["css_classes"].(string); ok && cssSummary != "" {
+		filename, _ := data["filename"].(string)
+		if len(cssSummary) > 1200 {
+			cssSummary = cssSummary[:1200]
+		}
+		return fmt.Sprintf(`{"success":true,"file":"%s","css_classes":"%s"}`, filename, strings.ReplaceAll(cssSummary, `"`, `'`))
 	}
 	filename, _ := data["filename"].(string)
 	size, _ := data["size"].(float64)

@@ -340,7 +340,6 @@ export function renderSiteChat(container, siteId) {
         addLoadEarlierButton();
       }
     } catch (err) {
-      console.error('Load earlier messages failed:', err);
       // Restore button so user can retry.
       if (btnEl) {
         btnEl.textContent = 'Load earlier messages';

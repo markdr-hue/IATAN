@@ -445,20 +445,39 @@ func buildBuildPrompt(bp *Blueprint, site *models.Site) string {
 
 	b.WriteString(buildPlatformCapabilitiesRef())
 
+	// Design token reference — always visible even after tool result compression.
+	b.WriteString("## Design Reference (use these exact values in your CSS and HTML)\n")
+	b.WriteString(fmt.Sprintf("- **Primary**: %s\n", bp.ColorScheme.Primary))
+	b.WriteString(fmt.Sprintf("- **Secondary**: %s\n", bp.ColorScheme.Secondary))
+	b.WriteString(fmt.Sprintf("- **Accent**: %s\n", bp.ColorScheme.Accent))
+	b.WriteString(fmt.Sprintf("- **Background**: %s\n", bp.ColorScheme.Background))
+	b.WriteString(fmt.Sprintf("- **Surface**: %s\n", bp.ColorScheme.Surface))
+	b.WriteString(fmt.Sprintf("- **Text**: %s\n", bp.ColorScheme.Text))
+	b.WriteString(fmt.Sprintf("- **Text Muted**: %s\n", bp.ColorScheme.TextMuted))
+	b.WriteString(fmt.Sprintf("- **Heading Font**: %s\n", bp.Typography.HeadingFont))
+	b.WriteString(fmt.Sprintf("- **Body Font**: %s\n", bp.Typography.BodyFont))
+	b.WriteString(fmt.Sprintf("- **Scale**: %.1f\n", bp.Typography.Scale))
+	if bp.DesignNotes != "" {
+		b.WriteString(fmt.Sprintf("- **Design Notes**: %s\n", bp.DesignNotes))
+	}
+	b.WriteString("\nDefine these as CSS custom properties (--color-primary, --color-secondary, etc.) in your global CSS, then reference them throughout all pages. Every page must use the same design system — never invent ad-hoc colors or fonts.\n\n")
+
 	b.WriteString(`## Build Order
 
 Execute in this order:
 
 ### Step 1: DATA LAYER (if Blueprint has data_tables or endpoints)
-1. Create tables with manage_schema(action="create") — follow Blueprint.data_tables exactly.
+1. Create ALL tables FIRST with manage_schema(action="create") — follow Blueprint.data_tables exactly.
    - Column types: TEXT, INTEGER, REAL, BOOLEAN, PASSWORD (bcrypt), ENCRYPTED (AES).
    - id and created_at are auto-added. Do NOT include them.
+   - Auth user tables MUST include a "role" column (TEXT type) for role-based access control.
+   - IMPORTANT: Every table must be created and confirmed successful BEFORE creating any endpoints that reference it.
 2. Create endpoints with manage_endpoints — follow Blueprint.endpoints exactly.
    - Use the EXACT action, path, table_name, and options from each EndpointSpec.
    - Do NOT create endpoints not listed in the Blueprint.
    - For create_api: set public_columns to exclude sensitive fields (never expose PASSWORD/ENCRYPTED).
    - For create_websocket: include room_column and write_to_table if specified.
-   - For create_auth: include username_column and password_column.
+   - For create_auth: include username_column and password_column. The table MUST already exist with the specified columns.
 3. Seed data with manage_data(action="insert", rows=[...]) for tables with seed_data=true.
    - Use realistic, relevant data (5-10 rows). Vary content.
 4. Create webhooks with manage_webhooks if Blueprint has webhooks:

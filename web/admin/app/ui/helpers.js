@@ -30,9 +30,12 @@ export function formatBytes(bytes) {
  * @returns {{ url: string, label: string }}
  */
 export function formatPublicUrl(site, systemStatus) {
+  if (!site.domain) {
+    return { url: '#', label: 'No domain configured' };
+  }
   const publicPort = (systemStatus && systemStatus.public_port) || 5000;
-  const host = site.domain || 'localhost';
-  const needsPort = !site.domain || host.includes('localhost');
+  const host = site.domain;
+  const needsPort = host.includes('localhost') || host.includes('127.0.0.1');
   const url = needsPort ? `http://${host}:${publicPort}` : `http://${host}`;
   const label = needsPort ? `${host}:${publicPort}` : host;
   return { url, label };

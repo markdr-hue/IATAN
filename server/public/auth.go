@@ -194,15 +194,21 @@ func (h *Handler) authRegister(w http.ResponseWriter, r *http.Request, siteID in
 		}
 		colRows.Close()
 
-		// Verify the auth config columns actually exist in the table.
-		if len(validCols) > 0 {
-			if !validCols[ae.UsernameColumn] || !validCols[ae.PasswordColumn] {
-				writePublicError(w, http.StatusInternalServerError,
-					fmt.Sprintf("auth config mismatch: table %q is missing column %q or %q", ae.TableName, ae.UsernameColumn, ae.PasswordColumn))
-				return
-			}
+		if len(validCols) == 0 {
+			writePublicError(w, http.StatusInternalServerError,
+				fmt.Sprintf("registration failed: table %q does not exist", ae.TableName))
+			return
 		}
 
+		// Verify the auth config columns actually exist in the table.
+		if !validCols[ae.UsernameColumn] || !validCols[ae.PasswordColumn] {
+			writePublicError(w, http.StatusInternalServerError,
+				fmt.Sprintf("auth config mismatch: table %q is missing column %q or %q",
+					ae.TableName, ae.UsernameColumn, ae.PasswordColumn))
+			return
+		}
+
+		// Filter unknown fields — only inside the validCols guard.
 		for col := range body {
 			if !validCols[col] {
 				delete(body, col)
@@ -225,7 +231,9 @@ func (h *Handler) authRegister(w http.ResponseWriter, r *http.Request, siteID in
 	}
 
 	if len(columns) == 0 {
-		writePublicError(w, http.StatusInternalServerError, "no valid columns for registration — auth endpoint config does not match table schema")
+		writePublicError(w, http.StatusInternalServerError,
+			fmt.Sprintf("no valid columns for registration — table=%q, username_col=%q, password_col=%q, role_col=%q",
+				ae.TableName, ae.UsernameColumn, ae.PasswordColumn, ae.RoleColumn))
 		return
 	}
 
@@ -279,6 +287,14 @@ func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request, siteID int, 
 		fmt.Sprintf("SELECT id, %s, %s FROM %s WHERE %s = ?", ae.PasswordColumn, ae.RoleColumn, physTable, ae.UsernameColumn),
 		username,
 	).Scan(&userID, &hashedPassword, &role)
+	if err != nil && strings.Contains(err.Error(), "no such column") {
+		// Role column doesn't exist — retry without it, use default role.
+		err = siteDB.QueryRow(
+			fmt.Sprintf("SELECT id, %s FROM %s WHERE %s = ?", ae.PasswordColumn, physTable, ae.UsernameColumn),
+			username,
+		).Scan(&userID, &hashedPassword)
+		role.String = ae.DefaultRole
+	}
 	if err != nil {
 		writePublicError(w, http.StatusUnauthorized, "invalid credentials")
 		return
@@ -605,13 +621,19 @@ type oauthTokenResponse struct {
 	TokenType   string `json:"token_type"`
 }
 
-// oauthRedirectURI builds the OAuth callback URI from the current request.
+// oauthRedirectURI builds the OAuth callback URI, using the site's configured
+// domain to prevent open-redirect attacks via Host header manipulation.
+// Falls back to r.Host only when no domain is configured (local development).
 func oauthRedirectURI(r *http.Request, authPath, provider string) string {
 	scheme := "https"
 	if r.TLS == nil {
 		scheme = "http"
 	}
-	return fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, r.Host, authPath, provider)
+	host := r.Host
+	if site := getSite(r); site != nil && site.Domain != nil && *site.Domain != "" {
+		host = *site.Domain
+	}
+	return fmt.Sprintf("%s://%s/api/%s/oauth/%s/callback", scheme, host, authPath, provider)
 }
 
 func exchangeOAuthCode(op *oauthProviderConfig, code, redirectURI, clientSecret string) (*oauthTokenResponse, error) {

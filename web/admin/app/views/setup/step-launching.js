@@ -137,8 +137,7 @@ export function renderLaunching(container, setupData) {
         try {
           await authPost(`/admin/api/brain/${site.id}/start`, {});
         } catch (e) {
-          // Brain may auto-start via event; log but don't block setup
-          console.warn('brain start request failed, may have auto-started:', e.message);
+          // Brain may auto-start via event; don't block setup.
         }
         markDone(3);
       } else {

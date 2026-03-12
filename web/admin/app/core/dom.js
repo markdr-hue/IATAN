@@ -31,6 +31,8 @@ export function h(tag, attrs, children) {
           el.dataset[dk] = dv;
         }
       } else if (key === 'innerHTML') {
+        // SAFETY: Only use innerHTML for trusted content like SVG icons.
+        // Never pass user-provided strings through this path.
         el.innerHTML = value;
       } else if (key === 'value') {
         el.value = value;

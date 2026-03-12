@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,6 +124,9 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 	switch site.Mode {
 	case "building":
 		w.setState(StateBuilding)
+		// Brief delay to let site DB migrations fully commit their WAL checkpoint.
+		// Without this, the first write can hit SQLITE_BUSY on fresh sites.
+		time.Sleep(200 * time.Millisecond)
 		// Auto-recover from crashes: reset error count and clear non-question pauses
 		// so the pipeline can resume instead of staying stuck in paused loop.
 		// But if error_count was high (repeated failures), keep the pause to avoid
@@ -140,8 +144,18 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 		if prevErrorCount > 0 {
 			w.logger.Info("auto-recovery: clearing error_count", "previous_count", prevErrorCount)
 		}
-		w.siteDB.ExecWrite(`UPDATE pipeline_state SET error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND error_count > 0`)
-		w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN (?, ?)`, PauseReasonOwnerAnswers, PauseReasonApproval)
+		if _, err := w.siteDB.ExecWrite(`UPDATE pipeline_state SET error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND error_count > 0`); err != nil {
+			w.logger.Error("auto-recovery: failed to reset error_count, entering paused state", "error", err)
+			w.setState(StatePaused)
+			w.runPausedLoop(ctx)
+			return
+		}
+		if _, err := w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN (?, ?)`, PauseReasonOwnerAnswers, PauseReasonApproval); err != nil {
+			w.logger.Error("auto-recovery: failed to clear pause, entering paused state", "error", err)
+			w.setState(StatePaused)
+			w.runPausedLoop(ctx)
+			return
+		}
 		w.runBuildPipeline(ctx)
 	case "monitoring":
 		w.setState(StateMonitoring)
@@ -200,7 +214,7 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 			defer func() {
 				if r := recover(); r != nil {
 					stageErr = fmt.Errorf("panic in stage %s: %v", stage, r)
-					w.logger.Error("stage panic", "stage", stage, "panic", r)
+					w.logger.Error("stage panic", "stage", stage, "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 
@@ -453,13 +467,15 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 		iteration = i
 
 		// Compress tool results the LLM has already seen to save context tokens.
-		// Exempt schema and endpoint results — their outputs contain column names
-		// and paths that are needed for correct JS/page code in later iterations.
+		// Exempt schema, endpoint, and CSS results — they contain column names,
+		// paths, and class/variable names needed for correct page code later.
 		if i > 0 {
 			for j := 0; j < seenUpTo; j++ {
 				if messages[j].Role == llm.RoleTool && len(messages[j].Content) > 500 {
-					// Check if this is a schema or endpoint result worth preserving.
-					if len(messages[j].Content) <= 2000 && (strings.Contains(messages[j].Content, "schema_def") || strings.Contains(messages[j].Content, "endpoint")) {
+					if len(messages[j].Content) <= 2000 && (strings.Contains(messages[j].Content, "schema_def") ||
+						strings.Contains(messages[j].Content, "endpoint") ||
+						strings.Contains(messages[j].Content, ".css") ||
+						strings.Contains(messages[j].Content, "css_classes")) {
 						continue
 					}
 					messages[j].Content = truncate(messages[j].Content, 300)

@@ -145,7 +145,9 @@ func (w *PipelineWorker) runAnalyze(ctx context.Context) (PipelineStage, error) 
 	if len(analysis.Questions) > 0 {
 		w.logger.Info("analysis has questions, pausing for owner answers", "count", len(analysis.Questions))
 		// Mark any stale pending questions from previous attempts as superseded.
-		w.siteDB.ExecWrite("UPDATE questions SET status = 'superseded' WHERE status = 'pending'")
+		if _, err := w.siteDB.ExecWrite("UPDATE questions SET status = 'superseded' WHERE status = 'pending'"); err != nil {
+			w.logger.Warn("failed to supersede old questions", "error", err)
+		}
 		for _, q := range analysis.Questions {
 			opts := ""
 			if len(q.Options) > 0 {

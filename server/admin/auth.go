@@ -170,18 +170,6 @@ func (h *AuthHandler) HandleProviderCatalog(w http.ResponseWriter, r *http.Reque
 // HandleSetup creates the initial admin user during first-run setup.
 // Optionally updates an existing DB provider with the user's API key.
 func (h *AuthHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
-	// Only allow setup if no users exist.
-	count, err := models.CountUsers(h.deps.DB.DB)
-	if err != nil {
-		h.deps.Logger.Error("setup: failed to count users", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if count > 0 {
-		writeError(w, http.StatusConflict, "setup already completed")
-		return
-	}
-
 	var req setupRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -192,7 +180,7 @@ func (h *AuthHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hash the password and create the admin user.
+	// Hash the password before acquiring the write lock (bcrypt is slow).
 	hash, err := security.HashPassword(req.Password)
 	if err != nil {
 		h.deps.Logger.Error("setup: failed to hash password", "error", err)
@@ -201,6 +189,8 @@ func (h *AuthHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Run all setup DB writes in a single transaction.
+	// The user-count check is INSIDE the transaction to prevent a TOCTOU race
+	// where concurrent requests both see count==0 and create duplicate admins.
 	tx, err := h.deps.DB.BeginWriteTx()
 	if err != nil {
 		h.deps.Logger.Error("setup: failed to begin transaction", "error", err)
@@ -208,6 +198,19 @@ func (h *AuthHandler) HandleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.deps.DB.EndWriteTx()
+
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM users").Scan(&count); err != nil {
+		tx.Rollback()
+		h.deps.Logger.Error("setup: failed to count users", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if count > 0 {
+		tx.Rollback()
+		writeError(w, http.StatusConflict, "setup already completed")
+		return
+	}
 
 	user, err := models.CreateUserTx(tx, req.Username, hash, "admin", req.DisplayName)
 	if err != nil {

@@ -411,6 +411,16 @@ func (t *EndpointsTool) createAuth(ctx *ToolContext, args map[string]interface{}
 			usernameCol, tableName, strings.Join(available, ", "))}, nil
 	}
 
+	// Verify the physical SQLite table actually exists (not just the registry entry).
+	var colCount int
+	if err := ctx.DB.QueryRow(
+		fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s')", tableName),
+	).Scan(&colCount); err != nil || colCount == 0 {
+		return &Result{Success: false, Error: fmt.Sprintf(
+			"table %q is registered but does not exist as a physical table — recreate it with manage_schema",
+			tableName)}, nil
+	}
+
 	// Build public columns JSON.
 	publicColumnsJSON := "[]"
 	if pubColsRaw, ok := args["public_columns"].([]interface{}); ok && len(pubColsRaw) > 0 {
@@ -438,6 +448,21 @@ func (t *EndpointsTool) createAuth(ctx *ToolContext, args map[string]interface{}
 			return &Result{Success: false, Error: fmt.Sprintf("invalid role_column name: %s", rc)}, nil
 		}
 		roleColumn = rc
+	}
+
+	// Ensure role_column exists in the table — auto-add if missing.
+	if _, ok := schemaMap[roleColumn]; !ok {
+		_, alterErr := ctx.DB.Exec(
+			fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT DEFAULT ''", tableName, roleColumn))
+		if alterErr != nil {
+			return &Result{Success: false, Error: fmt.Sprintf(
+				"role_column %q does not exist in table %q and could not be auto-added: %v",
+				roleColumn, tableName, alterErr)}, nil
+		}
+		schemaMap[roleColumn] = "TEXT"
+		updatedSchema, _ := json.Marshal(schemaMap)
+		ctx.DB.Exec("UPDATE dynamic_tables SET schema_def = ? WHERE table_name = ?",
+			string(updatedSchema), tableName)
 	}
 
 	// Insert into auth_endpoints table.

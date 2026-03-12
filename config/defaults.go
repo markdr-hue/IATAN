@@ -13,4 +13,5 @@ const (
 	DefaultFirstRunPath   = "./firstrun.json"
 	DefaultRateLimitRate  = 100 // Requests per second per IP (public endpoints)
 	DefaultRateLimitBurst = 200 // Burst capacity per IP (public endpoints)
+	DefaultLLMTimeoutSec  = 180 // 3 minutes default for LLM HTTP calls
 )

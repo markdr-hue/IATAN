@@ -9,6 +9,7 @@ import (
 	"context"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -75,16 +76,17 @@ func main() {
 
 	slog.Info("tools registered", "count", len(toolRegistry.List()))
 
+	llmHTTPClient := &http.Client{Timeout: cfg.LLMTimeout()}
 	providerFactory := func(name, providerType, apiKey, baseURL string) llm.Provider {
 		switch strings.ToLower(providerType) {
 		case "anthropic":
-			var opts []anthropic.Option
+			opts := []anthropic.Option{anthropic.WithHTTPClient(llmHTTPClient)}
 			if baseURL != "" {
 				opts = append(opts, anthropic.WithBaseURL(baseURL))
 			}
 			return anthropic.New(name, apiKey, opts...)
 		case "openai":
-			var opts []openai.Option
+			opts := []openai.Option{openai.WithHTTPClient(llmHTTPClient)}
 			if baseURL != "" {
 				opts = append(opts, openai.WithBaseURL(baseURL))
 			}

@@ -9,7 +9,9 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -47,8 +49,18 @@ func (t *MakeHTTPRequestTool) Execute(ctx *ToolContext, args map[string]interfac
 	}
 
 	// Resolve relative URLs (e.g. /api/drawings) against the site's own address.
-	if strings.HasPrefix(url, "/") {
+	// These are always local site URLs, so skip SSRF validation for them.
+	isRelative := strings.HasPrefix(url, "/")
+	if isRelative {
 		url = resolveLocalURL(ctx, url)
+	}
+
+	// Block SSRF: reject non-http(s) schemes and private/internal IPs for
+	// absolute URLs (which come from LLM output and are untrusted).
+	if !isRelative {
+		if err := validateExternalURL(url); err != nil {
+			return &Result{Success: false, Error: fmt.Sprintf("blocked URL: %v", err)}, nil
+		}
 	}
 
 	method, _ := args["method"].(string)
@@ -99,6 +111,42 @@ func (t *MakeHTTPRequestTool) Execute(ctx *ToolContext, args map[string]interfac
 		"body":        bodyStr,
 		"headers":     flattenHeaders(resp.Header),
 	}}, nil
+}
+
+// validateExternalURL blocks SSRF by rejecting dangerous schemes and private IPs.
+func validateExternalURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("scheme %q not allowed (only http/https)", scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("empty hostname")
+	}
+	// Resolve the hostname to IPs and check each one.
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve %q: %w", host, err)
+	}
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return fmt.Errorf("unparseable resolved IP %q", ipStr)
+		}
+		if isPrivateIP(ip) {
+			return fmt.Errorf("resolved to private/internal IP %s", ipStr)
+		}
+	}
+	return nil
+}
+
+// isPrivateIP returns true for loopback, link-local, and RFC-1918 addresses.
+func isPrivateIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 // resolveLocalURL turns a relative path like "/api/drawings" into a full URL

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -33,6 +34,9 @@ type Config struct {
 	// Brain monitoring intervals (seconds). Zero means use built-in defaults.
 	BrainMonitoringBaseSec int `json:"brain_monitoring_base_sec"`
 	BrainMonitoringMaxSec  int `json:"brain_monitoring_max_sec"`
+
+	// LLM HTTP client timeout in seconds. Zero means use default (180s / 3 minutes).
+	LLMTimeoutSec int `json:"llm_timeout_sec"`
 }
 
 func Load() (*Config, error) {
@@ -81,6 +85,17 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("encryption key: %w", err)
 		}
 		cfg.EncryptionKey = key
+	}
+	if len(cfg.EncryptionKey) < 64 {
+		return nil, fmt.Errorf("encryption key must be at least 64 hex characters (32 bytes), got %d", len(cfg.EncryptionKey))
+	}
+
+	// Validate port ranges.
+	if cfg.AdminPort < 1 || cfg.AdminPort > 65535 {
+		return nil, fmt.Errorf("admin_port must be 1-65535, got %d", cfg.AdminPort)
+	}
+	if cfg.PublicPort < 1 || cfg.PublicPort > 65535 {
+		return nil, fmt.Errorf("public_port must be 1-65535, got %d", cfg.PublicPort)
 	}
 
 	return cfg, nil
@@ -131,6 +146,29 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("IATAN_CADDY_ENABLED"); v == "true" || v == "1" {
 		cfg.CaddyEnabled = true
 	}
+	if v := os.Getenv("IATAN_RATE_LIMIT_RATE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			cfg.RateLimitRate = f
+		}
+	}
+	if v := os.Getenv("IATAN_RATE_LIMIT_BURST"); v != "" {
+		if b, err := strconv.Atoi(v); err == nil && b > 0 {
+			cfg.RateLimitBurst = b
+		}
+	}
+	if v := os.Getenv("IATAN_LLM_TIMEOUT"); v != "" {
+		if t, err := strconv.Atoi(v); err == nil && t > 0 {
+			cfg.LLMTimeoutSec = t
+		}
+	}
+}
+
+// LLMTimeout returns the configured LLM HTTP client timeout as a time.Duration.
+func (c *Config) LLMTimeout() time.Duration {
+	if c.LLMTimeoutSec > 0 {
+		return time.Duration(c.LLMTimeoutSec) * time.Second
+	}
+	return time.Duration(DefaultLLMTimeoutSec) * time.Second
 }
 
 func loadOrGenerateKey(path string, size int) (string, error) {
