@@ -22,8 +22,16 @@ type WebhooksTool struct{}
 
 func (t *WebhooksTool) Name() string { return "manage_webhooks" }
 func (t *WebhooksTool) Description() string {
-	return "Manage webhooks for external integration. Actions: create (direction is automatic — omit 'url' for incoming, provide 'url' for outgoing; incoming receives POSTs at /webhooks/{name} with HMAC-SHA256 validation; outgoing sends POSTs to external URLs on events), get, list, delete, update, subscribe (bind to events like data.insert, data.update, data.delete, payment.completed, webhook.received, ws.message)."
+	return "Create, get, list, delete, update, or subscribe webhooks to events."
 }
+
+func (t *WebhooksTool) Guide() string {
+	return `### Webhooks (manage_webhooks)
+- Incoming: receive at /webhooks/{name}. HMAC-SHA256 validation.
+- Outgoing: fire on events to external URLs.
+- Events: data.insert, data.update, data.delete, webhook.received, payment.completed, ws.message.`
+}
+
 func (t *WebhooksTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",

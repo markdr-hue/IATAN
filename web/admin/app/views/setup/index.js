@@ -32,7 +32,7 @@ export function renderSetup(container) {
     apiKey: '',
     siteName: '',
     siteDomain: '',
-    siteDirection: '',
+    siteDescription: '',
   };
 
   const wrapper = h('div', { className: 'setup-container' });

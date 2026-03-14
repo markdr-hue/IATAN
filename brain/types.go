@@ -31,13 +31,11 @@ const (
 type PipelineStage string
 
 const (
-	StageAnalyze         PipelineStage = "ANALYZE"
-	StageBlueprint       PipelineStage = "BLUEPRINT"
-	StageBuild           PipelineStage = "BUILD"
-	StageValidate        PipelineStage = "VALIDATE"
-	StageComplete        PipelineStage = "COMPLETE"
-	StageMonitoring      PipelineStage = "MONITORING"
-	StageUpdateBlueprint PipelineStage = "UPDATE_BLUEPRINT"
+	StagePlan       PipelineStage = "PLAN"
+	StageBuild      PipelineStage = "BUILD"
+	StageComplete   PipelineStage = "COMPLETE"
+	StageMonitoring PipelineStage = "MONITORING"
+	StageUpdatePlan PipelineStage = "UPDATE_PLAN"
 )
 
 // Pause reasons — stored in pipeline_state.pause_reason.

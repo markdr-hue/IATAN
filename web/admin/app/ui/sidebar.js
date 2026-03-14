@@ -158,8 +158,6 @@ export function createSidebar() {
         h('span', {}, link.label),
       ]);
 
-      // No pending badge needed for providers (no approval flow)
-
       globalSectionEl.appendChild(el);
     }
 
@@ -178,6 +176,26 @@ export function createSidebar() {
       },
     });
     footer.appendChild(themeBtn);
+
+    const socialLinks = h('span', { className: 'sidebar__social' }, [
+      h('a', {
+        href: 'https://github.com/markdr-hue/IATAN',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        className: 'sidebar__social-link',
+        title: 'GitHub',
+        innerHTML: icon('github'),
+      }),
+      h('a', {
+        href: 'https://discord.com/invite/VRdYgDQ2qr',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        className: 'sidebar__social-link',
+        title: 'Discord',
+        innerHTML: icon('discord'),
+      }),
+    ]);
+    footer.appendChild(socialLinks);
 
     const sysStatus = state.get('systemStatus');
     if (sysStatus && sysStatus.version) {
@@ -200,7 +218,6 @@ export function createSidebar() {
     }
   });
   state.watch('runningSites', () => switcher.update());
-  // No pending badge needed for providers (no approval flow).
   state.watch('siteActivity', () => switcher.update());
   state.watch('pendingQuestions', renderNav);
 

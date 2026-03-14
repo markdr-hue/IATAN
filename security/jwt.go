@@ -16,6 +16,7 @@ import (
 )
 
 type Claims struct {
+	SiteID   int    `json:"site_id,omitempty"`
 	UserID   int    `json:"user_id"`
 	Username string `json:"username"`
 	Role     string `json:"role"`
@@ -36,7 +37,14 @@ func NewJWTManager(secret string, expiry time.Duration) *JWTManager {
 }
 
 func (j *JWTManager) Generate(userID int, username, role string) (string, error) {
+	return j.GenerateForSite(0, userID, username, role)
+}
+
+// GenerateForSite creates a JWT token scoped to a specific site.
+// Site ID 0 means admin/unscoped token.
+func (j *JWTManager) GenerateForSite(siteID, userID int, username, role string) (string, error) {
 	claims := Claims{
+		SiteID:   siteID,
 		UserID:   userID,
 		Username: username,
 		Role:     role,

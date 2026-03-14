@@ -342,18 +342,33 @@ CREATE TABLE IF NOT EXISTS layouts (
     head_content TEXT DEFAULT '',
     body_before_main TEXT DEFAULT '',
     body_after_main TEXT DEFAULT '',
+    template TEXT DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS layout_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    layout_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    head_content TEXT DEFAULT '',
+    body_before_main TEXT DEFAULT '',
+    body_after_main TEXT DEFAULT '',
+    template TEXT DEFAULT NULL,
+    version_number INTEGER NOT NULL,
+    changed_by TEXT NOT NULL DEFAULT 'brain',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_layout_versions ON layout_versions(layout_id, version_number DESC);
+
 -- Pipeline state: singleton row tracking current build progress
 CREATE TABLE IF NOT EXISTS pipeline_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    stage TEXT NOT NULL DEFAULT 'ANALYZE',
+    stage TEXT NOT NULL DEFAULT 'PLAN',
     plan_json TEXT,
-    blueprint_json TEXT,
+    tool_calls_completed INTEGER DEFAULT 0,
     update_description TEXT,
-    current_page_index INTEGER DEFAULT 0,
     error_count INTEGER DEFAULT 0,
     last_error TEXT,
     paused BOOLEAN DEFAULT 0,
@@ -416,13 +431,23 @@ CREATE TABLE IF NOT EXISTS stream_endpoints (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- URL redirects (301/302)
+CREATE TABLE IF NOT EXISTS redirects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path TEXT NOT NULL UNIQUE,
+    target_path TEXT NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 301,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_redirects_source ON redirects(source_path);
+
 -- WebSocket endpoints
 CREATE TABLE IF NOT EXISTS ws_endpoints (
     id INTEGER PRIMARY KEY,
     path TEXT UNIQUE NOT NULL,
-    event_types TEXT,
-    receive_event_type TEXT DEFAULT 'ws.message',
     write_to_table TEXT DEFAULT '',
+    room_column TEXT DEFAULT '',
     requires_auth BOOLEAN DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

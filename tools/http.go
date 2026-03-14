@@ -7,6 +7,7 @@ package tools
 
 import (
 	"database/sql"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -26,7 +27,14 @@ type MakeHTTPRequestTool struct{}
 
 func (t *MakeHTTPRequestTool) Name() string { return "make_http_request" }
 func (t *MakeHTTPRequestTool) Description() string {
-	return "Make an HTTP request to an external URL. Useful for calling APIs, checking endpoints, or fetching data."
+	return "Make an HTTP request to an external URL."
+}
+
+func (t *MakeHTTPRequestTool) Guide() string {
+	return `### HTTP Requests (make_http_request)
+- External HTTP requests (GET, POST, PUT, DELETE, PATCH).
+- parse_feed=true for RSS/Atom feeds -> structured JSON.
+- strip_html=true to extract clean text from web pages.`
 }
 func (t *MakeHTTPRequestTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -36,7 +44,8 @@ func (t *MakeHTTPRequestTool) Parameters() map[string]interface{} {
 			"method":     map[string]interface{}{"type": "string", "description": "HTTP method (GET, POST, PUT, DELETE, PATCH)", "enum": []string{"GET", "POST", "PUT", "DELETE", "PATCH"}},
 			"headers":    map[string]interface{}{"type": "object", "description": "Request headers as key-value pairs"},
 			"body":       map[string]interface{}{"type": "string", "description": "Request body (for POST, PUT, PATCH)"},
-			"strip_html": map[string]interface{}{"type": "boolean", "description": "Strip HTML tags and return clean text content. Useful for reading web pages."},
+			"strip_html":  map[string]interface{}{"type": "boolean", "description": "Strip HTML tags and return clean text content. Useful for reading web pages."},
+			"parse_feed":  map[string]interface{}{"type": "boolean", "description": "Parse response as RSS/Atom feed. Returns structured JSON: {title, link, description, items: [{title, link, pub_date, description}]}"},
 		},
 		"required": []string{"url"},
 	}
@@ -98,6 +107,18 @@ func (t *MakeHTTPRequestTool) Execute(ctx *ToolContext, args map[string]interfac
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 100*1024))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	// RSS/Atom feed parsing.
+	if parseFeed, ok := args["parse_feed"].(bool); ok && parseFeed {
+		feed, err := parseRSSOrAtomFeed(respBody)
+		if err != nil {
+			return &Result{Success: false, Error: fmt.Sprintf("feed parse error: %v", err)}, nil
+		}
+		return &Result{Success: true, Data: map[string]interface{}{
+			"status_code": resp.StatusCode,
+			"feed":        feed,
+		}}, nil
 	}
 
 	bodyStr := string(respBody)
@@ -205,6 +226,151 @@ func extractText(htmlBytes []byte) string {
 				b.WriteString(tokenizer.Token().Data)
 				b.WriteByte(' ')
 			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RSS / Atom feed parsing
+// ---------------------------------------------------------------------------
+
+type feedResult struct {
+	Title       string     `json:"title"`
+	Link        string     `json:"link"`
+	Description string     `json:"description"`
+	Items       []feedItem `json:"items"`
+}
+
+type feedItem struct {
+	Title       string `json:"title"`
+	Link        string `json:"link"`
+	Description string `json:"description"`
+	PubDate     string `json:"pub_date,omitempty"`
+}
+
+// RSS 2.0 XML structures.
+type rssRoot struct {
+	XMLName xml.Name   `xml:"rss"`
+	Channel rssChannel `xml:"channel"`
+}
+type rssChannel struct {
+	Title       string    `xml:"title"`
+	Link        string    `xml:"link"`
+	Description string    `xml:"description"`
+	Items       []rssItem `xml:"item"`
+}
+type rssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+
+// Atom XML structures.
+type atomFeed struct {
+	XMLName xml.Name   `xml:"feed"`
+	Title   string     `xml:"title"`
+	Links   []atomLink `xml:"link"`
+	Entries []atomEntry `xml:"entry"`
+}
+type atomLink struct {
+	Href string `xml:"href,attr"`
+	Rel  string `xml:"rel,attr"`
+}
+type atomEntry struct {
+	Title   string     `xml:"title"`
+	Links   []atomLink `xml:"link"`
+	Summary string     `xml:"summary"`
+	Content string     `xml:"content"`
+	Updated string     `xml:"updated"`
+}
+
+const maxFeedItems = 50
+const maxFeedDescLen = 500
+
+func parseRSSOrAtomFeed(data []byte) (*feedResult, error) {
+	// Try RSS 2.0 first.
+	var rss rssRoot
+	if err := xml.Unmarshal(data, &rss); err == nil && rss.Channel.Title != "" {
+		result := &feedResult{
+			Title:       rss.Channel.Title,
+			Link:        rss.Channel.Link,
+			Description: truncate(rss.Channel.Description, maxFeedDescLen),
+		}
+		for i, item := range rss.Channel.Items {
+			if i >= maxFeedItems {
+				break
+			}
+			result.Items = append(result.Items, feedItem{
+				Title:       item.Title,
+				Link:        item.Link,
+				Description: truncate(stripHTMLTags(item.Description), maxFeedDescLen),
+				PubDate:     item.PubDate,
+			})
+		}
+		return result, nil
+	}
+
+	// Try Atom.
+	var atom atomFeed
+	if err := xml.Unmarshal(data, &atom); err == nil && atom.Title != "" {
+		link := ""
+		for _, l := range atom.Links {
+			if l.Rel == "" || l.Rel == "alternate" {
+				link = l.Href
+				break
+			}
+		}
+		result := &feedResult{
+			Title: atom.Title,
+			Link:  link,
+		}
+		for i, entry := range atom.Entries {
+			if i >= maxFeedItems {
+				break
+			}
+			eLink := ""
+			for _, l := range entry.Links {
+				if l.Rel == "" || l.Rel == "alternate" {
+					eLink = l.Href
+					break
+				}
+			}
+			desc := entry.Summary
+			if desc == "" {
+				desc = entry.Content
+			}
+			result.Items = append(result.Items, feedItem{
+				Title:       entry.Title,
+				Link:        eLink,
+				Description: truncate(stripHTMLTags(desc), maxFeedDescLen),
+				PubDate:     entry.Updated,
+			})
+		}
+		return result, nil
+	}
+
+	return nil, fmt.Errorf("response is not a valid RSS 2.0 or Atom feed")
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+// stripHTMLTags removes HTML markup from a string (for feed descriptions).
+func stripHTMLTags(s string) string {
+	tokenizer := html.NewTokenizer(strings.NewReader(s))
+	var b strings.Builder
+	for {
+		tt := tokenizer.Next()
+		if tt == html.ErrorToken {
+			return strings.TrimSpace(b.String())
+		}
+		if tt == html.TextToken {
+			b.WriteString(tokenizer.Token().Data)
 		}
 	}
 }

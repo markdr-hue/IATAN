@@ -28,20 +28,18 @@ const (
 	monitoringMaxDefault  = 15 * time.Minute
 	idleThreshold         = 3
 	maxStageRetries       = 3
-	llmTimeout            = 5 * time.Minute
+	llmTimeout            = 7 * time.Minute
 	toolTimeout           = 2 * time.Minute
 	maxLLMRetries         = 3
-	maxContinuations      = 2
+	maxContinuations      = 3
 )
 
 // stageTimeouts defines the maximum wall-clock time each stage may run.
 var stageTimeouts = map[PipelineStage]time.Duration{
-	StageAnalyze:         5 * time.Minute,
-	StageBlueprint:       5 * time.Minute,
-	StageBuild:           60 * time.Minute,
-	StageValidate:        20 * time.Minute,
-	StageComplete:        1 * time.Minute,
-	StageUpdateBlueprint: 5 * time.Minute,
+	StagePlan:       10 * time.Minute,
+	StageBuild:      90 * time.Minute,
+	StageComplete:   1 * time.Minute,
+	StageUpdatePlan: 10 * time.Minute,
 }
 
 // PipelineWorker is a goroutine that autonomously builds a site using a
@@ -123,40 +121,15 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 
 	switch site.Mode {
 	case "building":
-		w.setState(StateBuilding)
-		// Brief delay to let site DB migrations fully commit their WAL checkpoint.
-		// Without this, the first write can hit SQLITE_BUSY on fresh sites.
+		// Brief delay for WAL checkpoint on fresh sites.
 		time.Sleep(200 * time.Millisecond)
-		// Auto-recover from crashes: reset error count and clear non-question pauses
-		// so the pipeline can resume instead of staying stuck in paused loop.
-		// But if error_count was high (repeated failures), keep the pause to avoid
-		// burning tokens on the same failure after restart.
-		var prevErrorCount int
-		if err := w.siteDB.DB.QueryRow("SELECT error_count FROM pipeline_state WHERE id = 1").Scan(&prevErrorCount); err != nil {
-			w.logger.Warn("could not read previous error_count, assuming 0", "error", err)
-		}
-		if prevErrorCount >= maxStageRetries {
-			w.logger.Warn("auto-recovery skipped: previous error_count was high, manual resume required", "error_count", prevErrorCount)
+		if w.autoRecover() {
+			w.setState(StateBuilding)
+			w.runBuildPipeline(ctx)
+		} else {
 			w.setState(StatePaused)
 			w.runPausedLoop(ctx)
-			return
 		}
-		if prevErrorCount > 0 {
-			w.logger.Info("auto-recovery: clearing error_count", "previous_count", prevErrorCount)
-		}
-		if _, err := w.siteDB.ExecWrite(`UPDATE pipeline_state SET error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND error_count > 0`); err != nil {
-			w.logger.Error("auto-recovery: failed to reset error_count, entering paused state", "error", err)
-			w.setState(StatePaused)
-			w.runPausedLoop(ctx)
-			return
-		}
-		if _, err := w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN (?, ?)`, PauseReasonOwnerAnswers, PauseReasonApproval); err != nil {
-			w.logger.Error("auto-recovery: failed to clear pause, entering paused state", "error", err)
-			w.setState(StatePaused)
-			w.runPausedLoop(ctx)
-			return
-		}
-		w.runBuildPipeline(ctx)
 	case "monitoring":
 		w.setState(StateMonitoring)
 		w.runMonitoringLoop(ctx)
@@ -167,6 +140,52 @@ func (w *PipelineWorker) Run(ctx context.Context) {
 		w.setState(StateIdle)
 		w.runPausedLoop(ctx)
 	}
+}
+
+// autoRecover attempts to recover from a crash. Returns true if the pipeline
+// can proceed, false if it should stay paused.
+func (w *PipelineWorker) autoRecover() bool {
+	var errorCount int
+	w.siteDB.DB.QueryRow("SELECT error_count FROM pipeline_state WHERE id = 1").Scan(&errorCount)
+
+	// Too many failures — require manual resume.
+	if errorCount >= maxStageRetries {
+		w.logger.Warn("auto-recovery skipped: error_count too high", "error_count", errorCount)
+		return false
+	}
+
+	// Clear errors and non-question pauses.
+	w.siteDB.ExecWrite(`UPDATE pipeline_state SET error_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND error_count > 0`)
+	w.siteDB.ExecWrite(`UPDATE pipeline_state SET paused = 0, pause_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND paused = 1 AND pause_reason NOT IN (?, ?)`, PauseReasonOwnerAnswers, PauseReasonApproval)
+
+	// Auto-resume if paused for answers but all questions are already answered.
+	var paused bool
+	var reason string
+	row := w.siteDB.DB.QueryRow("SELECT paused, COALESCE(pause_reason,'') FROM pipeline_state WHERE id = 1")
+	if row.Scan(&paused, &reason) == nil && paused && reason == PauseReasonOwnerAnswers {
+		var pending int
+		if w.siteDB.DB.QueryRow("SELECT COUNT(*) FROM questions WHERE status = 'pending'").Scan(&pending) == nil && pending == 0 {
+			w.logger.Info("auto-recovery: all questions answered, resuming")
+			rows, err := w.siteDB.Query(
+				`SELECT q.question, a.answer FROM questions q JOIN answers a ON a.question_id = q.id WHERE q.status = 'answered' ORDER BY q.id`)
+			if err == nil {
+				var parts []string
+				for rows.Next() {
+					var q, a string
+					if rows.Scan(&q, &a) == nil {
+						parts = append(parts, q+": "+a)
+					}
+				}
+				rows.Close()
+				w.mu.Lock()
+				w.wakeContext = map[string]interface{}{"reason": "question_answered", "answer": strings.Join(parts, "\n")}
+				w.mu.Unlock()
+				ResumePipeline(w.siteDB)
+			}
+		}
+	}
+
+	return true
 }
 
 // runBuildPipeline executes the deterministic build pipeline, resuming from
@@ -190,11 +209,13 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 	stage := state.Stage
 
 	stageRetries := 0
+	var stageStart time.Time
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
+		stageStart = time.Now()
 		w.logger.Info("executing pipeline stage", "stage", stage)
 		w.publishBrainMessage(fmt.Sprintf("Starting stage: **%s**", stage))
 
@@ -227,18 +248,14 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 			}
 
 			switch stage {
-			case StageAnalyze:
-				nextStage, stageErr = w.runAnalyze(stageCtx)
-			case StageBlueprint:
-				nextStage, stageErr = w.runBlueprint(stageCtx)
+			case StagePlan:
+				nextStage, stageErr = w.runPlan(stageCtx)
 			case StageBuild:
 				nextStage, stageErr = w.runBuild(stageCtx)
-			case StageValidate:
-				nextStage, stageErr = w.runValidate(stageCtx)
 			case StageComplete:
 				nextStage, stageErr = w.runComplete(stageCtx)
-			case StageUpdateBlueprint:
-				nextStage, stageErr = w.runUpdateBlueprint(stageCtx)
+			case StageUpdatePlan:
+				nextStage, stageErr = w.runUpdatePlan(stageCtx)
 			default:
 				stageErr = fmt.Errorf("unknown pipeline stage: %s", stage)
 			}
@@ -287,6 +304,7 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 				backoff = 30 * time.Second
 			}
 			w.logger.Info("retrying stage after backoff", "stage", stage, "backoff", backoff)
+			w.publishBrainMessage(fmt.Sprintf("Stage %s failed (attempt %d/%d): %v — retrying...", stage, stageRetries, maxStageRetries, stageErr))
 			select {
 			case <-ctx.Done():
 				return
@@ -302,6 +320,16 @@ func (w *PipelineWorker) runBuildPipeline(ctx context.Context) {
 			// Stages are idempotent, so re-executing is safe.
 			continue
 		}
+
+		// Publish stage change event with timing data.
+		if w.deps.Bus != nil {
+			w.deps.Bus.Publish(events.NewEvent(events.EventBrainStageChange, w.siteID, map[string]interface{}{
+				"prev_stage":  string(stage),
+				"stage":       string(nextStage),
+				"duration_ms": time.Since(stageStart).Milliseconds(),
+			}))
+		}
+
 		stage = nextStage
 		stageRetries = 0
 	}
@@ -402,7 +430,7 @@ func (w *PipelineWorker) handleCommand(ctx context.Context, cmd BrainCommand) {
 			desc = d
 		}
 		w.siteDB.ExecWrite("UPDATE pipeline_state SET update_description = ? WHERE id = 1", desc)
-		if err := AdvanceStage(w.siteDB, StageUpdateBlueprint); err != nil {
+		if err := AdvanceStage(w.siteDB, StageUpdatePlan); err != nil {
 			w.logger.Error("failed to set update stage", "error", err)
 		}
 
@@ -454,6 +482,53 @@ func (w *PipelineWorker) monitoringInterval() time.Duration {
 
 // --- LLM execution helpers ---
 
+// callWithRetry makes a single LLM call with retry/backoff for transient errors.
+func (w *PipelineWorker) callWithRetry(ctx context.Context, lp llm.Provider, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	var resp *llm.CompletionResponse
+	var err error
+	for attempt := 0; attempt < maxLLMRetries; attempt++ {
+		llmCtx, cancel := context.WithTimeout(ctx, llmTimeout)
+		resp, err = lp.Complete(llmCtx, req)
+		cancel()
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		errMsg := err.Error()
+
+		// Connection errors (DNS, refused, TLS) won't succeed on retry.
+		if strings.Contains(errMsg, "send request:") && !strings.Contains(errMsg, "API error") &&
+			!strings.Contains(errMsg, "timeout") && !strings.Contains(errMsg, "context deadline exceeded") {
+			return nil, err
+		}
+
+		isRateLimit := strings.Contains(errMsg, "API error 429") || strings.Contains(errMsg, "API error 529") || strings.Contains(errMsg, "overloaded")
+		isTimeout := strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "context deadline exceeded")
+
+		var backoff time.Duration
+		switch {
+		case isRateLimit:
+			backoff = time.Duration(15*(attempt+1)) * time.Second
+			w.logger.Warn("LLM rate limited", "attempt", attempt, "backoff", backoff)
+		case isTimeout:
+			backoff = time.Duration(5*(attempt+1)) * time.Second
+			w.logger.Warn("LLM timeout", "attempt", attempt, "backoff", backoff)
+		default:
+			backoff = time.Duration(2*(attempt+1)) * time.Second
+			w.logger.Warn("LLM call failed", "attempt", attempt, "error", err, "backoff", backoff)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return nil, err
+}
+
 // runToolLoop executes an LLM tool-call loop: call LLM, execute tool calls,
 // repeat until no more tool calls or maxIter reached.
 func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider, modelID, systemPrompt string, messages []llm.Message, toolDefs []llm.ToolDef, maxIter, maxTokens int) (lastContent, lastModel string, totalTokens, totalToolCalls int, err error) {
@@ -462,65 +537,17 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 	llmLogger := llm.NewDBLLMLogger(w.siteDB.Writer())
 	loggedProvider := llm.NewLoggedProvider(provider, llmLogger, "brain", "brain", &iteration)
 
-	seenUpTo := len(messages)
 	for i := 0; i < maxIter; i++ {
 		iteration = i
 
-		// Compress tool results the LLM has already seen to save context tokens.
-		// Exempt schema, endpoint, and CSS results — they contain column names,
-		// paths, and class/variable names needed for correct page code later.
-		if i > 0 {
-			for j := 0; j < seenUpTo; j++ {
-				if messages[j].Role == llm.RoleTool && len(messages[j].Content) > 500 {
-					if len(messages[j].Content) <= 2000 && (strings.Contains(messages[j].Content, "schema_def") ||
-						strings.Contains(messages[j].Content, "endpoint") ||
-						strings.Contains(messages[j].Content, ".css") ||
-						strings.Contains(messages[j].Content, "css_classes")) {
-						continue
-					}
-					messages[j].Content = truncate(messages[j].Content, 300)
-				}
-			}
-		}
-
-		var resp *llm.CompletionResponse
-		var callErr error
-		for attempt := 0; attempt < maxLLMRetries; attempt++ {
-			llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
-			resp, callErr = loggedProvider.Complete(llmCtx, llm.CompletionRequest{
-				Model:       modelID,
-				System:      systemPrompt,
-				Messages:    messages,
-				Tools:       toolDefs,
-				MaxTokens:   maxTokens,
-				CacheSystem: true,
-			})
-			llmCancel()
-			if callErr == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				break
-			}
-
-			errMsg := callErr.Error()
-			isRateLimit := strings.Contains(errMsg, "API error 429") ||
-				strings.Contains(errMsg, "API error 529") ||
-				strings.Contains(errMsg, "overloaded")
-
-			var backoff time.Duration
-			if isRateLimit {
-				backoff = time.Duration(15*(attempt+1)) * time.Second
-				w.logger.Warn("LLM rate limited, backing off", "iteration", i, "attempt", attempt, "backoff", backoff)
-			} else {
-				backoff = time.Duration(2*(attempt+1)) * time.Second
-				w.logger.Warn("LLM call failed, retrying", "iteration", i, "attempt", attempt, "error", callErr, "backoff", backoff)
-			}
-			select {
-			case <-ctx.Done():
-			case <-time.After(backoff):
-			}
-		}
+		resp, callErr := w.callWithRetry(ctx, loggedProvider, llm.CompletionRequest{
+			Model:       modelID,
+			System:      systemPrompt,
+			Messages:    messages,
+			Tools:       toolDefs,
+			MaxTokens:   maxTokens,
+			CacheSystem: true,
+		})
 		if callErr != nil {
 			return "", "", totalTokens, totalToolCalls, fmt.Errorf("LLM call failed at iteration %d: %w", i, callErr)
 		}
@@ -538,7 +565,9 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 		if resp.Content != "" || len(resp.ToolCalls) > 0 {
 			w.saveChatMessage(assistantMsg)
 		}
-		if resp.Content != "" && w.deps.Bus != nil {
+		// Only publish assistant text to chat when it's a final response (no tool calls).
+		// When tool calls follow, the text is just LLM "thinking aloud" — not useful for the user.
+		if resp.Content != "" && len(resp.ToolCalls) == 0 && w.deps.Bus != nil {
 			w.deps.Bus.Publish(events.NewEvent(events.EventBrainMessage, w.siteID, map[string]interface{}{
 				"session_id": "brain",
 				"role":       "assistant",
@@ -551,13 +580,14 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 				continuationCount++
 				if continuationCount >= maxContinuations {
 					w.logger.Warn("LLM hit max_tokens too many times, stopping", "iteration", i, "continuations", continuationCount)
+					w.publishBrainMessage("Build hit output limit — some items may be incomplete. Use chat to request fixes.")
 					break
 				}
 				w.logger.Warn("LLM hit max_tokens, requesting continuation", "iteration", i, "continuation", continuationCount)
 				messages = append(messages, assistantMsg)
 				messages = append(messages, llm.Message{
 					Role:    llm.RoleUser,
-					Content: "Your response was cut off. Call the tool now — output ONLY the tool call, no explanation.",
+					Content: "Your response was cut off. Continue building from where you left off — call your next tool.",
 				})
 				continue
 			}
@@ -567,74 +597,10 @@ func (w *PipelineWorker) runToolLoop(ctx context.Context, provider llm.Provider,
 		messages = append(messages, assistantMsg)
 		messages = w.executeToolCalls(ctx, resp.ToolCalls, messages)
 		totalToolCalls += len(resp.ToolCalls)
-		seenUpTo = len(messages)
 	}
 	return
 }
 
-// callLLM makes a single LLM call without tools (used by ANALYZE/BLUEPRINT stages).
-func (w *PipelineWorker) callLLM(ctx context.Context, provider llm.Provider, modelID, systemPrompt, userMessage string, maxTokens int) (string, int, error) {
-	llmLogger := llm.NewDBLLMLogger(w.siteDB.Writer())
-	iteration := 0
-	loggedProvider := llm.NewLoggedProvider(provider, llmLogger, "brain", "brain", &iteration)
-
-	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
-
-	var resp *llm.CompletionResponse
-	var err error
-	for attempt := 0; attempt < maxLLMRetries; attempt++ {
-		llmCtx, llmCancel := context.WithTimeout(ctx, llmTimeout)
-		resp, err = loggedProvider.Complete(llmCtx, llm.CompletionRequest{
-			Model:       modelID,
-			System:      systemPrompt,
-			Messages:    messages,
-			MaxTokens:   maxTokens,
-			CacheSystem: true,
-		})
-		llmCancel()
-		if err == nil {
-			break
-		}
-		if ctx.Err() != nil {
-			break
-		}
-		errMsg := err.Error()
-		isRateLimit := strings.Contains(errMsg, "API error 429") ||
-			strings.Contains(errMsg, "API error 529") ||
-			strings.Contains(errMsg, "overloaded")
-		var backoff time.Duration
-		if isRateLimit {
-			backoff = time.Duration(15*(attempt+1)) * time.Second
-			w.logger.Warn("callLLM rate limited, backing off", "attempt", attempt, "backoff", backoff)
-		} else {
-			backoff = time.Duration(2*(attempt+1)) * time.Second
-			w.logger.Warn("callLLM failed, retrying", "attempt", attempt, "error", err, "backoff", backoff)
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(backoff):
-		}
-	}
-	if err != nil {
-		return "", 0, err
-	}
-
-	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
-
-	// Save assistant response.
-	if resp.Content != "" {
-		w.saveChatMessage(llm.Message{Role: llm.RoleAssistant, Content: resp.Content})
-		if w.deps.Bus != nil {
-			w.deps.Bus.Publish(events.NewEvent(events.EventBrainMessage, w.siteID, map[string]interface{}{
-				"session_id": "brain",
-				"role":       "assistant",
-				"content":    resp.Content,
-			}))
-		}
-	}
-
-	return resp.Content, tokens, nil
-}
 
 // executeToolCalls runs tool calls and appends results to messages.
 func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.ToolCall, messages []llm.Message) []llm.Message {
@@ -738,45 +704,35 @@ func (w *PipelineWorker) executeToolCalls(ctx context.Context, toolCalls []llm.T
 	return messages
 }
 
-// toolProgressMessage returns a human-readable message for successful write
-// operations (file saves, layout saves, page saves, etc.). Returns "" for
-// read-only operations or tools that don't need progress reporting.
+// toolProgressMessage returns a human-readable message for successful write operations.
 func toolProgressMessage(toolName string, args map[string]interface{}) string {
 	action, _ := args["action"].(string)
-	switch toolName {
-	case "manage_files":
-		filename, _ := args["filename"].(string)
-		if filename == "" {
-			return ""
-		}
-		switch action {
-		case "save":
+	switch {
+	case toolName == "manage_files" && action == "save":
+		if f, _ := args["filename"].(string); f != "" {
 			scope, _ := args["scope"].(string)
 			if scope == "" {
 				scope = "page"
 			}
-			return fmt.Sprintf("Created **%s** (%s)", filename, scope)
-		case "delete":
-			return fmt.Sprintf("Deleted **%s**", filename)
+			return fmt.Sprintf("Created **%s** (%s)", f, scope)
 		}
-	case "manage_layout":
+	case toolName == "manage_files" && action == "delete":
+		if f, _ := args["filename"].(string); f != "" {
+			return fmt.Sprintf("Deleted **%s**", f)
+		}
+	case toolName == "manage_layout" && action == "save":
 		name, _ := args["name"].(string)
 		if name == "" {
 			name = "default"
 		}
-		if action == "save" {
-			return fmt.Sprintf("Saved layout: **%s**", name)
+		return fmt.Sprintf("Saved layout: **%s**", name)
+	case toolName == "manage_schema" && action == "create":
+		if t, _ := args["table_name"].(string); t != "" {
+			return fmt.Sprintf("Created table: **%s**", t)
 		}
-	// manage_pages excluded — BUILD_PAGES stage has its own per-page messages.
-	case "manage_schema":
-		table, _ := args["table_name"].(string)
-		if action == "create" && table != "" {
-			return fmt.Sprintf("Created table: **%s**", table)
-		}
-	case "manage_endpoints":
-		path, _ := args["path"].(string)
-		if strings.HasPrefix(action, "create_") && path != "" {
-			return fmt.Sprintf("Created endpoint: **/api/%s** (%s)", path, action)
+	case toolName == "manage_endpoints" && strings.HasPrefix(action, "create_"):
+		if p, _ := args["path"].(string); p != "" {
+			return fmt.Sprintf("Created endpoint: **/api/%s** (%s)", p, action)
 		}
 	}
 	return ""
@@ -791,9 +747,10 @@ func (w *PipelineWorker) executeScheduledTask(ctx context.Context, prompt string
 		return
 	}
 
-	systemPrompt := buildScheduledTaskPrompt(w.deps.DB, w.siteDB.DB, w.siteID)
+	toolGuide := w.deps.ToolRegistry.BuildGuide(fullWriteToolSet)
+	systemPrompt := buildScheduledTaskPrompt(w.deps.DB, w.siteDB.DB, w.siteID, toolGuide)
 	messages := []llm.Message{{Role: llm.RoleUser, Content: prompt}}
-	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(scheduledTaskTools))
+	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(fullWriteToolSet)
 	start := time.Now()
 
 	lastContent, lastModel, totalTokens, _, iterErr := w.runToolLoop(ctx, provider, modelID, systemPrompt, messages, toolDefs, 20, 2048)
@@ -827,10 +784,10 @@ func (w *PipelineWorker) handleChatWake(ctx context.Context, userMessage string)
 	}
 
 	site, _ := models.GetSiteByID(w.deps.DB, w.siteID)
-	bp, _ := w.loadBlueprint()
-	prompt := buildChatWakePrompt(site, w.siteDB.DB, userMessage, bp)
+	plan, _ := w.loadPlan()
+	prompt := buildChatWakePrompt(site, w.siteDB.DB, userMessage, plan, w.ownerName())
 	messages := []llm.Message{{Role: llm.RoleUser, Content: userMessage}}
-	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(toToolSet(chatWakeTools))
+	toolDefs := w.deps.ToolRegistry.ToLLMToolsFiltered(chatWakeToolSet)
 
 	w.maxToolResultOverride = 8000
 	_, lastModel, totalTokens, _, iterErr := w.runToolLoop(ctx, provider, modelID, prompt, messages, toolDefs, 10, 8192)
@@ -918,7 +875,7 @@ func (w *PipelineWorker) saveChatMessage(msg llm.Message) {
 func (w *PipelineWorker) saveChatMessageOnce(msg llm.Message) {
 	if msg.Role == llm.RoleUser {
 		var exists int
-		w.siteDB.Writer().QueryRow(
+		w.siteDB.DB.QueryRow(
 			"SELECT COUNT(*) FROM chat_messages WHERE session_id = 'brain' AND role = 'user' AND content = ? AND created_at > datetime('now', '-30 minutes')",
 			msg.Content,
 		).Scan(&exists)
@@ -997,6 +954,12 @@ func isPermanentError(err error) bool {
 			return true
 		}
 	}
+	// Connection errors (DNS, refused, TLS) — endpoint unreachable, retrying won't help.
+	// But timeouts are transient and should be retried.
+	if strings.Contains(msg, "send request:") && !strings.Contains(msg, "api error") &&
+		!strings.Contains(msg, "timeout") && !strings.Contains(msg, "context deadline exceeded") {
+		return true
+	}
 	return false
 }
 
@@ -1038,7 +1001,7 @@ func truncate(s string, maxLen int) string {
 }
 
 func (w *PipelineWorker) truncateToolResult(toolName string, result string) string {
-	maxSize := 4000
+	maxSize := 6000
 	if tool, err := w.deps.ToolRegistry.Get(toolName); err == nil {
 		if sizer, ok := tool.(tools.ResultSizer); ok {
 			maxSize = sizer.MaxResultSize()

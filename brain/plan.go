@@ -10,83 +10,94 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/markdr-hue/IATAN/db"
 )
 
-// --- Analysis: output of the ANALYZE stage ---
+// --- Plan: unified output of the PLAN stage (replaces Analysis + Blueprint) ---
 
-// Analysis captures what the user wants, mapped to platform capabilities.
-type Analysis struct {
-	AppType       string         `json:"app_type"`                 // "chat-app", "blog", "portfolio", etc.
-	CoreBehaviors []string       `json:"core_behaviors"`           // ["real-time messaging", "channel rooms"]
-	RequiresAuth  bool           `json:"requires_auth"`            // does this need login/register?
-	AuthStrategy  string         `json:"auth_strategy"`            // "jwt", "localStorage-only", "none"
-	RealTimeNeeds []RealTimeSpec `json:"realtime_needs,omitempty"` // WebSocket/SSE specs
-	DataNeeds     []DataSpec     `json:"data_needs,omitempty"`     // tables needed and why
-	Exclusions     []string         `json:"exclusions,omitempty"`      // ["no auth endpoints", "no OAuth"]
-	DesignMood     string           `json:"design_mood"`               // "dark-retro-terminal", "clean-modern"
-	Architecture   string           `json:"architecture,omitempty"`    // "spa", "multi-page", or "single-page"
-	WebhookNeeds   []WebhookNeed   `json:"webhook_needs,omitempty"`   // planned webhooks
-	ScheduledTasks []TaskNeed      `json:"scheduled_tasks,omitempty"` // planned scheduled tasks
-	Questions      []PlanQuestion  `json:"questions,omitempty"`
+// Plan is the single build specification produced by the PLAN stage.
+type Plan struct {
+	AppType      string         `json:"app_type"`
+	Architecture string         `json:"architecture,omitempty"`
+	AuthStrategy string         `json:"auth_strategy,omitempty"`
+	DesignSystem *DesignSystem  `json:"design_system,omitempty"`
+	Layout       *LayoutSpec    `json:"layout,omitempty"`
+	Tables       []TableSpec    `json:"tables,omitempty"`
+	Endpoints    []EndpointSpec `json:"endpoints,omitempty"`
+	Pages        []PageSpec     `json:"pages"`
+	Exclusions   []string       `json:"exclusions,omitempty"`
+	Webhooks        []WebhookSpec  `json:"webhooks,omitempty"`
+	ScheduledTasks  []TaskSpec     `json:"scheduled_tasks,omitempty"`
+	Questions       []PlanQuestion `json:"questions,omitempty"`
 }
 
-type WebhookNeed struct {
-	Name      string   `json:"name"`                 // "stripe-events"
-	Direction string   `json:"direction"`             // "incoming" or "outgoing"
-	Purpose   string   `json:"purpose"`               // "receive Stripe payment notifications"
-	URL       string   `json:"url,omitempty"`          // outgoing only
-	Events    []string `json:"event_types,omitempty"`  // ["payment.completed", "data.insert"]
+// DesignSystem defines concrete design tokens that drive CSS generation.
+type DesignSystem struct {
+	Colors     map[string]string `json:"colors"`               // primary, secondary, bg, surface, text, muted, accent, error, success
+	Typography *TypographySpec   `json:"typography,omitempty"`
+	Spacing    string            `json:"spacing,omitempty"`     // compact | comfortable | spacious
+	Radius     string            `json:"radius,omitempty"`      // none | sm | md | lg
+	DarkMode   bool              `json:"dark_mode,omitempty"`
+	Components map[string]string `json:"components,omitempty"`  // Reusable HTML structures (e.g., {"card": "<div class='card'>...</div>"})
 }
 
-type TaskNeed struct {
-	Name           string `json:"name"`                        // "daily-digest"
-	Purpose        string `json:"purpose"`                     // "send daily summary email to owner"
-	CronExpression string `json:"cron_expression,omitempty"`   // "0 8 * * *"
-	IntervalSec    int    `json:"interval_seconds,omitempty"`  // alternative: every N seconds
+// TypographySpec defines font choices for the design system.
+type TypographySpec struct {
+	HeadingFont string `json:"heading_font,omitempty"` // e.g. "Inter", "Playfair Display"
+	BodyFont    string `json:"body_font,omitempty"`
+	Scale       string `json:"scale,omitempty"` // tight | normal | loose
 }
 
-type RealTimeSpec struct {
-	Purpose    string `json:"purpose"`                // "chat messages in channels"
-	Type       string `json:"type"`                   // "websocket" or "sse"
-	Path       string `json:"path"`                   // "chat"
-	RoomScoped bool   `json:"room_scoped,omitempty"`  // true = use room_column
-	RoomColumn string `json:"room_column,omitempty"`  // "channel_id"
-	WriteTable string `json:"write_table,omitempty"`  // "messages"
+// LayoutSpec defines the site's layout topology.
+type LayoutSpec struct {
+	Style    string   `json:"style"`              // topnav | sidebar | minimal
+	NavItems []string `json:"nav_items,omitempty"`
 }
 
-type DataSpec struct {
-	TableName  string      `json:"table_name"`
-	Purpose    string      `json:"purpose"` // "store chat messages with channel association"
-	Columns    []ColumnDef `json:"columns"`
-	NeedsAPI   bool        `json:"needs_api"`
-	NeedsAuth  bool        `json:"needs_auth"`
-	PublicRead bool        `json:"public_read,omitempty"`
-	SeedData   bool        `json:"seed_data,omitempty"`
+type PageSpec struct {
+	Path      string        `json:"path"`
+	Title     string        `json:"title"`
+	Purpose   string        `json:"purpose"`
+	Sections  []SectionSpec `json:"sections,omitempty"`
+	Endpoints []string      `json:"endpoints,omitempty"` // which endpoints this page uses
+	Auth      bool          `json:"auth,omitempty"`       // page requires authentication
+	Notes     string        `json:"notes,omitempty"`      // technical build notes
 }
 
-// --- Blueprint: output of the BLUEPRINT stage ---
+// SectionSpec describes a section within a page.
+type SectionSpec struct {
+	Name      string   `json:"name"`
+	Purpose   string   `json:"purpose,omitempty"`
+	Endpoints []string `json:"endpoints,omitempty"`
+	DataFlow  string   `json:"data_flow,omitempty"` // e.g. "fetch /api/posts on load, render as card grid"
+}
 
-// Blueprint is the complete build specification that drives the BUILD stage.
-type Blueprint struct {
-	AppType      string          `json:"app_type"`
-	AuthStrategy string          `json:"auth_strategy"`
-	Architecture string          `json:"architecture"` // "spa" or "multi-page"
-	ColorScheme  ColorScheme     `json:"color_scheme"`
-	Typography   Typography      `json:"typography"`
-	DesignNotes  string          `json:"design_notes"`
-	Endpoints    []EndpointSpec  `json:"endpoints,omitempty"`
-	DataTables   []TableSpec     `json:"data_tables,omitempty"`
-	Pages          []PageBlueprint `json:"pages"`
-	NavItems       []string        `json:"nav_items"`
-	Exclusions     []string        `json:"exclusions,omitempty"`
-	Webhooks       []WebhookSpec   `json:"webhooks,omitempty"`
-	ScheduledTasks []TaskSpec2     `json:"scheduled_tasks,omitempty"`
-	Questions      []PlanQuestion  `json:"questions,omitempty"`
+// UnmarshalJSON accepts both a plain string ("hero") and an object ({"name":"hero","purpose":"..."}).
+func (ss *SectionSpec) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		ss.Name = s
+		return nil
+	}
+	type alias SectionSpec
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*ss = SectionSpec(a)
+	return nil
+}
+
+// SectionNames returns section names as a string slice (for backward-compat formatting).
+func (p *PageSpec) SectionNames() []string {
+	names := make([]string, len(p.Sections))
+	for i, s := range p.Sections {
+		names[i] = s.Name
+	}
+	return names
 }
 
 type WebhookSpec struct {
@@ -96,12 +107,12 @@ type WebhookSpec struct {
 	Events    []string `json:"event_types,omitempty"` // events to subscribe to
 }
 
-type TaskSpec2 struct {
-	Name           string `json:"name"`
-	Description    string `json:"description"`
-	Prompt         string `json:"prompt"`                      // what the brain should do
-	CronExpression string `json:"cron_expression,omitempty"`
-	IntervalSec    int    `json:"interval_seconds,omitempty"`
+type TaskSpec struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Prompt      string `json:"prompt"`                    // what the brain should do
+	Cron        string `json:"cron,omitempty"`             // "0 8 * * *"
+	IntervalSec int    `json:"interval_seconds,omitempty"` // alternative: every N seconds
 }
 
 type EndpointSpec struct {
@@ -114,60 +125,20 @@ type EndpointSpec struct {
 	WriteTable   string   `json:"write_to_table,omitempty"` // WebSocket: table to write messages to
 	EventTypes   []string `json:"event_types,omitempty"`    // Stream/WebSocket: event types
 	// Auth-specific
-	UsernameCol string `json:"username_column,omitempty"`
-	PasswordCol string `json:"password_column,omitempty"`
+	UsernameCol    string   `json:"username_column,omitempty"`
+	PasswordCol    string   `json:"password_column,omitempty"`
+	DefaultRole    string   `json:"default_role,omitempty"`
+	RoleColumn     string   `json:"role_column,omitempty"`
+	JWTExpiryHours int      `json:"jwt_expiry_hours,omitempty"`
+	PublicColumns  []string `json:"public_columns,omitempty"`
 }
 
 type TableSpec struct {
-	Name     string      `json:"name"`
-	Purpose  string      `json:"purpose"`
-	Columns  []ColumnDef `json:"columns"`
-	SeedData bool        `json:"seed_data,omitempty"`
-}
-
-type PageBlueprint struct {
-	Path           string   `json:"path"`
-	Title          string   `json:"title"`
-	Purpose        string   `json:"purpose"`
-	Sections       []string `json:"sections"`
-	LinksTo        []string `json:"links_to,omitempty"`
-	Layout         string   `json:"layout,omitempty"`
-	ComponentHints []string `json:"component_hints,omitempty"`
-	UsesEndpoints  []string `json:"uses_endpoints,omitempty"` // ["GET /api/messages", "WS /api/chat/ws"]
-	UsesAuth       bool     `json:"uses_auth,omitempty"`
-	TechNotes      string   `json:"tech_notes"`               // technical build instructions for this page
-	DataTables     []string `json:"data_tables,omitempty"`
-}
-
-// BlueprintPatch describes incremental changes for an UPDATE_BLUEPRINT flow.
-type BlueprintPatch struct {
-	AddPages       []PageBlueprint `json:"add_pages,omitempty"`
-	ModifyPages    []PageBlueprint `json:"modify_pages,omitempty"`
-	RemovePages    []string        `json:"remove_pages,omitempty"`
-	AddEndpoints   []EndpointSpec  `json:"add_endpoints,omitempty"`
-	AddTables      []TableSpec     `json:"add_tables,omitempty"`
-	AddWebhooks    []WebhookSpec   `json:"add_webhooks,omitempty"`
-	AddTasks       []TaskSpec2     `json:"add_scheduled_tasks,omitempty"`
-	UpdateCSS      bool            `json:"update_css"`
-	UpdateNav      bool            `json:"update_nav"`
-}
-
-// --- Shared types (kept from v1) ---
-
-type ColorScheme struct {
-	Primary    string `json:"primary"`
-	Secondary  string `json:"secondary"`
-	Accent     string `json:"accent"`
-	Background string `json:"background"`
-	Surface    string `json:"surface"`
-	Text       string `json:"text"`
-	TextMuted  string `json:"text_muted"`
-}
-
-type Typography struct {
-	HeadingFont string `json:"heading_font"`
-	BodyFont    string `json:"body_font"`
-	Scale       string `json:"scale"` // e.g. "1.25" (major third)
+	Name              string      `json:"name"`
+	Purpose           string      `json:"purpose"`
+	Columns           []ColumnDef `json:"columns"`
+	SeedData          interface{} `json:"seed_data,omitempty"`          // bool or []map — LLM may output either
+	SearchableColumns []string    `json:"searchable_columns,omitempty"` // FTS5-indexed columns
 }
 
 type ColumnDef struct {
@@ -177,26 +148,150 @@ type ColumnDef struct {
 	Required bool   `json:"required,omitempty"`
 }
 
+// PlanPatch describes incremental changes for an UPDATE_PLAN flow.
+type PlanPatch struct {
+	AddPages            []PageSpec     `json:"add_pages,omitempty"`
+	ModifyPages         []PageSpec     `json:"modify_pages,omitempty"`
+	RemovePages         []string       `json:"remove_pages,omitempty"`
+	AddEndpoints        []EndpointSpec `json:"add_endpoints,omitempty"`
+	AddTables           []TableSpec    `json:"add_tables,omitempty"`
+	AddWebhooks         []WebhookSpec  `json:"add_webhooks,omitempty"`
+	AddTasks            []TaskSpec     `json:"add_scheduled_tasks,omitempty"`
+	UpdateCSS           bool           `json:"update_css"`
+	UpdateNav           bool           `json:"update_nav"`
+	UpdateAuthStrategy  string         `json:"update_auth_strategy,omitempty"`
+	UpdateDesignSystem  *DesignSystem  `json:"update_design_system,omitempty"`
+	UpdateLayout        *LayoutSpec    `json:"update_layout,omitempty"`
+}
+
+// ApplyPatch applies an incremental PlanPatch to this Plan. It filters
+// endpoints that conflict with exclusions, then mutates pages, endpoints,
+// tables, webhooks, tasks, design system, layout, and auth strategy in place.
+func (p *Plan) ApplyPatch(patch *PlanPatch) {
+	// Filter endpoints against exclusions.
+	if len(p.Exclusions) > 0 {
+		exclusionSet := strings.Join(p.Exclusions, " ")
+		var filtered []EndpointSpec
+		for _, ep := range patch.AddEndpoints {
+			if ep.Action == "create_auth" && strings.Contains(exclusionSet, "no auth") {
+				continue
+			}
+			filtered = append(filtered, ep)
+		}
+		patch.AddEndpoints = filtered
+	}
+
+	// Remove pages first (before add, so re-add works).
+	for _, rm := range patch.RemovePages {
+		for i, pg := range p.Pages {
+			if pg.Path == rm {
+				p.Pages = append(p.Pages[:i], p.Pages[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// Modify pages (replace in-place).
+	for _, mod := range patch.ModifyPages {
+		for i, pg := range p.Pages {
+			if pg.Path == mod.Path {
+				p.Pages[i] = mod
+				break
+			}
+		}
+	}
+
+	// Add pages.
+	p.Pages = append(p.Pages, patch.AddPages...)
+
+	// Append other items.
+	p.Endpoints = append(p.Endpoints, patch.AddEndpoints...)
+	p.Tables = append(p.Tables, patch.AddTables...)
+	p.Webhooks = append(p.Webhooks, patch.AddWebhooks...)
+	p.ScheduledTasks = append(p.ScheduledTasks, patch.AddTasks...)
+
+	if patch.UpdateAuthStrategy != "" {
+		p.AuthStrategy = patch.UpdateAuthStrategy
+	}
+	if patch.UpdateLayout != nil {
+		p.Layout = patch.UpdateLayout
+	}
+	if patch.UpdateDesignSystem != nil {
+		if p.DesignSystem == nil {
+			p.DesignSystem = patch.UpdateDesignSystem
+		} else {
+			for k, v := range patch.UpdateDesignSystem.Colors {
+				p.DesignSystem.Colors[k] = v
+			}
+			if patch.UpdateDesignSystem.Typography != nil {
+				p.DesignSystem.Typography = patch.UpdateDesignSystem.Typography
+			}
+			if patch.UpdateDesignSystem.Spacing != "" {
+				p.DesignSystem.Spacing = patch.UpdateDesignSystem.Spacing
+			}
+			if patch.UpdateDesignSystem.Radius != "" {
+				p.DesignSystem.Radius = patch.UpdateDesignSystem.Radius
+			}
+			p.DesignSystem.DarkMode = patch.UpdateDesignSystem.DarkMode
+			if patch.UpdateDesignSystem.Components != nil {
+				if p.DesignSystem.Components == nil {
+					p.DesignSystem.Components = make(map[string]string)
+				}
+				for k, v := range patch.UpdateDesignSystem.Components {
+					p.DesignSystem.Components[k] = v
+				}
+			}
+		}
+	}
+}
+
 type PlanQuestion struct {
 	Question string   `json:"question"`
+	Type     string   `json:"type"`              // "single_choice", "multiple_choice", "open"
 	Options  []string `json:"options,omitempty"`
+}
+
+// UnmarshalJSON accepts both a plain string ("question text") and
+// an object ({"question":"...","type":"...","options":[...]}) so LLM responses
+// that return questions as a string array still parse correctly.
+func (pq *PlanQuestion) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		pq.Question = s
+		pq.Type = "open"
+		return nil
+	}
+	type alias PlanQuestion
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*pq = PlanQuestion(a)
+	// Default type based on whether options are present.
+	if pq.Type == "" {
+		if len(pq.Options) > 0 {
+			pq.Type = "single_choice"
+		} else {
+			pq.Type = "open"
+		}
+	}
+	return nil
 }
 
 // --- Pipeline state ---
 
 // PipelineState is the singleton row in pipeline_state tracking build progress.
 type PipelineState struct {
-	Stage             PipelineStage
-	AnalysisJSON      string // stored in plan_json column
-	BlueprintJSON     string // stored in blueprint_json column
-	CurrentPageIndex  int
-	ErrorCount        int
-	LastError         string
-	Paused            bool
-	PauseReason       string
-	UpdateDescription string // what the owner wants changed (for UPDATE_BLUEPRINT)
-	StartedAt         time.Time
-	UpdatedAt         time.Time
+	Stage              PipelineStage
+	PlanJSON           string
+	ToolCallsCompleted int // BUILD crash-recovery checkpoint
+	ErrorCount         int
+	LastError          string
+	Paused             bool
+	PauseReason        string
+	UpdateDescription  string // what the owner wants changed (for UPDATE_PLAN)
+	StartedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // --- JSON parsing ---
@@ -239,7 +334,7 @@ func extractJSON(raw string) string {
 	return raw
 }
 
-// repairJSON fixes common LLM JSON mistakes (trailing commas, // comments).
+// repairJSON fixes common LLM JSON mistakes (trailing commas, // comments, truncation).
 func repairJSON(s string) string {
 	// Strip single-line // comments (only full-line comments to avoid mangling URLs).
 	lines := strings.Split(s, "\n")
@@ -255,35 +350,144 @@ func repairJSON(s string) string {
 	// Remove trailing commas before } or ].
 	s = trailingCommaRe.ReplaceAllString(s, "$1")
 
+	// Repair truncated JSON (from max_tokens cutoff).
+	s = repairTruncatedJSON(s)
+
 	return s
 }
 
-// ParseAnalysis parses an Analysis from raw LLM output.
-func ParseAnalysis(raw string) (*Analysis, error) {
-	raw = repairJSON(extractJSON(raw))
-	var a Analysis
-	if err := json.Unmarshal([]byte(raw), &a); err != nil {
-		return nil, fmt.Errorf("invalid analysis JSON: %w", err)
+// repairTruncatedJSON closes unclosed brackets and braces from a max_tokens cutoff.
+func repairTruncatedJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 || (s[0] != '{' && s[0] != '[') {
+		return s
 	}
-	return &a, nil
+
+	// Count open/close brackets.
+	var stack []byte
+	inString := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch c {
+		case '{', '[':
+			stack = append(stack, c)
+		case '}':
+			if len(stack) > 0 && stack[len(stack)-1] == '{' {
+				stack = stack[:len(stack)-1]
+			}
+		case ']':
+			if len(stack) > 0 && stack[len(stack)-1] == '[' {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+
+	if len(stack) == 0 {
+		return s // Already balanced.
+	}
+
+	// Truncated mid-string: find last complete value boundary.
+	if inString {
+		lastQuote := strings.LastIndex(s, `"`)
+		if lastQuote > 0 {
+			s = s[:lastQuote]
+			s = strings.TrimRight(s, " \t\n\r")
+			// Remove trailing colon (dangling key with no value).
+			if len(s) > 0 && s[len(s)-1] == ':' {
+				s = s[:len(s)-1]
+				s = strings.TrimRight(s, " \t\n\r")
+				if len(s) > 0 && s[len(s)-1] == '"' {
+					prevQuote := strings.LastIndex(s[:len(s)-1], `"`)
+					if prevQuote >= 0 {
+						s = s[:prevQuote]
+					}
+				}
+			}
+			s = strings.TrimRight(s, " \t\n\r,")
+		}
+	} else {
+		s = strings.TrimRight(s, " \t\n\r,:")
+	}
+
+	// Re-count the stack after trimming.
+	stack = stack[:0]
+	inString = false
+	escaped = false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch c {
+		case '{', '[':
+			stack = append(stack, c)
+		case '}':
+			if len(stack) > 0 && stack[len(stack)-1] == '{' {
+				stack = stack[:len(stack)-1]
+			}
+		case ']':
+			if len(stack) > 0 && stack[len(stack)-1] == '[' {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+
+	// Close remaining open brackets in reverse order.
+	for i := len(stack) - 1; i >= 0; i-- {
+		if stack[i] == '{' {
+			s += "}"
+		} else {
+			s += "]"
+		}
+	}
+
+	return s
 }
 
-// ParseBlueprint parses a Blueprint from raw LLM output.
-func ParseBlueprint(raw string) (*Blueprint, error) {
+// ParsePlan parses a Plan from raw LLM output.
+func ParsePlan(raw string) (*Plan, error) {
 	raw = repairJSON(extractJSON(raw))
-	var bp Blueprint
-	if err := json.Unmarshal([]byte(raw), &bp); err != nil {
-		return nil, fmt.Errorf("invalid blueprint JSON: %w", err)
+	var p Plan
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return nil, fmt.Errorf("invalid plan JSON: %w", err)
 	}
-	return &bp, nil
+	return &p, nil
 }
 
-// ParseBlueprintPatch parses a BlueprintPatch from raw LLM output.
-func ParseBlueprintPatch(raw string) (*BlueprintPatch, error) {
+// ParsePlanPatch parses a PlanPatch from raw LLM output.
+func ParsePlanPatch(raw string) (*PlanPatch, error) {
 	raw = repairJSON(extractJSON(raw))
-	var patch BlueprintPatch
+	var patch PlanPatch
 	if err := json.Unmarshal([]byte(raw), &patch); err != nil {
-		return nil, fmt.Errorf("invalid blueprint patch JSON: %w", err)
+		return nil, fmt.Errorf("invalid plan patch JSON: %w", err)
 	}
 	return &patch, nil
 }
@@ -299,135 +503,61 @@ func marshalToJSON(v interface{}) (string, error) {
 
 // --- Validation ---
 
-// ValidateAnalysis checks an Analysis for structural errors.
-func ValidateAnalysis(a *Analysis) []string {
-	var errs []string
-	if a.AppType == "" {
-		errs = append(errs, "app_type is required")
+// routeMatches checks if a concrete path (e.g. "/builder/new") matches
+// a parameterized route pattern (e.g. "/builder/:id").
+func routeMatches(pattern, concrete string) bool {
+	ps := strings.Split(strings.Trim(pattern, "/"), "/")
+	cs := strings.Split(strings.Trim(concrete, "/"), "/")
+	if len(ps) != len(cs) {
+		return false
 	}
-	if len(a.CoreBehaviors) == 0 {
-		errs = append(errs, "core_behaviors must have at least one entry")
-	}
-	if a.AuthStrategy == "" {
-		errs = append(errs, "auth_strategy is required (use 'none' if no auth needed)")
-	}
-	if a.DesignMood == "" {
-		errs = append(errs, "design_mood is required")
-	}
-	// Architecture is optional and free-form — no restriction on valid values.
-	// Validate real-time specs.
-	for i, rt := range a.RealTimeNeeds {
-		if rt.Type != "websocket" && rt.Type != "sse" {
-			errs = append(errs, fmt.Sprintf("realtime_needs[%d].type must be 'websocket' or 'sse'", i))
+	for i := range ps {
+		if strings.HasPrefix(ps[i], ":") {
+			continue
 		}
-		if rt.Path == "" {
-			errs = append(errs, fmt.Sprintf("realtime_needs[%d].path is required", i))
+		if ps[i] != cs[i] {
+			return false
 		}
 	}
-	// Validate data specs.
-	for i, d := range a.DataNeeds {
-		if d.TableName == "" {
-			errs = append(errs, fmt.Sprintf("data_needs[%d].table_name is required", i))
-		}
-		if len(d.Columns) == 0 {
-			errs = append(errs, fmt.Sprintf("data_needs[%d] (%s) must have at least one column", i, d.TableName))
-		}
-	}
-	return errs
+	return true
 }
 
-// ValidateBlueprint checks a Blueprint for structural errors.
-func ValidateBlueprint(bp *Blueprint) []string {
+// ValidatePlan checks a Plan for structural errors.
+func ValidatePlan(p *Plan) []string {
 	var errs []string
 
-	// Architecture is free-form — no restriction on valid values.
+	if p.AppType == "" {
+		errs = append(errs, "app_type is required")
+	}
 
-	if len(bp.Pages) < 1 {
-		errs = append(errs, "blueprint must include at least 1 page")
+	if len(p.Pages) < 1 {
+		errs = append(errs, "plan must include at least 1 page")
 	}
 
 	// Build path set for link validation.
-	paths := make(map[string]bool, len(bp.Pages))
-	for _, p := range bp.Pages {
-		if paths[p.Path] {
-			errs = append(errs, fmt.Sprintf("duplicate page path: %s", p.Path))
+	paths := make(map[string]bool, len(p.Pages))
+	for _, pg := range p.Pages {
+		if paths[pg.Path] {
+			errs = append(errs, fmt.Sprintf("duplicate page path: %s", pg.Path))
 		}
-		paths[p.Path] = true
+		paths[pg.Path] = true
 	}
 
 	if !paths["/"] {
-		errs = append(errs, "blueprint must include a homepage at path /")
+		errs = append(errs, "plan must include a homepage at path /")
 	}
 
-	// Auto-add listing pages for parameterised routes.
-	for _, p := range bp.Pages {
-		if !strings.Contains(p.Path, ":") {
-			continue
-		}
-		parts := strings.Split(p.Path, "/")
-		var baseParts []string
-		for _, part := range parts {
-			if strings.HasPrefix(part, ":") {
-				break
+	// Validate design system if present.
+	if p.DesignSystem != nil {
+		if len(p.DesignSystem.Colors) == 0 {
+			errs = append(errs, "design_system.colors is required when design_system is present")
+		} else {
+			if p.DesignSystem.Colors["primary"] == "" {
+				errs = append(errs, "design_system.colors must include 'primary'")
 			}
-			baseParts = append(baseParts, part)
-		}
-		basePath := strings.Join(baseParts, "/")
-		if basePath == "" {
-			basePath = "/"
-		}
-		if !paths[basePath] && basePath != "/" {
-			listingPage := PageBlueprint{
-				Path:     basePath,
-				Title:    strings.TrimPrefix(basePath, "/"),
-				Purpose:  fmt.Sprintf("Lists available items and navigates to %s with the selected ID.", p.Path),
-				Sections: []string{"listing"},
-				LinksTo:  []string{p.Path},
+			if p.DesignSystem.Colors["bg"] == "" {
+				errs = append(errs, "design_system.colors must include 'bg'")
 			}
-			listingPage.DataTables = append(listingPage.DataTables, p.DataTables...)
-			bp.Pages = append(bp.Pages, listingPage)
-			paths[basePath] = true
-			for i, nav := range bp.NavItems {
-				if nav == p.Path {
-					bp.NavItems[i] = basePath
-				}
-			}
-		}
-	}
-
-	// Verify all links_to targets exist.
-	for _, p := range bp.Pages {
-		for _, link := range p.LinksTo {
-			if paths[link] {
-				continue
-			}
-			found := false
-			for knownPath := range paths {
-				if strings.HasPrefix(knownPath, link+"/:") {
-					found = true
-					break
-				}
-			}
-			if !found {
-				errs = append(errs, fmt.Sprintf("page %s links_to %s which is not in the blueprint", p.Path, link))
-			}
-		}
-	}
-
-	// Verify nav_items.
-	for _, nav := range bp.NavItems {
-		if paths[nav] {
-			continue
-		}
-		found := false
-		for knownPath := range paths {
-			if strings.HasPrefix(knownPath, nav+"/:") {
-				found = true
-				break
-			}
-		}
-		if !found {
-			errs = append(errs, fmt.Sprintf("nav_items references %s which is not in the blueprint", nav))
 		}
 	}
 
@@ -436,7 +566,7 @@ func ValidateBlueprint(bp *Blueprint) []string {
 		"create_api": true, "create_auth": true, "create_websocket": true,
 		"create_stream": true, "create_upload": true,
 	}
-	for i, ep := range bp.Endpoints {
+	for i, ep := range p.Endpoints {
 		if !validActions[ep.Action] {
 			errs = append(errs, fmt.Sprintf("endpoints[%d].action %q is not valid", i, ep.Action))
 		}
@@ -445,25 +575,10 @@ func ValidateBlueprint(bp *Blueprint) []string {
 		}
 	}
 
-	// Color scheme validation.
-	if bp.ColorScheme.Primary == "" || bp.ColorScheme.Background == "" || bp.ColorScheme.Text == "" {
-		errs = append(errs, "color_scheme must include at least primary, background, and text")
-	}
-
-	// Typography validation.
-	if bp.Typography.BodyFont == "" {
-		errs = append(errs, "typography must include at least body_font")
-	}
-	if bp.Typography.Scale != "" {
-		if s, err := strconv.ParseFloat(bp.Typography.Scale, 64); err != nil || s < 1.0 || s > 2.0 {
-			errs = append(errs, fmt.Sprintf("typography scale must be between 1.0 and 2.0, got %q", bp.Typography.Scale))
-		}
-	}
-
 	// Data table validation.
-	for i, t := range bp.DataTables {
+	for i, t := range p.Tables {
 		if t.Name == "" {
-			errs = append(errs, fmt.Sprintf("data_tables[%d].name is required", i))
+			errs = append(errs, fmt.Sprintf("tables[%d].name is required", i))
 			continue
 		}
 		colNames := make(map[string]bool, len(t.Columns))
@@ -490,21 +605,20 @@ func ValidateBlueprint(bp *Blueprint) []string {
 // LoadPipelineState loads the singleton pipeline_state row.
 func LoadPipelineState(d *sql.DB) (*PipelineState, error) {
 	var s PipelineState
-	var analysisJSON, blueprintJSON, lastError, pauseReason, updateDesc sql.NullString
+	var planJSON, lastError, pauseReason, updateDesc sql.NullString
 	var startedAt, updatedAt sql.NullString
 
-	err := d.QueryRow(`SELECT stage, plan_json, blueprint_json, current_page_index, error_count,
+	err := d.QueryRow(`SELECT stage, plan_json, tool_calls_completed, error_count,
 		last_error, paused, pause_reason, COALESCE(update_description, ''), started_at, updated_at
 		FROM pipeline_state WHERE id = 1`).Scan(
-		&s.Stage, &analysisJSON, &blueprintJSON, &s.CurrentPageIndex, &s.ErrorCount,
+		&s.Stage, &planJSON, &s.ToolCallsCompleted, &s.ErrorCount,
 		&lastError, &s.Paused, &pauseReason, &updateDesc, &startedAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load pipeline state: %w", err)
 	}
 
-	s.AnalysisJSON = analysisJSON.String
-	s.BlueprintJSON = blueprintJSON.String
+	s.PlanJSON = planJSON.String
 	s.LastError = lastError.String
 	s.PauseReason = pauseReason.String
 	s.UpdateDescription = updateDesc.String
@@ -521,11 +635,11 @@ func LoadPipelineState(d *sql.DB) (*PipelineState, error) {
 // SavePipelineState persists the full pipeline state.
 func SavePipelineState(sdb *db.SiteDB, s *PipelineState) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = ?, plan_json = ?, blueprint_json = ?, current_page_index = ?,
+		stage = ?, plan_json = ?, tool_calls_completed = ?,
 		error_count = ?, last_error = ?, paused = ?,
 		pause_reason = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = 1`,
-		s.Stage, s.AnalysisJSON, s.BlueprintJSON, s.CurrentPageIndex,
+		s.Stage, s.PlanJSON, s.ToolCallsCompleted,
 		s.ErrorCount, s.LastError, s.Paused, s.PauseReason,
 	)
 	return err
@@ -540,7 +654,7 @@ func AdvanceStage(sdb *db.SiteDB, stage PipelineStage) error {
 // ResetPipeline resets pipeline state for a fresh build.
 func ResetPipeline(sdb *db.SiteDB) error {
 	_, err := sdb.ExecWrite(`UPDATE pipeline_state SET
-		stage = 'ANALYZE', plan_json = NULL, blueprint_json = NULL, current_page_index = 0,
+		stage = 'PLAN', plan_json = NULL, tool_calls_completed = 0,
 		error_count = 0, last_error = NULL, paused = 0,
 		pause_reason = NULL, started_at = CURRENT_TIMESTAMP,
 		updated_at = CURRENT_TIMESTAMP

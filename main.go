@@ -126,14 +126,22 @@ func main() {
 	// Wake the brain when a question is answered so it can resume building.
 	// Pass the answer context so the brain can acknowledge it.
 	bus.Subscribe(events.EventQuestionAnswered, func(e events.Event) {
-		_ = brainMgr.SendCommand(e.SiteID, brain.BrainCommand{
+		cmd := brain.BrainCommand{
 			Type: brain.CommandWake,
 			Payload: map[string]interface{}{
 				"reason":      "question_answered",
 				"question_id": e.Payload["question_id"],
 				"answer":      e.Payload["answer"],
 			},
-		})
+		}
+		if err := brainMgr.SendCommand(e.SiteID, cmd); err != nil {
+			slog.Error("failed to wake brain after question answered, retrying", "site_id", e.SiteID, "error", err)
+			time.AfterFunc(3*time.Second, func() {
+				if err2 := brainMgr.SendCommand(e.SiteID, cmd); err2 != nil {
+					slog.Error("retry wake after question answered also failed", "site_id", e.SiteID, "error", err2)
+				}
+			})
+		}
 	})
 
 	// Wake the brain when the user sends a chat message so it can

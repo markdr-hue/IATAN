@@ -25,7 +25,6 @@ type createSiteRequest struct {
 	Name        string  `json:"name"`
 	Domain      *string `json:"domain"`
 	Description *string `json:"description"`
-	Direction   *string `json:"direction"`
 	LLMModelID  int     `json:"llm_model_id"`
 }
 
@@ -33,7 +32,6 @@ type updateSiteRequest struct {
 	Name        string  `json:"name"`
 	Domain      *string `json:"domain"`
 	Description *string `json:"description"`
-	Direction   *string `json:"direction"`
 	LLMModelID  int     `json:"llm_model_id"`
 }
 
@@ -119,7 +117,7 @@ func (h *SitesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		req.Domain = nil
 	}
 
-	site, err := models.CreateSite(h.deps.DB.DB, req.Name, req.Domain, req.Description, req.Direction, req.LLMModelID)
+	site, err := models.CreateSite(h.deps.DB.DB, req.Name, req.Domain, req.Description, req.LLMModelID)
 	if err != nil {
 		h.deps.Logger.Error("failed to create site", "error", err)
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -192,7 +190,7 @@ func (h *SitesHandler) Update(w http.ResponseWriter, r *http.Request) {
 		req.Domain = nil
 	}
 
-	if err := models.UpdateSite(h.deps.DB.DB, siteID, req.Name, req.Domain, req.Description, req.Direction, req.LLMModelID); err != nil {
+	if err := models.UpdateSite(h.deps.DB.DB, siteID, req.Name, req.Domain, req.Description, req.LLMModelID); err != nil {
 		h.deps.Logger.Error("failed to update site", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to update site")
 		return

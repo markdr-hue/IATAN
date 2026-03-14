@@ -19,6 +19,7 @@ type Deps struct {
 	DB            *db.DB
 	SiteDBManager *db.SiteDBManager
 	Bus           *events.Bus
+	WSHub         *wsHub
 	Encryptor     *security.Encryptor
 	JWTManager    *security.JWTManager
 	Logger        *slog.Logger

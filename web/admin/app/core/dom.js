@@ -87,10 +87,4 @@ export function render(parent, element) {
   }
 }
 
-/**
- * Query shortcut.
- */
-export function qs(selector, parent = document) {
-  return parent.querySelector(selector);
-}
 

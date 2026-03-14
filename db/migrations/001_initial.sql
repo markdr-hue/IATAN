@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS sites (
     name TEXT NOT NULL,
     domain TEXT UNIQUE,
     description TEXT,
-    direction TEXT,
     status TEXT NOT NULL DEFAULT 'inactive',
     mode TEXT NOT NULL DEFAULT 'building',
     llm_model_id INTEGER NOT NULL,

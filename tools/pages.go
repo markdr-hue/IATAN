@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -22,24 +23,44 @@ type PagesTool struct{}
 
 func (t *PagesTool) Name() string { return "manage_pages" }
 func (t *PagesTool) Description() string {
-	return "Manage site pages. Actions: save (create/update page), patch (search/replace fix without full rewrite), get (read page), list (list all), delete (soft-delete), restore, history (version history), search (full-text search)."
+	return "Save, patch, get, list, delete, restore, search, or revert pages."
+}
+
+func (t *PagesTool) Guide() string {
+	return `### Page Content Rules (manage_pages)
+- Content = body content only. Server builds the full HTML document around it.
+- DO NOT include <!DOCTYPE>, <html>, <head>, <body>, or <main> tags.
+- DO NOT include <nav> or <footer> — the layout provides these.
+- DO NOT include <link>/<script src> for /assets/ files — auto-injected by server.
+- DO include: sections, divs, headings, forms, and CSS classes from the global stylesheet.
+- Use var(--color-*) for colors. Use classes from the global CSS — never hardcode hex values.
+- Pages MUST be functional, not static mockups. Use JavaScript to:
+  - Fetch data from API endpoints and render it into the DOM
+  - Handle form submissions (preventDefault, fetch POST/PUT, show feedback)
+  - Wire up interactive elements (tabs, accordions, modals) with event listeners
+  - CRUD: list items on load, create via form, edit/delete with buttons
+- All JS must be in external .js files (manage_files), not inline <script> blocks.
+  - Global-scope JS: auto-injected on all pages. Page-scope JS: list in assets array.
+  - Only exception: a tiny inline <script> (under 3 lines) to call an init function.
+- Only link to pages that actually exist. Check the plan before adding href links.`
 }
 
 func (t *PagesTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
 		"properties": map[string]interface{}{
-			"action":   map[string]interface{}{"type": "string", "description": "Action to perform", "enum": []string{"save", "patch", "get", "list", "delete", "restore", "history", "search"}},
+			"action":   map[string]interface{}{"type": "string", "description": "Action to perform", "enum": []string{"save", "patch", "get", "list", "delete", "restore", "history", "revert", "search"}},
 			"path":     map[string]interface{}{"type": "string", "description": "URL path for the page (e.g. /about)"},
 			"title":    map[string]interface{}{"type": "string", "description": "Page title"},
-			"content":  map[string]interface{}{"type": "string", "description": "HTML content for the page. The server wraps this with the site layout (nav/footer) and injects shared CSS/JS automatically."},
+			"content":  map[string]interface{}{"type": "string", "description": "HTML content for the page. Pages using a layout will have this content placed within the layout structure."},
 			"template": map[string]interface{}{"type": "string", "description": "Template name to use for rendering"},
 			"status":   map[string]interface{}{"type": "string", "description": "Page status: published or draft", "enum": []string{"published", "draft"}},
 			"layout":   map[string]interface{}{"type": "string", "description": `Layout name for this page. Default: uses "default" layout. Use "none" for no layout wrapping.`},
 			"assets":   map[string]interface{}{"type": "string", "description": `JSON array of page-scoped asset filenames to include on this page (e.g. ["charts.js","maps.css"]). Global-scope assets are auto-injected on all pages.`},
 			"metadata": map[string]interface{}{"type": "string", "description": "JSON string of additional metadata (description, og_image, canonical, keywords)"},
 			"limit":    map[string]interface{}{"type": "number", "description": "Maximum number of results to return"},
-			"query":    map[string]interface{}{"type": "string", "description": "Search query for full-text search"},
+			"version":  map[string]interface{}{"type": "integer", "description": "Version number to restore (revert action)"},
+		"query":    map[string]interface{}{"type": "string", "description": "Search query for full-text search"},
 			"patches":  map[string]interface{}{"type": "string", "description": `JSON array of search/replace pairs for patch action: [{"search":"old text","replace":"new text"}]. Works on HTML and JS content.`},
 		},
 		"required": []string{"action"},
@@ -55,8 +76,12 @@ func (t *PagesTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Res
 		"delete":  t.delete,
 		"restore": t.restore,
 		"history": t.history,
+		"revert":  t.revert,
 		"search":  t.search,
 	}, func(a map[string]interface{}) string {
+		if _, has := a["version"]; has {
+			return "revert"
+		}
 		if _, has := a["content"]; has {
 			return "save"
 		}
@@ -169,6 +194,18 @@ func (t *PagesTool) save(ctx *ToolContext, args map[string]interface{}) (*Result
 	if len(hints) > 0 {
 		resultData["hints"] = hints
 	}
+	// Inject API, CSS, and page skeleton catalogs for cross-page coherence.
+	if apiCatalog := buildAPICatalog(ctx.DB); apiCatalog != "" {
+		resultData["available_endpoints"] = apiCatalog
+	}
+	if css := loadGlobalCSSForCatalog(ctx.DB); css != "" {
+		if summary := extractCSSSummary(css); summary != "" {
+			resultData["css_classes"] = summary
+		}
+	}
+	if skeletons := loadRecentPageSkeletons(ctx.DB, path, 3); skeletons != "" {
+		resultData["page_skeletons"] = skeletons
+	}
 	if len(hardErrors) > 0 {
 		resultData["errors"] = hardErrors
 		return &Result{
@@ -274,6 +311,18 @@ func (t *PagesTool) patch(ctx *ToolContext, args map[string]interface{}) (*Resul
 	}
 	if len(hints) > 0 {
 		resultData["hints"] = hints
+	}
+	// Inject API, CSS, and page skeleton catalogs for cross-page coherence.
+	if apiCatalog := buildAPICatalog(ctx.DB); apiCatalog != "" {
+		resultData["available_endpoints"] = apiCatalog
+	}
+	if css := loadGlobalCSSForCatalog(ctx.DB); css != "" {
+		if summary := extractCSSSummary(css); summary != "" {
+			resultData["css_classes"] = summary
+		}
+	}
+	if skeletons := loadRecentPageSkeletons(ctx.DB, path, 3); skeletons != "" {
+		resultData["page_skeletons"] = skeletons
 	}
 	return &Result{Success: true, Data: resultData}, nil
 }
@@ -461,6 +510,68 @@ func (t *PagesTool) history(ctx *ToolContext, args map[string]interface{}) (*Res
 }
 
 // ---------------------------------------------------------------------------
+// revert — restore a page to a previous version
+// ---------------------------------------------------------------------------
+
+func (t *PagesTool) revert(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return &Result{Success: false, Error: "path is required"}, nil
+	}
+
+	version, ok := args["version"].(float64)
+	if !ok || version < 1 {
+		return &Result{Success: false, Error: "version (number) is required"}, nil
+	}
+
+	// Find the page.
+	var pageID int
+	var oldTitle, oldContent, oldTemplate, oldStatus, oldMeta sql.NullString
+	err := ctx.DB.QueryRow(
+		"SELECT id, title, content, template, status, metadata FROM pages WHERE path = ?",
+		path,
+	).Scan(&pageID, &oldTitle, &oldContent, &oldTemplate, &oldStatus, &oldMeta)
+	if err != nil {
+		return &Result{Success: false, Error: "page not found"}, nil
+	}
+
+	// Load the requested version.
+	var verTitle, verContent, verTemplate, verStatus, verMeta sql.NullString
+	err = ctx.DB.QueryRow(
+		"SELECT title, content, template, status, metadata FROM page_versions WHERE page_id = ? AND version_number = ?",
+		pageID, int(version),
+	).Scan(&verTitle, &verContent, &verTemplate, &verStatus, &verMeta)
+	if err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("version %d not found for page %s", int(version), path)}, nil
+	}
+
+	// Save current state as a new version first (so revert is reversible).
+	var maxVer int
+	ctx.DB.QueryRow("SELECT COALESCE(MAX(version_number), 0) FROM page_versions WHERE page_id = ?", pageID).Scan(&maxVer)
+	ctx.DB.Exec(
+		`INSERT INTO page_versions (page_id, path, title, content, template, status, metadata, version_number, changed_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'revert')`,
+		pageID, path, oldTitle, oldContent, oldTemplate, oldStatus, oldMeta, maxVer+1,
+	)
+
+	// Restore the old version content.
+	_, err = ctx.DB.Exec(
+		`UPDATE pages SET title = ?, content = ?, template = ?, status = ?, metadata = ?,
+		 is_deleted = 0, deleted_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		verTitle, verContent, verTemplate, verStatus, verMeta, pageID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reverting page: %w", err)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"path":             path,
+		"restored_version": int(version),
+		"title":            verTitle.String,
+	}}, nil
+}
+
+// ---------------------------------------------------------------------------
 // search — full-text search across pages
 // ---------------------------------------------------------------------------
 
@@ -636,6 +747,94 @@ func sanitizePageHTML(content string) string {
 	return content
 }
 
+// buildCSSCatalog returns a summary of all CSS classes and custom properties
+// available in the site's stylesheet assets. Injected into page save results
+// so the LLM knows which classes to use when building HTML.
+func buildCSSCatalog(db *sql.DB) string {
+	rows, err := db.Query("SELECT filename, storage_path FROM assets WHERE filename LIKE '%.css' ORDER BY scope DESC, filename")
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var combined strings.Builder
+	for rows.Next() {
+		var filename, storagePath string
+		if err := rows.Scan(&filename, &storagePath); err != nil {
+			continue
+		}
+		data, err := os.ReadFile(storagePath)
+		if err != nil {
+			continue
+		}
+		summary := extractCSSSummary(string(data))
+		if summary != "" {
+			if combined.Len() > 0 {
+				combined.WriteString(" | ")
+			}
+			combined.WriteString(filename + ": " + summary)
+		}
+	}
+
+	result := combined.String()
+	if len(result) > 3000 {
+		result = result[:3000]
+	}
+	return result
+}
+
+// buildAPICatalog returns a compact reference of all API endpoints and their
+// columns. Injected into page save results so the LLM uses correct paths and
+// property names in JS code.
+func buildAPICatalog(db *sql.DB) string {
+	rows, err := db.Query("SELECT path, methods, table_name, public_columns FROM api_endpoints ORDER BY path")
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var parts []string
+	for rows.Next() {
+		var path, methods, tableName string
+		var publicCols sql.NullString
+		if err := rows.Scan(&path, &methods, &tableName, &publicCols); err != nil {
+			continue
+		}
+		cols := ""
+		if publicCols.Valid && publicCols.String != "" && publicCols.String != "[]" {
+			// Parse JSON array of column names into compact form.
+			var colArr []string
+			if json.Unmarshal([]byte(publicCols.String), &colArr) == nil && len(colArr) > 0 {
+				cols = strings.Join(colArr, ",")
+			}
+		}
+		entry := methods + " " + path + " -> " + tableName
+		if cols != "" {
+			entry += "(" + cols + ")"
+		}
+		parts = append(parts, entry)
+	}
+
+	// Also include auth endpoints.
+	authRows, err := db.Query("SELECT path, table_name FROM auth_endpoints ORDER BY path")
+	if err == nil {
+		defer authRows.Close()
+		for authRows.Next() {
+			var path, tableName string
+			if err := authRows.Scan(&path, &tableName); err != nil {
+				continue
+			}
+			parts = append(parts, "AUTH "+path+" -> "+tableName)
+		}
+	}
+
+	result := strings.Join(parts, "; ")
+	if len(result) > 2000 {
+		result = result[:2000]
+	}
+	return result
+}
+
 func (t *PagesTool) MaxResultSize() int { return 16000 }
 
 func (t *PagesTool) Summarize(result string) string {
@@ -657,10 +856,14 @@ func (t *PagesTool) Summarize(result string) string {
 		fingerprint := pageStructureFingerprint(content)
 		return fmt.Sprintf(`{"success":true,"summary":"Read page %s (%d chars). %s"}`, path, len(content), fingerprint)
 	}
+	// For save/patch results: preserve warnings, hints, and catalogs.
+	path, hasPath := data["path"].(string)
 	warnings, hasW := data["warnings"]
 	hints, hasH := data["hints"]
-	if hasW || hasH {
-		path, _ := data["path"].(string)
+	apiC, hasAPI := data["available_endpoints"].(string)
+	cssC, hasCSS := data["css_classes"].(string)
+	skelC, hasSkel := data["page_skeletons"].(string)
+	if hasPath && (hasW || hasH || hasAPI || hasCSS || hasSkel) {
 		var parts []string
 		parts = append(parts, fmt.Sprintf(`"success":true,"path":"%s"`, path))
 		if hasW {
@@ -671,7 +874,226 @@ func (t *PagesTool) Summarize(result string) string {
 			hJSON, _ := json.Marshal(hints)
 			parts = append(parts, fmt.Sprintf(`"hints":%s`, hJSON))
 		}
+		if hasAPI {
+			parts = append(parts, fmt.Sprintf(`"available_endpoints":"%s"`, strings.ReplaceAll(apiC, `"`, `\"`)))
+		}
+		if hasCSS {
+			parts = append(parts, fmt.Sprintf(`"css_classes":"%s"`, strings.ReplaceAll(cssC, `"`, `\"`)))
+		}
+		if hasSkel {
+			if len(skelC) > 800 {
+				skelC = skelC[:800]
+			}
+			parts = append(parts, fmt.Sprintf(`"page_skeletons":"%s"`, strings.ReplaceAll(skelC, `"`, `\"`)))
+		}
 		return "{" + strings.Join(parts, ",") + "}"
 	}
 	return summarizeTruncate(result, 300)
+}
+
+// ---------------------------------------------------------------------------
+// Page skeleton extraction — feed structural patterns back to the LLM
+// ---------------------------------------------------------------------------
+
+// skeletonLeafTags are tags whose text content is stripped and self-closed.
+var skeletonLeafTags = map[string]bool{
+	"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
+	"p": true, "a": true, "img": true, "button": true, "span": true,
+	"input": true, "textarea": true, "select": true, "label": true,
+	"li": true, "th": true, "td": true, "figcaption": true, "small": true,
+}
+
+// skeletonSkipTags are tags whose entire content (including children) is skipped.
+var skeletonSkipTags = map[string]bool{
+	"script": true, "style": true, "svg": true, "noscript": true,
+}
+
+// extractPageSkeleton strips text content from HTML, keeping only the structural
+// skeleton with tag names, class, and id attributes. Leaf tags are self-closed.
+// Example output: <section class="hero"><div class="container"><h1/><p/><a class="btn"/></div></section>
+func extractPageSkeleton(html string) string {
+	var b strings.Builder
+	i := 0
+	n := len(html)
+	depth := 0
+	maxDepth := 6
+	skipUntil := "" // non-empty when inside a skip tag
+
+	for i < n && b.Len() < 700 {
+		if html[i] != '<' {
+			// Skip text content.
+			i++
+			continue
+		}
+
+		// Find end of tag.
+		end := strings.IndexByte(html[i:], '>')
+		if end < 0 {
+			break
+		}
+		tag := html[i : i+end+1]
+		i += end + 1
+
+		// Skip comments.
+		if strings.HasPrefix(tag, "<!--") {
+			if ci := strings.Index(html[i-1:], "-->"); ci >= 0 {
+				i = i - 1 + ci + 3
+			}
+			continue
+		}
+
+		// Parse tag name.
+		inner := tag[1 : len(tag)-1]
+		if len(inner) == 0 {
+			continue
+		}
+		isClosing := inner[0] == '/'
+		if isClosing {
+			inner = inner[1:]
+		}
+		// Self-closing tag like <br/>
+		isSelfClose := inner[len(inner)-1] == '/'
+		if isSelfClose {
+			inner = inner[:len(inner)-1]
+		}
+		inner = strings.TrimSpace(inner)
+
+		// Extract tag name (up to first space or end).
+		tagName := inner
+		if sp := strings.IndexAny(inner, " \t\n\r"); sp > 0 {
+			tagName = inner[:sp]
+		}
+		tagName = strings.ToLower(tagName)
+
+		// Handle skip tags.
+		if skipUntil != "" {
+			if isClosing && tagName == skipUntil {
+				skipUntil = ""
+			}
+			continue
+		}
+		if skeletonSkipTags[tagName] && !isClosing {
+			skipUntil = tagName
+			continue
+		}
+
+		if isClosing {
+			if depth > 0 {
+				depth--
+			}
+			if depth < maxDepth {
+				b.WriteString("</" + tagName + ">")
+			}
+			continue
+		}
+
+		if depth >= maxDepth {
+			if !isSelfClose && !skeletonLeafTags[tagName] {
+				depth++
+			}
+			continue
+		}
+
+		// Extract class and id attributes.
+		attrs := extractSkeletonAttrs(inner)
+		if skeletonLeafTags[tagName] || isSelfClose {
+			b.WriteString("<" + tagName + attrs + "/>")
+		} else {
+			b.WriteString("<" + tagName + attrs + ">")
+			depth++
+		}
+	}
+
+	result := b.String()
+	if len(result) > 600 {
+		// Truncate at last complete tag.
+		if last := strings.LastIndex(result[:600], ">"); last > 0 {
+			result = result[:last+1]
+		} else {
+			result = result[:600]
+		}
+	}
+	return result
+}
+
+// extractSkeletonAttrs extracts class and id attributes from a tag's inner string.
+func extractSkeletonAttrs(inner string) string {
+	var attrs string
+	for _, attr := range []string{"class", "id"} {
+		idx := strings.Index(inner, attr+"=")
+		if idx < 0 {
+			continue
+		}
+		rest := inner[idx+len(attr)+1:]
+		if len(rest) == 0 {
+			continue
+		}
+		quote := rest[0]
+		if quote != '"' && quote != '\'' {
+			continue
+		}
+		end := strings.IndexByte(rest[1:], quote)
+		if end < 0 {
+			continue
+		}
+		val := rest[1 : end+1]
+		if val != "" {
+			attrs += " " + attr + `="` + val + `"`
+		}
+	}
+	return attrs
+}
+
+// loadRecentPageSkeletons loads the last N page skeletons (excluding excludePath)
+// so the LLM sees the structural patterns of recently built pages.
+func loadRecentPageSkeletons(db *sql.DB, excludePath string, limit int) string {
+	rows, err := db.Query(
+		"SELECT path, content FROM pages WHERE is_deleted = 0 AND path != ? ORDER BY updated_at DESC LIMIT ?",
+		excludePath, limit,
+	)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	count := 0
+	for rows.Next() {
+		var path, content string
+		if rows.Scan(&path, &content) != nil {
+			continue
+		}
+		skeleton := extractPageSkeleton(content)
+		if skeleton == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(" | ")
+		}
+		entry := path + ": " + skeleton
+		if b.Len()+len(entry) > 1500 {
+			break
+		}
+		b.WriteString(entry)
+		count++
+	}
+	if count == 0 {
+		return ""
+	}
+	return b.String()
+}
+
+// loadGlobalCSSForCatalog returns the first global CSS file content (capped at 4000 chars)
+// for extracting a class catalog to inject into page save/patch results.
+func loadGlobalCSSForCatalog(db *sql.DB) string {
+	var content sql.NullString
+	db.QueryRow("SELECT content FROM assets WHERE scope = 'global' AND filename LIKE '%.css' ORDER BY filename LIMIT 1").Scan(&content)
+	if content.Valid && len(content.String) > 0 {
+		css := content.String
+		if len(css) > 4000 {
+			css = css[:4000]
+		}
+		return css
+	}
+	return ""
 }

@@ -326,10 +326,10 @@ func (h *Handler) authLogin(w http.ResponseWriter, r *http.Request, siteID int, 
 }
 
 // authMe handles GET /api/{path}/me.
-func (h *Handler) authMe(w http.ResponseWriter, r *http.Request, _ int, siteDB *sql.DB, physTable string, ae *authEndpointConfig) {
-	// Extract and validate JWT token.
+func (h *Handler) authMe(w http.ResponseWriter, r *http.Request, siteID int, siteDB *sql.DB, physTable string, ae *authEndpointConfig) {
+	// Extract and validate JWT token — must be scoped to this site.
 	claims, err := h.extractUserClaims(r)
-	if err != nil {
+	if err != nil || claims.SiteID != siteID {
 		writePublicError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -357,15 +357,13 @@ func (h *Handler) authMe(w http.ResponseWriter, r *http.Request, _ int, siteDB *
 	writePublicJSON(w, http.StatusOK, results[0])
 }
 
-// generateUserToken creates a JWT token for a site user.
+// generateUserToken creates a JWT token for a site user, scoped to the site.
 func (h *Handler) generateUserToken(userID int, username, role string, siteID int, ae *authEndpointConfig) (string, error) {
 	if h.deps.JWTManager == nil {
 		return "", fmt.Errorf("JWT manager not configured")
 	}
-	// Use the site-level JWT manager with the configured expiry.
-	_ = siteID // JWT is signed with the global secret; siteID is in context.
-	_ = ae     // Expiry could be customized per auth endpoint in the future.
-	return h.deps.JWTManager.Generate(userID, username, role)
+	_ = ae // Expiry could be customized per auth endpoint in the future.
+	return h.deps.JWTManager.GenerateForSite(siteID, userID, username, role)
 }
 
 // extractUserClaims extracts and validates JWT claims from the Authorization header.
@@ -388,7 +386,7 @@ func (h *Handler) extractUserClaims(r *http.Request) (*security.Claims, error) {
 }
 
 // validateSiteTokenOrJWT checks if the token is either a valid site API key
-// or a valid user JWT token. Returns true if either check passes.
+// or a valid user JWT token scoped to this site. Returns true if either check passes.
 func (h *Handler) validateSiteTokenOrJWT(siteID int, token string) bool {
 	if token == "" {
 		return false
@@ -399,10 +397,10 @@ func (h *Handler) validateSiteTokenOrJWT(siteID int, token string) bool {
 		return true
 	}
 
-	// Second try: user JWT.
+	// Second try: user JWT — must be scoped to this site.
 	if h.deps.JWTManager != nil {
-		_, err := h.deps.JWTManager.Validate(token)
-		return err == nil
+		claims, err := h.deps.JWTManager.Validate(token)
+		return err == nil && claims.SiteID == siteID
 	}
 
 	return false

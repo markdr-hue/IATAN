@@ -9,8 +9,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -24,19 +22,37 @@ import (
 // EndpointsTool consolidates API endpoint and auth endpoint management into a
 // single tool with actions: create_api, list_api, delete_api,
 // create_auth, list_auth, delete_auth, create_upload, create_stream,
-// create_websocket, verify_password, test, create_oauth, list_oauth, delete_oauth.
+// create_websocket, verify_password, create_oauth, list_oauth, delete_oauth.
 type EndpointsTool struct{}
 
 func (t *EndpointsTool) Name() string { return "manage_endpoints" }
 func (t *EndpointsTool) Description() string {
-	return "Manage API and auth endpoints. Actions: create_api, list_api, delete_api, create_auth, list_auth, delete_auth, create_upload, create_stream, create_websocket, verify_password, test, create_oauth, list_oauth, delete_oauth. " +
-		"API endpoints serve CRUD at /api/{path}. Auth endpoints create /register, /login, /me routes using JWT. " +
-		"OAuth endpoints add social login via /api/{auth_path}/oauth/{provider} with automatic callback handling. " +
-		"Upload endpoints accept multipart file uploads at /api/{path}/upload. " +
-		"Stream endpoints provide real-time SSE at /api/{path}/stream for live data updates (server→client). " +
-		"WebSocket endpoints provide bidirectional real-time communication at /api/{path}/ws (chat, collaboration). " +
-		"Use 'test' with a path to verify an endpoint works and see sample data. " +
-		"API endpoints support required_role for RBAC (e.g. required_role='admin'). Auth endpoints support default_role for new registrations."
+	return "Create, list, or delete API, auth, upload, stream, websocket, and oauth endpoints."
+}
+
+func (t *EndpointsTool) Guide() string {
+	return `### Endpoint Types (manage_endpoints)
+- **create_api**: CRUD REST endpoint bound to a dynamic table.
+  Creates: GET /api/{path} (list), GET /api/{path}/{id}, POST, PUT, DELETE.
+  List returns: {data: [...], count, limit, offset}. Filtering: ?col=val, ?col__like=term, ?col__gt, ?col__lt, ?q=term.
+  Options: requires_auth, public_read, public_columns, rate_limit.
+- **create_auth**: JWT authentication endpoint for a table with a PASSWORD column.
+  Creates: POST /api/{path}/login -> {token}, POST /api/{path}/register -> {token}, GET /api/{path}/me -> user.
+  Protected endpoints require: Authorization: Bearer <token>
+  Options: default_role, role_column, jwt_expiry_hours, public_columns (for JWT claims and /me).
+- **create_websocket**: Real-time bidirectional relay with room support.
+  Connect: new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/{path}/ws?room=VALUE')
+  Pure relay: messages arrive as sent by other client, plus "_sender" (unique client UUID).
+  ECHO SUPPRESSION: server does NOT echo your message back — update UI optimistically after ws.send().
+  NO JOIN/LEAVE events from server — track peers client-side using incoming _sender IDs.
+  Use a "type" field in every message: {type: "join"}, {type: "move", x: 5}, {type: "state", board: [...]}.
+  Reconnection: use ws.onclose with exponential backoff, re-send join message after reconnecting.
+  Options: write_to_table (auto-persist messages to table), requires_auth, room_column. Rooms via ?room=.
+- **create_stream**: SSE for one-way real-time data.
+  Connect: new EventSource('/api/{path}/stream'). Options: event_types, requires_auth.
+- **create_upload**: File upload (multipart form).
+  POST /api/{path}/upload -> {url, filename, size, type}. Options: allowed_types, max_size_mb, requires_auth.
+- **create_oauth**: OAuth provider linked to an existing auth endpoint.`
 }
 
 func (t *EndpointsTool) Parameters() map[string]interface{} {
@@ -46,7 +62,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"action": map[string]interface{}{
 				"type":        "string",
 				"description": "Action to perform",
-				"enum":        []string{"create_api", "list_api", "delete_api", "create_auth", "list_auth", "delete_auth", "create_upload", "create_stream", "create_websocket", "verify_password", "test", "create_oauth", "list_oauth", "delete_oauth"},
+				"enum":        []string{"create_api", "list_api", "delete_api", "create_auth", "list_auth", "delete_auth", "create_upload", "create_stream", "create_websocket", "verify_password", "create_oauth", "list_oauth", "delete_oauth"},
 			},
 			"path": map[string]interface{}{
 				"type":        "string",
@@ -94,7 +110,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			"event_types": map[string]interface{}{
 				"type":        "array",
 				"items":       map[string]interface{}{"type": "string"},
-				"description": "Event types to broadcast (e.g. [\"data.insert\", \"data.update\", \"data.delete\"]). For create_stream and create_websocket.",
+				"description": "Event types to broadcast (e.g. [\"data.insert\", \"data.update\", \"data.delete\"]). For create_stream only.",
 			},
 			"max_size_mb": map[string]interface{}{
 				"type":        "number",
@@ -160,17 +176,13 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 				"type":        "string",
 				"description": "Auth endpoint path this OAuth links to (must already exist). For create_oauth.",
 			},
-			"receive_event_type": map[string]interface{}{
-				"type":        "string",
-				"description": "Event type published when a client sends a WebSocket message (default: 'ws.message'). Only for create_websocket.",
-			},
 			"write_to_table": map[string]interface{}{
 				"type":        "string",
 				"description": "Table to auto-insert incoming WebSocket messages into. JSON fields are mapped to table columns automatically. Only for create_websocket.",
 			},
 			"room_column": map[string]interface{}{
 				"type":        "string",
-				"description": "Column name used for room-based filtering. Clients connect with ?room=<value> and only receive messages where this field matches. Use for scoped real-time (e.g. room_column='drawing_id' for per-canvas collaboration). Only for create_websocket.",
+				"description": "Column name used for room scoping in WebSocket connections. Only for create_websocket.",
 			},
 		},
 		"required": []string{"action"},
@@ -189,7 +201,6 @@ func (t *EndpointsTool) Execute(ctx *ToolContext, args map[string]interface{}) (
 		"create_stream":    t.createStream,
 		"create_websocket": t.createWebSocket,
 		"verify_password":  t.verifyPassword,
-		"test":             t.testEndpoint,
 		"create_oauth":     t.createOAuth,
 		"list_oauth":       t.listOAuth,
 		"delete_oauth":     t.deleteOAuth,
@@ -722,23 +733,6 @@ func (t *EndpointsTool) createWebSocket(ctx *ToolContext, args map[string]interf
 		return &Result{Success: false, Error: "path is required"}, nil
 	}
 
-	// Parse event_types (default: all data events).
-	eventTypes := []string{"data.insert", "data.update", "data.delete"}
-	if typesRaw, ok := args["event_types"].([]interface{}); ok && len(typesRaw) > 0 {
-		eventTypes = nil
-		for _, et := range typesRaw {
-			if ets, ok := et.(string); ok {
-				eventTypes = append(eventTypes, ets)
-			}
-		}
-	}
-	eventTypesJSON, _ := json.Marshal(eventTypes)
-
-	receiveEventType := "ws.message"
-	if ret, ok := args["receive_event_type"].(string); ok && ret != "" {
-		receiveEventType = ret
-	}
-
 	writeToTable := ""
 	if wtt, ok := args["write_to_table"].(string); ok && wtt != "" {
 		if !validColumnName.MatchString(wtt) {
@@ -747,66 +741,60 @@ func (t *EndpointsTool) createWebSocket(ctx *ToolContext, args map[string]interf
 		writeToTable = wtt
 	}
 
+	roomColumn := ""
+	if rc, ok := args["room_column"].(string); ok {
+		roomColumn = rc
+	}
+
 	requiresAuth := false
 	if ra, ok := args["requires_auth"].(bool); ok {
 		requiresAuth = ra
 	}
 
-	roomColumn := ""
-	if rc, ok := args["room_column"].(string); ok && rc != "" {
-		if !validColumnName.MatchString(rc) {
-			return &Result{Success: false, Error: fmt.Sprintf("invalid room_column name: %s", rc)}, nil
-		}
-		roomColumn = rc
-	}
-
 	_, err := ctx.DB.Exec(
-		`INSERT INTO ws_endpoints (path, event_types, receive_event_type, write_to_table, requires_auth, room_column)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO ws_endpoints (path, write_to_table, room_column, requires_auth)
+		 VALUES (?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
-		   event_types = excluded.event_types,
-		   receive_event_type = excluded.receive_event_type,
 		   write_to_table = excluded.write_to_table,
-		   requires_auth = excluded.requires_auth,
-		   room_column = excluded.room_column`,
-		path, string(eventTypesJSON), receiveEventType, writeToTable, requiresAuth, roomColumn,
+		   room_column = excluded.room_column,
+		   requires_auth = excluded.requires_auth`,
+		path, writeToTable, roomColumn, requiresAuth,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating websocket endpoint: %w", err)
 	}
 
-	roomSuffix := "'"
-	if roomColumn != "" {
-		roomSuffix = "?room=' + roomId"
-	}
 	usage := fmt.Sprintf(`CONNECTION:
-  const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/%s/ws%s);
+  const ws = new WebSocket((location.protocol==='https:'?'wss:':'ws:') + '//' + location.host + '/api/%s/ws?room=' + roomId);
+  // ?room= is always available. Clients in the same room see each other's messages.
+  // Omit ?room= for a single global channel.
 
-MESSAGE FORMAT (received via ws.onmessage):
-  { "type": "%s", "payload": { "path": "%s", "data": { ...original fields... }, "client_id": "uuid" } }
+RECEIVED MESSAGES (ws.onmessage):
+  Exactly what the other client sent, plus "_sender" (unique client ID).
+  Example: other client sends {type: "move", x: 5}
+           you receive:       {"type": "move", "x": 5, "_sender": "uuid"}
 
-HANDLING RECEIVED MESSAGES — append to DOM immediately, no page refresh:
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
-    const data = msg.payload.data;  // the actual message object with your table columns
-    // append data to the UI here (e.g. create a new DOM element and add it to the message list)
+    // msg has exactly the fields the sender set, plus msg._sender
   };
 
-SENDING MESSAGES:
-  ws.send(JSON.stringify({ content: "hello", nickname: nick }));
+SENDING:
+  ws.send(JSON.stringify({ type: "chat", content: "hello" }));
 
-CRITICAL — ECHO SUPPRESSION:
-  The server does NOT echo messages back to the sender.
-  You MUST optimistically append your own sent message to the DOM right after calling ws.send().
-  Other clients will receive the message via ws.onmessage.`, path, roomSuffix, receiveEventType, path)
+ECHO SUPPRESSION:
+  The server does NOT echo your message back to you.
+  Update your own UI immediately after ws.send().
+
+ROOMS:
+  All clients with the same ?room= value share a channel.
+  Clients in different rooms cannot see each other's messages.`, path)
 
 	result := map[string]interface{}{
-		"path":               path,
-		"route":              fmt.Sprintf("GET /api/%s/ws", path),
-		"event_types":        eventTypes,
-		"receive_event_type": receiveEventType,
-		"requires_auth":      requiresAuth,
-		"usage":              usage,
+		"path":          path,
+		"route":         fmt.Sprintf("GET /api/%s/ws", path),
+		"requires_auth": requiresAuth,
+		"usage":         usage,
 	}
 	if writeToTable != "" {
 		result["write_to_table"] = writeToTable
@@ -819,57 +807,6 @@ CRITICAL — ECHO SUPPRESSION:
 
 // ---------------------------------------------------------------------------
 // Test action
-// ---------------------------------------------------------------------------
-
-func (t *EndpointsTool) testEndpoint(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
-	path, _ := args["path"].(string)
-	if path == "" {
-		return &Result{Success: false, Error: "path is required"}, nil
-	}
-
-	url := resolveLocalURL(ctx, "/api/"+path+"?limit=1")
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return &Result{Success: false, Error: fmt.Sprintf("endpoint unreachable: %v", err)}, nil
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-
-	if resp.StatusCode != http.StatusOK {
-		return &Result{Success: false, Data: map[string]interface{}{
-			"status_code": resp.StatusCode,
-			"body":        string(body),
-		}, Error: fmt.Sprintf("endpoint returned status %d", resp.StatusCode)}, nil
-	}
-
-	// Try to parse as JSON to extract column names.
-	var parsed interface{}
-	var columns []string
-	if json.Unmarshal(body, &parsed) == nil {
-		// Extract column names from first record if it's an array of objects.
-		if arr, ok := parsed.([]interface{}); ok && len(arr) > 0 {
-			if obj, ok := arr[0].(map[string]interface{}); ok {
-				for k := range obj {
-					columns = append(columns, k)
-				}
-			}
-		}
-	}
-
-	result := map[string]interface{}{
-		"status_code": resp.StatusCode,
-		"data_sample": string(body),
-	}
-	if len(columns) > 0 {
-		result["columns"] = columns
-	}
-
-	return &Result{Success: true, Data: result}, nil
-}
-
 // ---------------------------------------------------------------------------
 // OAuth endpoint actions
 // ---------------------------------------------------------------------------

@@ -161,7 +161,7 @@ export async function renderSites(container) {
   async function showCreateModal() {
     const nameInput = h('input', { className: 'input', placeholder: 'My Website' });
     const domainInput = h('input', { className: 'input', placeholder: 'example.com (optional)' });
-    const directionInput = h('textarea', {
+    const descInput = h('textarea', {
       className: 'input',
       placeholder: 'Describe what this site should be about...',
       rows: '3',
@@ -188,8 +188,8 @@ export async function renderSites(container) {
         domainInput,
       ]),
       h('div', { className: 'form-group' }, [
-        h('label', {}, 'Direction'),
-        directionInput,
+        h('label', {}, 'Description'),
+        descInput,
       ]),
       h('div', { className: 'form-group' }, [
         h('label', {}, ['Provider', h('span', { className: 'required' }, ' *')]),
@@ -221,7 +221,7 @@ export async function renderSites(container) {
             const site = await post('/admin/api/sites', {
               name,
               domain: domainInput.value.trim() || null,
-              direction: directionInput.value.trim() || null,
+              description: descInput.value.trim() || null,
               llm_model_id: selectedModel.id,
             });
             toast.success('Site created');

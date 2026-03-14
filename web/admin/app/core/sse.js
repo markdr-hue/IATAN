@@ -91,17 +91,6 @@ export class SSEClient {
     if (this._handlers[eventType].includes(callback)) return;
     this._handlers[eventType].push(callback);
 
-    // If already connected, add the listener now
-    if (this._source && this._source.readyState !== EventSource.CLOSED) {
-      this._source.addEventListener(eventType, (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          callback(data);
-        } catch {
-          callback(e.data);
-        }
-      });
-    }
   }
 
   /**

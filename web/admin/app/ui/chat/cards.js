@@ -12,6 +12,7 @@ import { h } from '../../core/dom.js';
 import { post } from '../../core/http.js';
 import { icon } from '../icon.js';
 import * as toast from '../toast.js';
+import { buildQuestionInput } from '../question-input.js';
 
 // Navigation callback - set by site/index.js to control context panel
 let _switchPanel = null;
@@ -145,24 +146,7 @@ export function createToolCard(toolName, status, args, result) {
  * Create an inline question card with interactive option buttons.
  */
 export function createQuestionCard(questionData) {
-  const { id, question, options, urgency, context, fields } = questionData;
-
-  // Parse structured fields if present.
-  let parsedFields = [];
-  if (fields) {
-    try {
-      parsedFields = typeof fields === 'string' ? JSON.parse(fields) : fields;
-    } catch { /* ignore */ }
-  }
-  if (!Array.isArray(parsedFields)) parsedFields = [];
-
-  let parsedOptions = [];
-  if (options) {
-    try {
-      parsedOptions = typeof options === 'string' ? JSON.parse(options) : options;
-    } catch { /* ignore */ }
-  }
-  if (!Array.isArray(parsedOptions)) parsedOptions = [];
+  const { id, question, urgency, context, type, options } = questionData;
 
   const card = h('div', { className: 'chat-card chat-card--question' });
 
@@ -185,84 +169,48 @@ export function createQuestionCard(questionData) {
   card.appendChild(header);
   card.appendChild(body);
 
-  // Multi-field structured input form.
-  if (parsedFields.length > 0) {
-    const fieldsContainer = h('div', { className: 'chat-card__fields' });
-    const fieldInputs = {};
+  // For single-choice with no explicit type, allow immediate submit on click
+  const isSingleChoice = (type === 'single_choice' || !type) && options;
+  const { inputEl, getValue } = buildQuestionInput(questionData);
 
-    for (const field of parsedFields) {
-      const inputType = field.type === 'secret' ? 'password' : 'text';
-      const input = h('input', {
-        type: inputType,
-        className: 'input input--sm',
-        placeholder: field.label || field.name,
-        'data-field-name': field.name,
-      });
-      fieldInputs[field.name] = input;
-
-      const row = h('div', { className: 'chat-card__field-row' }, [
-        h('label', { className: 'chat-card__field-label' }, field.label || field.name),
-        input,
-      ]);
-      fieldsContainer.appendChild(row);
-    }
-
+  if (isSingleChoice) {
+    // Override: single-choice option buttons submit immediately on click
+    const btns = inputEl.querySelectorAll('.chat-card__option-btn');
+    btns.forEach(btn => {
+      btn.addEventListener('click', () => submitAnswer(id, btn.textContent, card));
+    });
+    card.appendChild(inputEl);
+  } else if (questionData.fields) {
+    // Fields: wrap with submit button
     const submitBtn = h('button', {
       className: 'btn btn--sm btn--primary',
-      onClick: () => {
-        const values = {};
-        let hasValue = false;
-        for (const field of parsedFields) {
-          const val = fieldInputs[field.name].value.trim();
-          if (val) hasValue = true;
-          values[field.name] = val;
-        }
-        if (hasValue) {
-          submitAnswer(id, JSON.stringify(values), card);
-        }
-      },
+      onClick: () => { if (getValue()) submitAnswer(id, getValue(), card); },
     }, 'Submit');
-
-    fieldsContainer.appendChild(h('div', { className: 'chat-card__field-actions' }, [submitBtn]));
-    card.appendChild(fieldsContainer);
+    card.appendChild(inputEl);
+    card.appendChild(h('div', { className: 'chat-card__field-actions' }, [submitBtn]));
+  } else if (type === 'multiple_choice') {
+    // Multiple choice: submit button
+    const submitBtn = h('button', {
+      className: 'btn btn--sm btn--primary',
+      onClick: () => { if (getValue()) submitAnswer(id, getValue(), card); },
+    }, 'Submit');
+    card.appendChild(inputEl);
+    card.appendChild(h('div', { className: 'chat-card__custom-answer' }, [submitBtn]));
   } else {
-    // Option buttons (original path)
-    const optionsContainer = h('div', { className: 'chat-card__options' });
-    for (const opt of parsedOptions) {
-      const label = typeof opt === 'string' ? opt : opt.label || opt;
-      const btn = h('button', {
-        className: 'btn btn--sm btn--ghost chat-card__option-btn',
-        onClick: () => submitAnswer(id, label, card),
-      }, label);
-      optionsContainer.appendChild(btn);
+    // Open text: input + send button + Enter key
+    const input = inputEl.querySelector('input');
+    if (input) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && getValue()) submitAnswer(id, getValue(), card);
+      });
     }
-
-    // Custom answer input
-    const customInput = h('input', {
-      type: 'text',
-      className: 'input input--sm',
-      placeholder: 'Or type a custom answer...',
-      onKeyDown: (e) => {
-        if (e.key === 'Enter' && customInput.value.trim()) {
-          submitAnswer(id, customInput.value.trim(), card);
-        }
-      },
-    });
-
-    const customRow = h('div', { className: 'chat-card__custom-answer' }, [
-      customInput,
+    card.appendChild(h('div', { className: 'chat-card__custom-answer' }, [
+      inputEl,
       h('button', {
         className: 'btn btn--sm btn--primary',
-        onClick: () => {
-          if (customInput.value.trim()) {
-            submitAnswer(id, customInput.value.trim(), card);
-          }
-        },
+        onClick: () => { if (getValue()) submitAnswer(id, getValue(), card); },
       }, 'Send'),
-    ]);
-
-    if (parsedOptions.length > 0) card.appendChild(optionsContainer);
-    card.appendChild(customRow);
+    ]));
   }
 
   return { element: card, questionId: id };
@@ -300,13 +248,165 @@ async function submitAnswer(questionId, answer, cardEl) {
   }
 }
 
+/**
+ * Create a grouped question card that collects answers for multiple questions
+ * and submits them all at once.
+ * Returns { element, addQuestion(data), questionIds }.
+ */
+export function createQuestionGroup(questions) {
+  const items = []; // { id, data, getValue, hasValue, numberEl }
+  const questionIds = new Set();
+
+  const card = h('div', { className: 'chat-card chat-card--question-group' });
+
+  // Header
+  const countBadge = h('span', { className: 'badge badge--question' }, `${questions.length} question${questions.length > 1 ? 's' : ''}`);
+  const progressEl = h('span', { className: 'question-group__progress' }, '0/' + questions.length + ' filled');
+
+  const header = h('div', { className: 'chat-card__header chat-card__header--question' }, [
+    h('span', { innerHTML: icon('help-circle'), className: 'chat-card__icon chat-card__icon--question' }),
+    h('span', { className: 'chat-card__label' }, 'Questions'),
+    countBadge,
+    progressEl,
+  ]);
+  card.appendChild(header);
+
+  const list = h('div', { className: 'question-group__list' });
+  card.appendChild(list);
+
+  // Submit footer
+  const submitProgress = h('span', { className: 'question-group__submit-progress' });
+  const submitBtn = h('button', {
+    className: 'btn btn--primary',
+    disabled: true,
+    onClick: () => submitAll(),
+  }, 'Submit All');
+
+  const footer = h('div', { className: 'question-group__submit' }, [submitProgress, submitBtn]);
+  card.appendChild(footer);
+
+  function updateProgress() {
+    const filled = items.filter(i => i.hasValue()).length;
+    const total = items.length;
+    progressEl.textContent = `${filled}/${total} filled`;
+    submitProgress.textContent = `${filled} of ${total} answered`;
+    submitBtn.disabled = filled < total;
+    // Update number badges
+    for (const item of items) {
+      item.numberEl.classList.toggle('question-group__number--filled', item.hasValue());
+    }
+  }
+
+  function addItem(qData) {
+    const { id, question, context: ctx } = qData;
+    if (questionIds.has(id)) return;
+    questionIds.add(id);
+
+    const idx = items.length + 1;
+    const numberEl = h('span', { className: 'question-group__number' }, String(idx));
+    const questionText = h('span', { className: 'question-group__question-text' }, question);
+
+    const itemEl = h('div', { className: 'question-group__item' });
+    itemEl.appendChild(h('div', { className: 'question-group__item-header' }, [numberEl, questionText]));
+
+    if (ctx) {
+      itemEl.appendChild(h('p', { className: 'text-sm text-secondary', style: { paddingLeft: '32px', marginBottom: '8px' } }, ctx));
+    }
+
+    const { inputEl, getValue, hasValue } = buildQuestionInput(qData, {
+      onInput: () => updateProgress(),
+      wrapClass: 'question-group__input',
+    });
+
+    itemEl.appendChild(inputEl);
+    list.appendChild(itemEl);
+
+    items.push({ id, data: qData, getValue, hasValue, numberEl });
+
+    // Update counts
+    countBadge.textContent = `${items.length} question${items.length > 1 ? 's' : ''}`;
+    updateProgress();
+  }
+
+  async function submitAll() {
+    // Collect answers
+    const answers = [];
+    for (const item of items) {
+      const val = item.getValue();
+      if (!val) return; // shouldn't happen, button is disabled
+      answers.push({ questionId: item.id, answer: val });
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Submitting...';
+
+    try {
+      for (const { questionId, answer } of answers) {
+        await post(`/admin/api/questions/${questionId}/answer`, { answer });
+      }
+
+      // Transform to answered state
+      card.className = 'chat-card chat-card--question-group chat-card--answered';
+      card.innerHTML = '';
+
+      card.appendChild(h('div', { className: 'chat-card__header' }, [
+        h('span', { innerHTML: icon('check'), className: 'chat-card__icon chat-card__icon--success' }),
+        h('span', { className: 'chat-card__label' }, `${answers.length} Questions Answered`),
+      ]));
+
+      const summary = h('div', { className: 'question-group__answered' });
+      for (let i = 0; i < items.length; i++) {
+        summary.appendChild(h('div', { className: 'question-group__answered-item' }, [
+          h('div', { className: 'question-group__answered-q' }, items[i].data.question),
+          h('div', { className: 'question-group__answered-a' }, answers[i].answer),
+        ]));
+      }
+      card.appendChild(summary);
+
+      card.appendChild(h('div', { className: 'chat-card__body' }, [
+        h('button', {
+          className: 'btn btn--ghost btn--sm',
+          onClick: () => switchPanel('questions'),
+        }, 'View all questions \u2192'),
+      ]));
+
+      // Notify for each answered question
+      for (const { questionId, answer } of answers) {
+        document.dispatchEvent(new CustomEvent('iatan:questionAnswered', {
+          detail: { questionId, answer },
+        }));
+      }
+
+      toast.success(`${answers.length} answers submitted`);
+    } catch (err) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Submit All';
+      toast.error('Failed to submit answers: ' + err.message);
+    }
+  }
+
+  // Add initial questions
+  for (const q of questions) {
+    addItem(q);
+  }
+
+  return {
+    element: card,
+    addQuestion: (data) => {
+      addItem(data);
+      card.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    },
+    get questionIds() { return questionIds; },
+  };
+}
+
 // --- Page card ---
 function createPageCard(toolName, status, args, result) {
   const path = args?.path || 'page';
   const pageTitle = args?.title || path;
   const actionLabel = getToolLabel(toolName, args);
 
-  const card = h('div', { className: 'chat-card chat-card--page' }, [
+  const card = h('div', { className: `chat-card chat-card--page${status === 'running' ? ' chat-card--running' : ''}` }, [
     h('div', { className: 'chat-card__header' }, [
       h('span', { innerHTML: icon('file-text'), className: 'chat-card__icon chat-card__icon--page' }),
       h('span', { className: 'chat-card__label' }, actionLabel),
@@ -335,7 +435,7 @@ function createAssetCard(toolName, status, args, result) {
   const contentType = args?.content_type || '';
   const actionLabel = getToolLabel(toolName, args);
 
-  const card = h('div', { className: 'chat-card chat-card--asset' }, [
+  const card = h('div', { className: `chat-card chat-card--asset${status === 'running' ? ' chat-card--running' : ''}` }, [
     h('div', { className: 'chat-card__header' }, [
       h('span', { innerHTML: icon('image'), className: 'chat-card__icon chat-card__icon--asset' }),
       h('span', { className: 'chat-card__label' }, actionLabel),
@@ -362,7 +462,7 @@ function createAssetCard(toolName, status, args, result) {
 function createTableCard(toolName, status, args, result) {
   const tableName = args?.table_name || args?.table || 'table';
 
-  const card = h('div', { className: 'chat-card chat-card--table' }, [
+  const card = h('div', { className: `chat-card chat-card--table${status === 'running' ? ' chat-card--running' : ''}` }, [
     h('div', { className: 'chat-card__header' }, [
       h('span', { innerHTML: icon('database'), className: 'chat-card__icon chat-card__icon--table' }),
       h('span', { className: 'chat-card__label' }, getToolLabel(toolName, args)),
@@ -388,14 +488,16 @@ function createTableCard(toolName, status, args, result) {
 function createEndpointCard(toolName, status, args, result) {
   const path = args?.path || 'endpoint';
   const tableName = args?.table_name || '';
-  const card = h('div', { className: 'chat-card chat-card--table' }, [
+  const method = args?.method ? args.method.toUpperCase() : '';
+  const card = h('div', { className: `chat-card chat-card--endpoint${status === 'running' ? ' chat-card--running' : ''}` }, [
     h('div', { className: 'chat-card__header' }, [
-      h('span', { innerHTML: icon('zap'), className: 'chat-card__icon chat-card__icon--table' }),
+      h('span', { innerHTML: icon('zap'), className: 'chat-card__icon chat-card__icon--endpoint' }),
       h('span', { className: 'chat-card__label' }, getToolLabel(toolName, args)),
       createStatusBadge(status),
     ]),
     h('div', { className: 'chat-card__body' }, [
-      h('strong', {}, `/api/${path}`),
+      method ? h('span', { className: 'badge badge--sm' }, method) : null,
+      h('code', { style: 'font-size: 0.85rem' }, `/api/${path}`),
       tableName ? h('span', { className: 'text-sm text-secondary ml-2' }, `\u2192 ${tableName}`) : null,
     ].filter(Boolean)),
   ]);
@@ -413,6 +515,11 @@ function bindStatusUpdater(card) {
       badge.className = newStatus === 'success' ? 'badge badge--success' : 'badge badge--danger';
       badge.textContent = newStatus === 'success' ? 'Done' : 'Error';
     }
+    // Remove running shimmer, add flash
+    card.classList.remove('chat-card--running');
+    const flashClass = newStatus === 'success' ? 'chat-card--success-flash' : 'chat-card--error-flash';
+    card.classList.add(flashClass);
+    setTimeout(() => card.classList.remove(flashClass), 700);
   };
 }
 

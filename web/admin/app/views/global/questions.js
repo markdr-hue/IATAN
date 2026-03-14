@@ -5,14 +5,15 @@
 
 /**
  * Questions management view.
+ * Groups pending questions per site with one submit button per group.
  */
 
 import { h, clear } from '../../core/dom.js';
 import { get, post } from '../../core/http.js';
 import { icon } from '../../ui/icon.js';
 import * as toast from '../../ui/toast.js';
-import * as modal from '../../ui/modal.js';
 import { emptyState } from '../../ui/helpers.js';
+import { createGroupedForm, createApprovalCard, createAnsweredCard } from '../../ui/question-cards.js';
 
 export async function renderQuestions(container) {
   clear(container);
@@ -43,70 +44,50 @@ export async function renderQuestions(container) {
       return;
     }
 
-    const cards = questions.map(q => {
-      const isApproval = q.type === 'approval';
+    // Group by site
+    const bySite = {};
+    for (const q of questions) {
+      (bySite[q.site_id] ??= []).push(q);
+    }
 
-      const statusBadge = q.status === 'pending'
-        ? h('span', { className: `badge ${isApproval ? 'badge--danger' : 'badge--warning'}` },
-            isApproval ? 'Approval Needed' : 'Pending')
-        : h('span', { className: 'badge badge--success' }, 'Answered');
+    for (const [siteId, siteQuestions] of Object.entries(bySite)) {
+      const pending = siteQuestions.filter(q => q.status === 'pending');
+      const answered = siteQuestions.filter(q => q.status !== 'pending');
+      const pendingRegular = pending.filter(q => q.type !== 'approval');
+      const pendingApproval = pending.filter(q => q.type === 'approval');
 
-      const actions = [];
-      if (q.status === 'pending') {
-        if (isApproval) {
-          actions.push(h('button', {
-            className: 'btn btn--success btn--sm',
-            onClick: () => submitAnswer(q.id, 'Approve'),
-          }, 'Approve'));
-          actions.push(h('button', {
-            className: 'btn btn--danger btn--sm',
-            onClick: () => submitAnswer(q.id, 'Deny'),
-          }, 'Deny'));
-        } else {
-          actions.push(h('button', {
-            className: 'btn btn--primary btn--sm',
-            onClick: () => showAnswerModal(q),
-          }, [
-            h('span', { innerHTML: icon('chat') }),
-            'Answer',
-          ]));
-        }
+      // Site section header
+      listContainer.appendChild(h('div', { className: 'flex items-center gap-2 mb-3 mt-4' }, [
+        h('span', { innerHTML: icon('globe') }),
+        h('h4', {}, `Site #${siteId}`),
+        pending.length > 0
+          ? h('span', { className: 'badge badge--warning' }, `${pending.length} pending`)
+          : null,
+      ].filter(Boolean)));
+
+      if (pendingRegular.length > 0) {
+        listContainer.appendChild(createGroupedForm(pendingRegular, {
+          onSubmit: async (answers) => {
+            for (const { questionId, answer } of answers) {
+              await post(`/admin/api/questions/${questionId}/answer`, { answer });
+            }
+            toast.success(`${answers.length} answers submitted`);
+            loadQuestions();
+          },
+        }));
       }
 
-      const children = [
-        h('div', { className: 'card__header' }, [
-          h('div', { className: 'flex items-center gap-3' }, [
-            h('span', { innerHTML: icon(isApproval ? 'alert-circle' : 'help-circle') }),
-            h('div', {}, [
-              h('h4', { className: 'card__title' }, `Site #${q.site_id}`),
-              h('span', { className: 'text-xs text-secondary' }, new Date(q.created_at).toLocaleString()),
-            ]),
-          ]),
-          statusBadge,
-        ]),
-        h('div', { className: 'mt-3' }, [
-          h('p', {}, q.question),
-        ]),
-      ];
-
-      if (q.answer) {
-        children.push(h('div', { className: 'mt-3', style: { opacity: '0.7' } }, [
-          h('strong', {}, 'Answer: '),
-          h('span', {}, q.answer),
-        ]));
+      for (const q of pendingApproval) {
+        listContainer.appendChild(createApprovalCard(q, { onRespond: submitSingle }));
       }
 
-      if (actions.length > 0) {
-        children.push(h('div', { className: 'flex items-center gap-2 mt-4' }, actions));
+      for (const q of answered) {
+        listContainer.appendChild(createAnsweredCard(q));
       }
-
-      return h('div', { className: `card mb-4${isApproval && q.status === 'pending' ? ' card--approval' : ''}` }, children);
-    });
-
-    cards.forEach(c => listContainer.appendChild(c));
+    }
   }
 
-  async function submitAnswer(questionId, answer) {
+  async function submitSingle(questionId, answer) {
     try {
       await post(`/admin/api/questions/${questionId}/answer`, { answer });
       toast.success(`Response submitted: ${answer}`);
@@ -114,107 +95,6 @@ export async function renderQuestions(container) {
     } catch (err) {
       toast.error(err.message);
     }
-  }
-
-  function showAnswerModal(question) {
-    const isSecret = question.type === 'secret';
-
-    // Parse structured fields if present.
-    let parsedFields = [];
-    if (question.fields) {
-      try {
-        parsedFields = typeof question.fields === 'string' ? JSON.parse(question.fields) : question.fields;
-      } catch { /* ignore */ }
-    }
-    if (!Array.isArray(parsedFields)) parsedFields = [];
-
-    const contentChildren = [
-      h('div', { className: 'form-group' }, [
-        h('label', {}, 'Question'),
-        h('p', { style: { padding: '8px 0' } }, question.question),
-      ]),
-    ];
-
-    let getAnswer;
-
-    if (parsedFields.length > 0) {
-      // Multi-field structured input form.
-      const fieldInputs = {};
-      for (const field of parsedFields) {
-        const inputType = field.type === 'secret' ? 'password' : 'text';
-        const input = h('input', {
-          type: inputType,
-          className: 'input',
-          placeholder: field.label || field.name,
-        });
-        fieldInputs[field.name] = input;
-        contentChildren.push(h('div', { className: 'form-group' }, [
-          h('label', {}, field.label || field.name),
-          field.type === 'secret' ? h('p', {
-            className: 'text-sm text-secondary',
-            style: { opacity: 0.7, marginBottom: '4px' },
-          }, 'This value will be encrypted.') : null,
-          input,
-        ].filter(Boolean)));
-      }
-      getAnswer = () => {
-        const values = {};
-        let hasValue = false;
-        for (const field of parsedFields) {
-          const val = fieldInputs[field.name].value.trim();
-          if (val) hasValue = true;
-          values[field.name] = val;
-        }
-        return hasValue ? JSON.stringify(values) : '';
-      };
-    } else {
-      // Single input.
-      const answerInput = isSecret
-        ? h('input', {
-            type: 'password',
-            className: 'input',
-            placeholder: 'Enter secret value...',
-          })
-        : h('textarea', {
-            className: 'input',
-            rows: 4,
-            placeholder: 'Type your answer...',
-          });
-
-      if (isSecret) {
-        contentChildren.push(h('p', {
-          className: 'text-sm text-secondary mb-3',
-          style: { opacity: 0.7 },
-        }, `This value will be encrypted and stored as secret '${question.secret_name}'.`));
-      }
-      contentChildren.push(h('div', { className: 'form-group' }, [
-        h('label', {}, isSecret ? 'Secret Value' : 'Your Answer'),
-        answerInput,
-      ]));
-      getAnswer = () => answerInput.value.trim();
-    }
-
-    const content = h('div', {}, contentChildren);
-
-    modal.show('Answer Question', content, [
-      { label: 'Cancel', onClick: () => {} },
-      {
-        label: 'Submit Answer',
-        className: 'btn btn--primary',
-        onClick: async () => {
-          const answer = getAnswer();
-          if (!answer) return false;
-          try {
-            await post(`/admin/api/questions/${question.id}/answer`, { answer });
-            toast.success('Answer submitted');
-            loadQuestions();
-          } catch (err) {
-            toast.error(err.message);
-            return false;
-          }
-        },
-      },
-    ]);
   }
 
   loadQuestions();

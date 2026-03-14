@@ -24,11 +24,11 @@ export function renderSite(container, setupData, onNext) {
     value: setupData.siteDomain || '',
   });
 
-  const directionInput = h('textarea', {
+  const descInput = h('textarea', {
     className: 'input',
     placeholder: 'Tell me about your site \u2014 what it\u2019s for, how it should look, what features you need...',
     rows: '5',
-    value: setupData.siteDirection || '',
+    value: setupData.siteDescription || '',
   });
 
   function submit() {
@@ -40,7 +40,7 @@ export function renderSite(container, setupData, onNext) {
     }
     setupData.siteName = name;
     setupData.siteDomain = domainInput.value.trim();
-    setupData.siteDirection = directionInput.value.trim();
+    setupData.siteDescription = descInput.value.trim();
     onNext();
   }
 
@@ -54,7 +54,7 @@ export function renderSite(container, setupData, onNext) {
   nameInput.addEventListener('keydown', onKey);
   domainInput.addEventListener('keydown', onKey);
   // Textarea: Ctrl/Cmd+Enter to submit (regular Enter adds newline)
-  directionInput.addEventListener('keydown', (e) => {
+  descInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       submit();
@@ -82,7 +82,7 @@ export function renderSite(container, setupData, onNext) {
     ]),
     h('div', { className: 'form-group' }, [
       h('label', {}, 'Description'),
-      directionInput,
+      descInput,
       h('p', { className: 'form-hint' }, 'Describe it however you want, like you\u2019re telling a friend.'),
     ]),
     h('div', { className: 'setup-actions setup-actions--center' }, [

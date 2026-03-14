@@ -29,13 +29,6 @@ export async function renderSiteSettings(container, siteId, site) {
     placeholder: 'Brief description of this site',
     disabled: readOnly,
   });
-  const directionInput = h('textarea', {
-    className: 'input',
-    rows: '4',
-    value: site.direction || '',
-    placeholder: 'Describe what the AI should build and how it should behave...',
-    disabled: readOnly,
-  });
 
   // Model picker
   let providers = [];
@@ -63,7 +56,6 @@ export async function renderSiteSettings(container, siteId, site) {
           name: nameInput.value.trim(),
           domain: domainInput.value.trim() || null,
           description: descInput.value.trim() || null,
-          direction: directionInput.value.trim() || null,
           llm_model_id: selectedModel.id,
         });
         toast.success('Site settings saved');
@@ -97,11 +89,6 @@ export async function renderSiteSettings(container, siteId, site) {
       h('div', { className: 'form-group' }, [
         h('label', {}, 'Description'),
         descInput,
-      ]),
-      h('div', { className: 'form-group' }, [
-        h('label', {}, 'AI Direction'),
-        directionInput,
-        h('p', { className: 'form-hint' }, 'Instructions for how the AI should build and manage this site'),
       ]),
       h('div', { className: 'form-group' }, [
         h('label', {}, ['Provider', h('span', { className: 'required' }, ' *')]),

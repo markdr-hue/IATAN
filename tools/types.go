@@ -6,6 +6,7 @@
 package tools
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 
@@ -23,9 +24,10 @@ type Tool interface {
 
 // ToolContext carries dependencies into tool execution.
 type ToolContext struct {
-	DB        *sql.DB // site-scoped database
-	GlobalDB  *sql.DB // global database (users, providers, sites)
-	SiteID    int     // kept for file paths and logging, not for queries
+	Ctx       context.Context // cancellation/timeout context from the pipeline
+	DB        *sql.DB         // site-scoped database
+	GlobalDB  *sql.DB         // global database (users, providers, sites)
+	SiteID    int             // kept for file paths and logging, not for queries
 	Logger    *slog.Logger
 	Bus       *events.Bus
 	Encryptor *security.Encryptor
@@ -48,6 +50,23 @@ type Summarizer interface {
 // the default result truncation limit (4KB).
 type ResultSizer interface {
 	MaxResultSize() int
+}
+
+// Documented is an optional interface tools can implement to provide
+// rich behavioral documentation for LLM prompts. Guide() returns
+// markdown text describing when/why/how to use the tool, response
+// shapes, protocols, and behavioral contracts.
+type Documented interface {
+	Guide() string
+}
+
+// Context returns the tool's context, falling back to context.Background()
+// if none was set (e.g., in tests or direct calls).
+func (tc *ToolContext) Context() context.Context {
+	if tc.Ctx != nil {
+		return tc.Ctx
+	}
+	return context.Background()
 }
 
 // RequireAction extracts and validates the "action" arg. Returns the action

@@ -11,6 +11,7 @@ import { h, clear } from '../core/dom.js';
 import { icon } from './icon.js';
 
 let currentOverlay = null;
+let currentKeyHandler = null;
 
 /**
  * Show a modal dialog.
@@ -68,13 +69,10 @@ export function show(title, content, actions = []) {
   });
 
   // ESC to close
-  const onKeydown = (e) => {
-    if (e.key === 'Escape') {
-      close();
-      document.removeEventListener('keydown', onKeydown);
-    }
+  currentKeyHandler = (e) => {
+    if (e.key === 'Escape') close();
   };
-  document.addEventListener('keydown', onKeydown);
+  document.addEventListener('keydown', currentKeyHandler);
 
   return close;
 }
@@ -83,6 +81,10 @@ export function show(title, content, actions = []) {
  * Close the current modal.
  */
 export function close() {
+  if (currentKeyHandler) {
+    document.removeEventListener('keydown', currentKeyHandler);
+    currentKeyHandler = null;
+  }
   if (currentOverlay) {
     currentOverlay.classList.remove('visible');
     const overlay = currentOverlay;

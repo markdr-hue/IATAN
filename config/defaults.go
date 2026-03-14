@@ -13,5 +13,5 @@ const (
 	DefaultFirstRunPath   = "./firstrun.json"
 	DefaultRateLimitRate  = 100 // Requests per second per IP (public endpoints)
 	DefaultRateLimitBurst = 200 // Burst capacity per IP (public endpoints)
-	DefaultLLMTimeoutSec  = 180 // 3 minutes default for LLM HTTP calls
+	DefaultLLMTimeoutSec  = 480 // 8 minutes default for LLM HTTP calls (must exceed brain's 7-min context timeout)
 )

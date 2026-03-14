@@ -16,7 +16,6 @@ type Site struct {
 	Name        string    `json:"name"`
 	Domain      *string   `json:"domain"`
 	Description *string   `json:"description"`
-	Direction   *string   `json:"direction"`
 	LLMModelID  int       `json:"llm_model_id"`
 	Status      string    `json:"status"`
 	Mode        string    `json:"mode"`
@@ -25,16 +24,16 @@ type Site struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-const siteColumns = "id, name, domain, description, direction, llm_model_id, status, mode, config, created_at, updated_at"
+const siteColumns = "id, name, domain, description, llm_model_id, status, mode, config, created_at, updated_at"
 
 func scanSite(s *Site, row interface{ Scan(...interface{}) error }) error {
-	return row.Scan(&s.ID, &s.Name, &s.Domain, &s.Description, &s.Direction, &s.LLMModelID, &s.Status, &s.Mode, &s.Config, &s.CreatedAt, &s.UpdatedAt)
+	return row.Scan(&s.ID, &s.Name, &s.Domain, &s.Description, &s.LLMModelID, &s.Status, &s.Mode, &s.Config, &s.CreatedAt, &s.UpdatedAt)
 }
 
-func CreateSite(db *sql.DB, name string, domain, description, direction *string, llmModelID int) (*Site, error) {
+func CreateSite(db *sql.DB, name string, domain, description *string, llmModelID int) (*Site, error) {
 	result, err := db.Exec(
-		"INSERT INTO sites (name, domain, description, direction, llm_model_id, status, mode) VALUES (?, ?, ?, ?, ?, 'active', 'building')",
-		name, domain, description, direction, llmModelID,
+		"INSERT INTO sites (name, domain, description, llm_model_id, status, mode) VALUES (?, ?, ?, ?, 'active', 'building')",
+		name, domain, description, llmModelID,
 	)
 	if err != nil {
 		return nil, err
@@ -122,10 +121,10 @@ func ListActiveSites(db *sql.DB) ([]Site, error) {
 	return sites, nil
 }
 
-func UpdateSite(db *sql.DB, id int, name string, domain, description, direction *string, llmModelID int) error {
+func UpdateSite(db *sql.DB, id int, name string, domain, description *string, llmModelID int) error {
 	_, err := db.Exec(
-		"UPDATE sites SET name = ?, domain = ?, description = ?, direction = ?, llm_model_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-		name, domain, description, direction, llmModelID, id,
+		"UPDATE sites SET name = ?, domain = ?, description = ?, llm_model_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		name, domain, description, llmModelID, id,
 	)
 	return err
 }

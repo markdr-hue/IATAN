@@ -20,7 +20,14 @@ type CommunicationTool struct{}
 
 func (t *CommunicationTool) Name() string { return "manage_communication" }
 func (t *CommunicationTool) Description() string {
-	return "Communicate with the site owner when you need information you cannot determine on your own. Actions: ask (ask the owner a question — use for missing credentials, design preferences, or ambiguous requirements), check (check if the owner has answered your questions). Do NOT ask questions you can answer yourself."
+	return "Ask the site owner a question or check for answers."
+}
+func (t *CommunicationTool) Guide() string {
+	return `### Owner Communication (manage_communication)
+- ask: send a question to the site owner. Supports type="secret" with secret_name for API keys (auto-encrypted on answer).
+- fields: structured multi-input questions via JSON array of {name, label, type, secret_name}.
+- check: poll for answers. Omit question_id to check all pending questions.
+`
 }
 func (t *CommunicationTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{

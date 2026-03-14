@@ -10,13 +10,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
-	js_parser "github.com/dop251/goja/parser"
 )
 
 const maxFileSize = 10 << 20    // 10 MB
@@ -200,7 +202,17 @@ type FilesTool struct{}
 
 func (t *FilesTool) Name() string { return "manage_files" }
 func (t *FilesTool) Description() string {
-	return `Manage site files. Actions: save (create/update file), get (read file), list (list all), delete (remove file), rename, history (view versions), rollback (restore version). Text files (CSS/JS/SVG) are automatically versioned on save. Use storage="assets" for CSS/JS/images (served at /assets/), storage="files" for downloads (served at /files/).`
+	return "Save, get, list, delete, rename, or fetch files and assets."
+}
+
+func (t *FilesTool) Guide() string {
+	return `### Asset System (manage_files)
+- Saves any text file: .css, .js, .svg, .html, .json — use content parameter.
+- scope="global": CSS/JS auto-injected on ALL pages. scope="page": only when listed in page assets array.
+- Load order: Global CSS -> Page CSS -> Layout -> [content] -> Global JS -> Page JS.
+- SVG files: save inline SVG markup as .svg files. Reference as <img src="/assets/icon.svg"> or embed inline.
+- patch action: apply targeted search/replace without rewriting the whole file. Use patches=[{"search":"old","replace":"new"}].
+- fetch_image action downloads images from URLs and saves locally (JPEG, PNG, GIF, WebP, SVG, ICO, AVIF).`
 }
 
 func (t *FilesTool) Parameters() map[string]interface{} {
@@ -210,8 +222,9 @@ func (t *FilesTool) Parameters() map[string]interface{} {
 			"action": map[string]interface{}{
 				"type":        "string",
 				"description": "Action to perform",
-				"enum":        []string{"save", "get", "list", "delete", "rename", "history", "rollback"},
+				"enum":        []string{"save", "patch", "get", "list", "delete", "rename", "history", "rollback", "fetch_image"},
 			},
+			"url": map[string]interface{}{"type": "string", "description": "URL to download image from (for fetch_image action). Supports JPEG, PNG, GIF, WebP, SVG, ICO, AVIF."},
 			"storage":      storageParam,
 			"filename":     map[string]interface{}{"type": "string", "description": "Path (e.g. styles.css, css/main.css)"},
 			"content_type": map[string]interface{}{"type": "string", "description": "MIME type. Auto-detected if omitted."},
@@ -223,6 +236,7 @@ func (t *FilesTool) Parameters() map[string]interface{} {
 			"new_filename": map[string]interface{}{"type": "string", "description": "New filename (rename)"},
 			"version":      map[string]interface{}{"type": "integer", "description": "Version number to restore (rollback)"},
 			"limit":        map[string]interface{}{"type": "number", "description": "Max entries to return (for history action, default: 10)"},
+			"patches":      map[string]interface{}{"type": "string", "description": `JSON array of search/replace pairs for patch action: [{"search":"old text","replace":"new text"}]. Only for text files (CSS, JS, etc.).`},
 		},
 		"required": []string{"action"},
 	}
@@ -230,14 +244,22 @@ func (t *FilesTool) Parameters() map[string]interface{} {
 
 func (t *FilesTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
 	return DispatchAction(ctx, args, map[string]ActionHandler{
-		"save":     t.executeSave,
-		"get":      t.executeGet,
-		"list":     t.executeList,
-		"delete":   t.executeDelete,
-		"rename":   t.executeRename,
-		"history":  t.executeHistory,
-		"rollback": t.executeRollback,
+		"save":        t.executeSave,
+		"patch":       t.executePatch,
+		"get":         t.executeGet,
+		"list":        t.executeList,
+		"delete":      t.executeDelete,
+		"rename":      t.executeRename,
+		"history":     t.executeHistory,
+		"rollback":    t.executeRollback,
+		"fetch_image": t.executeFetchImage,
 	}, func(a map[string]interface{}) string {
+		if _, has := a["url"]; has {
+			return "fetch_image"
+		}
+		if _, has := a["patches"]; has {
+			return "patch"
+		}
 		if _, has := a["version"]; has {
 			return "rollback"
 		}
@@ -300,10 +322,13 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 		contentType = inferred
 	}
 
+	// Use context-aware DB calls so the pipeline's tool timeout can cancel stuck writes.
+	dbCtx := ctx.Context()
+
 	// Before overwrite: capture existing text file into version history.
 	if isTextContentType(contentType) {
 		var oldStoragePath sql.NullString
-		qErr := ctx.DB.QueryRow(
+		qErr := ctx.DB.QueryRowContext(dbCtx,
 			fmt.Sprintf("SELECT storage_path FROM %s WHERE filename = ?", cfg.table),
 			filename,
 		).Scan(&oldStoragePath)
@@ -315,18 +340,18 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 			}
 			if oldData, readErr := os.ReadFile(oldPath); readErr == nil {
 				var maxVer int
-				ctx.DB.QueryRow(
+				ctx.DB.QueryRowContext(dbCtx,
 					"SELECT COALESCE(MAX(version_number), 0) FROM file_versions WHERE storage_type = ? AND filename = ?",
 					cfg.table, filename,
 				).Scan(&maxVer)
-				ctx.DB.Exec(
+				ctx.DB.ExecContext(dbCtx,
 					`INSERT INTO file_versions (storage_type, filename, content, content_type, size, version_number, changed_by)
 					 VALUES (?, ?, ?, ?, ?, ?, 'brain')`,
 					cfg.table, filename, string(oldData), contentType, len(oldData), maxVer+1,
 				)
 				// Prune: keep only last 10 versions.
 				if maxVer+1 > maxFileVersions {
-					ctx.DB.Exec(
+					ctx.DB.ExecContext(dbCtx,
 						"DELETE FROM file_versions WHERE storage_type = ? AND filename = ? AND version_number <= ?",
 						cfg.table, filename, maxVer+1-maxFileVersions,
 					)
@@ -341,7 +366,7 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 	}
 
 	if cfg.table == "assets" {
-		_, err = ctx.DB.Exec(
+		_, err = ctx.DB.ExecContext(dbCtx,
 			`INSERT INTO assets (filename, content_type, size, storage_path, alt_text, scope)
 			 VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(filename) DO UPDATE SET
@@ -353,7 +378,7 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 			filename, contentType, len(fileData), storagePath, desc, scope,
 		)
 	} else {
-		_, err = ctx.DB.Exec(
+		_, err = ctx.DB.ExecContext(dbCtx,
 			fmt.Sprintf(
 				`INSERT INTO %s (filename, content_type, size, storage_path, %s)
 				 VALUES (?, ?, ?, ?, ?)
@@ -381,18 +406,6 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 		resultData["scope"] = scope
 	}
 
-	// Post-save validation for JS files — syntax errors block the save.
-	if strings.HasSuffix(strings.ToLower(filename), ".js") {
-		if jsErrors := validateJSContent(filename, fileData); len(jsErrors) > 0 {
-			resultData["js_errors"] = jsErrors
-			return &Result{
-				Success: false,
-				Error:   "JS syntax errors — fix and re-save: " + jsErrors[0],
-				Data:    resultData,
-			}, nil
-		}
-	}
-
 	// Post-save validation and summary for CSS files.
 	if strings.HasSuffix(strings.ToLower(filename), ".css") {
 		if warnings := validateCSSContent(filename, fileData); len(warnings) > 0 {
@@ -400,6 +413,138 @@ func (t *FilesTool) executeSave(ctx *ToolContext, args map[string]interface{}) (
 		}
 		// Extract CSS classes and variables so the AI remembers them for page creation.
 		if summary := extractCSSSummary(string(fileData)); summary != "" {
+			resultData["css_classes"] = summary
+		}
+	}
+
+	return &Result{Success: true, Data: resultData}, nil
+}
+
+// ---------------------------------------------------------------------------
+// patch — apply search/replace pairs to a text file without full rewrite
+// ---------------------------------------------------------------------------
+
+func (t *FilesTool) executePatch(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	cfg, err := getStorageConfig(args)
+	if err != nil {
+		return &Result{Success: false, Error: err.Error()}, nil
+	}
+
+	filename, _ := args["filename"].(string)
+	if filename == "" {
+		return &Result{Success: false, Error: "filename is required"}, nil
+	}
+	filename = sanitizeFilename(filename, cfg.dirName)
+	if filename == "" {
+		return &Result{Success: false, Error: "invalid filename"}, nil
+	}
+
+	patchesStr, _ := args["patches"].(string)
+	if patchesStr == "" {
+		return &Result{Success: false, Error: "patches is required (JSON array of {search, replace} pairs)"}, nil
+	}
+
+	var patches []struct {
+		Search  string `json:"search"`
+		Replace string `json:"replace"`
+	}
+	if err := json.Unmarshal([]byte(patchesStr), &patches); err != nil {
+		return &Result{Success: false, Error: "patches must be a JSON array: " + err.Error()}, nil
+	}
+	if len(patches) == 0 {
+		return &Result{Success: false, Error: "patches array is empty"}, nil
+	}
+
+	// Read current file from disk.
+	var storagePath string
+	var contentType sql.NullString
+	err = ctx.DB.QueryRow(
+		fmt.Sprintf("SELECT storage_path, content_type FROM %s WHERE filename = ?", cfg.table),
+		filename,
+	).Scan(&storagePath, &contentType)
+	if err == sql.ErrNoRows {
+		return &Result{Success: false, Error: "file not found"}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying %s: %w", cfg.table, err)
+	}
+
+	ct := contentType.String
+	if !isTextContentType(ct) {
+		return &Result{Success: false, Error: fmt.Sprintf("patch only works on text files, got %s", ct)}, nil
+	}
+
+	if storagePath == "" {
+		storagePath = filepath.Join("data", "sites", fmt.Sprintf("%d", ctx.SiteID), cfg.dirName, filepath.FromSlash(filename))
+	}
+	fileData, err := os.ReadFile(storagePath)
+	if err != nil {
+		return &Result{Success: false, Error: "file not found on disk"}, nil
+	}
+
+	// Save version history before modifying.
+	dbCtx := ctx.Context()
+	var maxVer int
+	ctx.DB.QueryRowContext(dbCtx,
+		"SELECT COALESCE(MAX(version_number), 0) FROM file_versions WHERE storage_type = ? AND filename = ?",
+		cfg.table, filename,
+	).Scan(&maxVer)
+	ctx.DB.ExecContext(dbCtx,
+		`INSERT INTO file_versions (storage_type, filename, content, content_type, size, version_number, changed_by)
+		 VALUES (?, ?, ?, ?, ?, ?, 'brain')`,
+		cfg.table, filename, string(fileData), ct, len(fileData), maxVer+1,
+	)
+
+	// Apply patches sequentially.
+	modified := string(fileData)
+	var applied, notFound []string
+	for _, p := range patches {
+		if p.Search == "" {
+			continue
+		}
+		if !strings.Contains(modified, p.Search) {
+			notFound = append(notFound, p.Search)
+			continue
+		}
+		modified = strings.ReplaceAll(modified, p.Search, p.Replace)
+		label := p.Search
+		if len(label) > 60 {
+			label = label[:60] + "..."
+		}
+		applied = append(applied, label)
+	}
+
+	if len(applied) == 0 && len(notFound) > 0 {
+		return &Result{Success: false, Error: "no patches matched", Data: map[string]interface{}{"not_found": notFound}}, nil
+	}
+
+	// Write modified content to disk.
+	newData := []byte(modified)
+	if err := os.WriteFile(storagePath, newData, 0o644); err != nil {
+		return nil, fmt.Errorf("writing patched file: %w", err)
+	}
+
+	// Update size in DB.
+	ctx.DB.ExecContext(dbCtx,
+		fmt.Sprintf("UPDATE %s SET size = ? WHERE filename = ?", cfg.table),
+		len(newData), filename,
+	)
+
+	resultData := map[string]interface{}{
+		"filename": filename,
+		"applied":  len(applied),
+		"size":     len(newData),
+	}
+	if len(notFound) > 0 {
+		resultData["not_found"] = notFound
+	}
+
+	// Post-patch validation for CSS files.
+	if strings.HasSuffix(strings.ToLower(filename), ".css") {
+		if warnings := validateCSSContent(filename, newData); len(warnings) > 0 {
+			resultData["warnings"] = warnings
+		}
+		if summary := extractCSSSummary(modified); summary != "" {
 			resultData["css_classes"] = summary
 		}
 	}
@@ -761,33 +906,178 @@ func (t *FilesTool) executeRollback(ctx *ToolContext, args map[string]interface{
 }
 
 // ---------------------------------------------------------------------------
-// JS syntax validation
+// fetch_image — download image from URL and save as asset
 // ---------------------------------------------------------------------------
 
-// validateJSContent parses a JS file and returns syntax error warnings.
-// Uses goja's ES5.1 parser to catch real syntax errors (unexpected tokens,
-// unclosed braces, malformed expressions). Returns at most 3 warnings.
-func validateJSContent(filename string, content []byte) []string {
-	_, err := js_parser.ParseFile(nil, filename, string(content), 0)
-	if err == nil {
-		return nil
+// allowedImageTypes maps Content-Type prefixes to file extensions.
+var allowedImageTypes = map[string]string{
+	"image/jpeg":    ".jpg",
+	"image/png":     ".png",
+	"image/gif":     ".gif",
+	"image/webp":    ".webp",
+	"image/svg+xml": ".svg",
+	"image/x-icon":  ".ico",
+	"image/avif":    ".avif",
+}
+
+const maxImageSize = 5 << 20 // 5 MB
+
+func (t *FilesTool) executeFetchImage(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	rawURL, _ := args["url"].(string)
+	if rawURL == "" {
+		return &Result{Success: false, Error: "url is required"}, nil
 	}
 
-	// goja returns a parser.ErrorList for multiple errors.
-	if errList, ok := err.(js_parser.ErrorList); ok {
-		var warnings []string
-		for i, e := range errList {
-			if i >= 3 {
-				warnings = append(warnings, fmt.Sprintf("... and %d more syntax errors", len(errList)-3))
-				break
+	// SSRF protection — reuse the same validation as make_http_request.
+	if err := validateExternalURL(rawURL); err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("blocked URL: %v", err)}, nil
+	}
+
+	cfg, err := getStorageConfig(args)
+	if err != nil {
+		return &Result{Success: false, Error: err.Error()}, nil
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
 			}
-			warnings = append(warnings, fmt.Sprintf("JS syntax error at %s: %s", e.Position, e.Message))
-		}
-		return warnings
+			return nil
+		},
 	}
 
-	// Single error fallback.
-	return []string{fmt.Sprintf("JS syntax error: %s", err.Error())}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("fetching image: %v", err)}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return &Result{Success: false, Error: fmt.Sprintf("HTTP %d from image URL", resp.StatusCode)}, nil
+	}
+
+	// Validate Content-Type.
+	ct := resp.Header.Get("Content-Type")
+	// Normalize: "image/jpeg; charset=utf-8" → "image/jpeg"
+	if idx := strings.Index(ct, ";"); idx != -1 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	ct = strings.ToLower(ct)
+
+	ext, ok := allowedImageTypes[ct]
+	if !ok {
+		return &Result{Success: false, Error: fmt.Sprintf("unsupported image type %q — supported: JPEG, PNG, GIF, WebP, SVG, ICO, AVIF", ct)}, nil
+	}
+
+	// Read body with size limit.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageSize+1))
+	if err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("reading image: %v", err)}, nil
+	}
+	if len(data) > maxImageSize {
+		return &Result{Success: false, Error: fmt.Sprintf("image too large (>%d MB)", maxImageSize>>20)}, nil
+	}
+
+	// Determine filename.
+	filename, _ := args["filename"].(string)
+	if filename == "" {
+		filename = filenameFromURL(rawURL, ext)
+	}
+	filename = sanitizeFilename(filename, cfg.dirName)
+	if filename == "" {
+		filename = "image" + ext
+	}
+	// Ensure correct extension if not already present.
+	if filepath.Ext(filename) == "" {
+		filename += ext
+	}
+
+	// Write to disk.
+	storagePath, err := writeFileToDisk(ctx.SiteID, cfg.dirName, filename, data)
+	if err != nil {
+		return nil, fmt.Errorf("saving image: %w", err)
+	}
+
+	// Upsert into DB.
+	desc, _ := args["description"].(string)
+	scope, _ := args["scope"].(string)
+	if scope == "" {
+		scope = "global"
+	}
+
+	if cfg.table == "assets" {
+		_, err = ctx.DB.Exec(
+			`INSERT INTO assets (filename, content_type, size, storage_path, alt_text, scope)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(filename) DO UPDATE SET
+			   content_type = excluded.content_type,
+			   size = excluded.size,
+			   storage_path = excluded.storage_path,
+			   alt_text = excluded.alt_text,
+			   scope = excluded.scope`,
+			filename, ct, len(data), storagePath, desc, scope,
+		)
+	} else {
+		_, err = ctx.DB.Exec(
+			fmt.Sprintf(
+				`INSERT INTO %s (filename, content_type, size, storage_path, %s)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(filename) DO UPDATE SET
+				   content_type = excluded.content_type,
+				   size = excluded.size,
+				   storage_path = excluded.storage_path,
+				   %s = excluded.%s`,
+				cfg.table, cfg.metaCol, cfg.metaCol, cfg.metaCol,
+			),
+			filename, ct, len(data), storagePath, desc,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("saving image record: %w", err)
+	}
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"filename":     filename,
+		"content_type": ct,
+		"size":         len(data),
+		"url":          cfg.urlBase + filename,
+	}}, nil
+}
+
+// filenameFromURL extracts a clean filename from a URL path, with fallback.
+func filenameFromURL(rawURL, fallbackExt string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "image" + fallbackExt
+	}
+	base := filepath.Base(u.Path)
+	// Strip query params that might have leaked into the base.
+	if idx := strings.Index(base, "?"); idx != -1 {
+		base = base[:idx]
+	}
+	// If the base is empty, just a slash, or has no useful name, use fallback.
+	if base == "" || base == "." || base == "/" {
+		return "image" + fallbackExt
+	}
+	// Sanitize: keep only alphanumeric, dashes, underscores, dots.
+	var clean strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			clean.WriteRune(r)
+		}
+	}
+	result := clean.String()
+	if result == "" {
+		return "image" + fallbackExt
+	}
+	// Truncate very long filenames (Unsplash IDs can be long).
+	if len(result) > 80 {
+		ext := filepath.Ext(result)
+		result = result[:80-len(ext)] + ext
+	}
+	return result
 }
 
 // validateCSSContent performs basic CSS syntax validation:
@@ -857,50 +1147,101 @@ func validateCSSContent(filename string, content []byte) []string {
 	return warnings
 }
 
-// cssClassRe matches class selectors like .classname at the start of a rule.
-var cssClassRe = regexp.MustCompile(`(?m)^[^{}]*?\.([\w-]+)`)
+// cssClassRe matches class selectors like .classname at the start of a rule, ignoring pseudo-selectors.
+var cssClassRe = regexp.MustCompile(`(?m)^[^{}]*?\.([a-zA-Z0-9_-]+)(?:[:\s]|$)`)
 
 // cssVarRe matches CSS custom property declarations like --color-primary: #fff.
 var cssVarRe = regexp.MustCompile(`(--[\w-]+)\s*:\s*([^;}]+)`)
 
 // extractCSSSummary extracts class names and CSS custom properties from CSS content.
-// Returns a compact summary string suitable for preserving in tool results.
+// Returns a grouped summary so the LLM can quickly see the design vocabulary:
+// COLORS, FONTS, SPACING (vars) and LAYOUT, COMPONENTS, UTILITIES (classes).
 func extractCSSSummary(css string) string {
-	var vars []string
-	var classes []string
 	seen := make(map[string]bool)
 
-	// Extract custom properties.
+	// Categorise CSS custom properties.
+	var colors, fonts, spacing, otherVars []string
 	for _, m := range cssVarRe.FindAllStringSubmatch(css, -1) {
-		key := m[1] + ": " + strings.TrimSpace(m[2])
-		if !seen[m[1]] {
-			vars = append(vars, key)
-			seen[m[1]] = true
+		name := m[1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		entry := name + ":" + strings.TrimSpace(m[2])
+		switch {
+		case strings.HasPrefix(name, "--color"):
+			colors = append(colors, entry)
+		case strings.HasPrefix(name, "--font"), strings.HasPrefix(name, "--text"):
+			fonts = append(fonts, entry)
+		case strings.HasPrefix(name, "--spacing"), strings.HasPrefix(name, "--radius"),
+			strings.HasPrefix(name, "--gap"):
+			spacing = append(spacing, entry)
+		default:
+			otherVars = append(otherVars, entry)
 		}
 	}
 
-	// Extract class selectors (deduplicated).
+	// Categorise class selectors.
+	var layout, components, utilities, otherClasses []string
 	for _, m := range cssClassRe.FindAllStringSubmatch(css, -1) {
 		cls := m[1]
-		if !seen["."+cls] {
-			classes = append(classes, "."+cls)
-			seen["."+cls] = true
+		key := "." + cls
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		switch {
+		case strings.HasPrefix(cls, "container") || strings.HasPrefix(cls, "grid") ||
+			strings.HasPrefix(cls, "flex") || strings.HasPrefix(cls, "col-") ||
+			strings.HasPrefix(cls, "row") || strings.HasPrefix(cls, "wrap"):
+			layout = append(layout, key)
+		case strings.HasPrefix(cls, "card") || strings.HasPrefix(cls, "btn") ||
+			strings.HasPrefix(cls, "hero") || strings.HasPrefix(cls, "section") ||
+			strings.HasPrefix(cls, "form") || strings.HasPrefix(cls, "modal") ||
+			strings.HasPrefix(cls, "badge") || strings.HasPrefix(cls, "alert") ||
+			strings.HasPrefix(cls, "nav") || strings.HasPrefix(cls, "footer") ||
+			strings.HasPrefix(cls, "header") || strings.HasPrefix(cls, "sidebar") ||
+			strings.HasPrefix(cls, "tab") || strings.HasPrefix(cls, "dropdown") ||
+			strings.HasPrefix(cls, "input") || strings.HasPrefix(cls, "label"):
+			components = append(components, key)
+		case strings.HasPrefix(cls, "text-") || strings.HasPrefix(cls, "hidden") ||
+			strings.HasPrefix(cls, "sr-") || strings.HasPrefix(cls, "mt-") ||
+			strings.HasPrefix(cls, "mb-") || strings.HasPrefix(cls, "ml-") ||
+			strings.HasPrefix(cls, "mr-") || strings.HasPrefix(cls, "mx-") ||
+			strings.HasPrefix(cls, "my-") || strings.HasPrefix(cls, "p-") ||
+			strings.HasPrefix(cls, "pt-") || strings.HasPrefix(cls, "pb-") ||
+			strings.HasPrefix(cls, "px-") || strings.HasPrefix(cls, "py-") ||
+			strings.HasPrefix(cls, "gap-") || strings.HasPrefix(cls, "w-") ||
+			strings.HasPrefix(cls, "h-") || strings.HasPrefix(cls, "d-") ||
+			cls == "hidden" || cls == "visible":
+			utilities = append(utilities, key)
+		default:
+			otherClasses = append(otherClasses, key)
 		}
 	}
 
+	// Build grouped output with caps per group.
+	cap := func(s []string, n int) []string {
+		if len(s) > n {
+			return s[:n]
+		}
+		return s
+	}
 	var parts []string
-	if len(vars) > 0 {
-		if len(vars) > 30 {
-			vars = vars[:30]
+	addGroup := func(label string, items []string, max int, sep string) {
+		items = cap(items, max)
+		if len(items) > 0 {
+			parts = append(parts, label+": "+strings.Join(items, sep))
 		}
-		parts = append(parts, "vars: "+strings.Join(vars, "; "))
 	}
-	if len(classes) > 0 {
-		if len(classes) > 40 {
-			classes = classes[:40]
-		}
-		parts = append(parts, "classes: "+strings.Join(classes, " "))
-	}
+	addGroup("COLORS", colors, 12, ", ")
+	addGroup("FONTS", fonts, 4, ", ")
+	addGroup("SPACING", spacing, 6, ", ")
+	addGroup("VARS", otherVars, 8, ", ")
+	addGroup("LAYOUT", layout, 10, " ")
+	addGroup("COMPONENTS", components, 15, " ")
+	addGroup("UTILITIES", utilities, 10, " ")
+	addGroup("OTHER", otherClasses, 10, " ")
 
 	summary := strings.Join(parts, " | ")
 	if len(summary) > 1500 {

@@ -28,9 +28,13 @@ type PaymentsTool struct{}
 
 func (t *PaymentsTool) Name() string { return "manage_payments" }
 func (t *PaymentsTool) Description() string {
-	return "Manage payment flows. Actions: configure (set up payment provider), create_checkout (create checkout session), " +
-		"check_status (check payment status), list (list payments), handle_webhook (process payment webhooks). " +
-		"Works with any payment provider (Stripe, PayPal, Mollie, Square, etc.) via service_providers."
+	return "Configure, create checkout sessions, check status, list, or handle payment webhooks."
+}
+
+func (t *PaymentsTool) Guide() string {
+	return `### Payments (manage_payments)
+- Configure payment provider (Stripe, PayPal, Mollie, Square, generic) + create checkout sessions.
+- Requires a service provider configured via manage_providers.`
 }
 
 func (t *PaymentsTool) Parameters() map[string]interface{} {

@@ -14,49 +14,25 @@ import { h, render } from '../../core/dom.js';
 import { get } from '../../core/http.js';
 import * as state from '../../core/state.js';
 import { createFeed } from '../../ui/chat/feed.js';
-import { createUserMessage, createAutomatedMessage, createAssistantMessage, createBrainMessage, createStreamingMessage, createToolCall } from '../../ui/chat/message.js';
-import { createQuestionCard } from '../../ui/chat/cards.js';
-import { startStream, humanizeError } from '../../ui/chat/stream.js';
+import { createUserMessage, createAutomatedMessage, createAssistantMessage, createBrainMessage, createStreamingMessage, createToolCall, createStageTransition } from '../../ui/chat/message.js';
+import { createQuestionCard, createQuestionGroup } from '../../ui/chat/cards.js';
+import { startStream } from '../../ui/chat/stream.js';
 import { createChatInput } from '../../ui/chat/input.js';
+import { createPipelineTracker } from '../../ui/chat/pipeline-tracker.js';
 import { icon } from '../../ui/icon.js';
+import { formatDuration } from '../../ui/helpers.js';
 import * as toast from '../../ui/toast.js';
 
 export function renderSiteChat(container, siteId) {
   const feed = createFeed();
+  const tracker = createPipelineTracker();
   let currentStream = null;
   let streamingMsg = null;
   let emptyState = null;
   const unwatchers = [];
   const questionCards = {}; // Track question cards by ID
   let questionData = {};    // Track question metadata for banner
-
-  // --- Brain status bar (persistent, top of chat) ---
-  const brainStatusBar = h('div', { className: 'chat-brain-status' });
-  let brainStatusTimer = null;
-
-  function updateBrainStatus(newState, detail) {
-    if (brainStatusTimer) clearTimeout(brainStatusTimer);
-    brainStatusBar.innerHTML = '';
-
-    if (newState === 'idle') {
-      brainStatusBar.style.display = 'none';
-      return;
-    }
-
-    brainStatusBar.style.display = '';
-    const states = {
-      thinking: { ico: 'brain', text: 'Brain is thinking...', cls: 'thinking' },
-      building: { ico: 'code', text: detail || 'Brain is working...', cls: 'building' },
-      waiting:  { ico: 'clock', text: 'Waiting for your answer...', cls: 'waiting' },
-    };
-    const s = states[newState] || states.thinking;
-    brainStatusBar.className = `chat-brain-status chat-brain-status--${s.cls}`;
-    brainStatusBar.appendChild(h('span', { innerHTML: icon(s.ico), className: 'chat-brain-status__icon' }));
-    brainStatusBar.appendChild(h('span', {}, s.text));
-
-    // Auto-hide after 2 minutes if no update
-    brainStatusTimer = setTimeout(() => updateBrainStatus('idle'), 120000);
-  }
+  let activeQuestionGroup = null; // Active grouped question card
 
   // --- Pinned question banner (between feed and input) ---
   const questionBanner = h('div', { className: 'chat-question-banner' });
@@ -66,56 +42,30 @@ export function renderSiteChat(container, siteId) {
     const pendingIds = Object.keys(questionCards);
     if (pendingIds.length === 0) {
       questionBanner.style.display = 'none';
-      updateBrainStatus('idle');
+      tracker.updateBrainStatus('idle');
       return;
     }
 
     questionBanner.style.display = '';
     questionBanner.innerHTML = '';
 
-    // Get the most recent pending question
-    const latestId = pendingIds[pendingIds.length - 1];
-    const qMeta = questionData[latestId];
-    const questionText = qMeta?.question || 'The brain needs your input';
+    const count = pendingIds.length;
+    const badge = h('span', { className: 'badge badge--warning' },
+      count > 1 ? `${count} questions` : 'Question');
 
-    // Parse options
-    let parsedOptions = [];
-    if (qMeta?.options) {
-      try {
-        parsedOptions = typeof qMeta.options === 'string' ? JSON.parse(qMeta.options) : qMeta.options;
-      } catch { /* ignore */ }
-    }
-    if (!Array.isArray(parsedOptions)) parsedOptions = [];
+    const textEl = h('div', { className: 'chat-question-banner__text' },
+      count > 1 ? `${count} questions need your input` : (questionData[pendingIds[0]]?.question || 'The brain needs your input'));
 
-    const badge = pendingIds.length > 1
-      ? h('span', { className: 'badge badge--warning' }, `${pendingIds.length} questions`)
-      : h('span', { className: 'badge badge--warning' }, 'Question');
-
-    const textEl = h('div', { className: 'chat-question-banner__text' }, questionText);
-
-    // Quick-reply buttons in banner
-    const actions = h('div', { className: 'chat-question-banner__actions' });
-    for (const opt of parsedOptions.slice(0, 3)) {
-      const label = typeof opt === 'string' ? opt : opt.label || opt;
-      actions.appendChild(h('button', {
-        className: 'btn btn--sm btn--ghost chat-question-banner__btn',
-        onClick: () => {
-          // Find the card and submit through it
-          const card = questionCards[latestId];
-          if (card?.element) {
-            card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        },
-      }, label));
-    }
-
-    // Scroll-to-question button
+    // Scroll-to-group button
     const scrollBtn = h('button', {
       className: 'btn btn--sm btn--primary',
       onClick: () => {
-        const card = questionCards[latestId];
-        if (card?.element) {
-          card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        if (activeQuestionGroup?.element) {
+          activeQuestionGroup.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+          const latestId = pendingIds[pendingIds.length - 1];
+          const card = questionCards[latestId];
+          if (card?.element) card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       },
     }, 'Answer');
@@ -123,10 +73,9 @@ export function renderSiteChat(container, siteId) {
     questionBanner.appendChild(h('span', { innerHTML: icon('help-circle'), className: 'chat-question-banner__icon' }));
     questionBanner.appendChild(badge);
     questionBanner.appendChild(textEl);
-    if (parsedOptions.length > 0) questionBanner.appendChild(actions);
     questionBanner.appendChild(scrollBtn);
 
-    updateBrainStatus('waiting');
+    tracker.updateBrainStatus('waiting');
   }
 
   // --- Chat input ---
@@ -136,7 +85,7 @@ export function renderSiteChat(container, siteId) {
 
   // --- Layout ---
   const chatContainer = h('div', { className: 'chat-container' }, [
-    brainStatusBar,
+    tracker.element,
     feed.element,
     questionBanner,
     chatInput.element,
@@ -153,19 +102,19 @@ export function renderSiteChat(container, siteId) {
 
   // Listen for question answers from cards.js
   function onQuestionAnswered(e) {
-    const { questionId, answer } = e.detail;
-    // Show a "Your answer" bubble in the feed
-    removeEmptyState();
-    const answerMsg = h('div', { className: 'message message--user-answer' }, [
-      h('span', { className: 'message__answer-label' }, 'Your answer'),
-      h('span', {}, answer),
-    ]);
-    feed.append(answerMsg);
-    feed.scrollToBottom();
+    const { questionId } = e.detail;
 
-    // Clean up tracking
     delete questionCards[questionId];
     delete questionData[questionId];
+
+    // Clear group reference if all group questions are answered
+    if (activeQuestionGroup && activeQuestionGroup.questionIds) {
+      const groupStillPending = [...activeQuestionGroup.questionIds].some(id => questionCards[id]);
+      if (!groupStillPending) {
+        activeQuestionGroup = null;
+      }
+    }
+
     updateQuestionBanner();
   }
   document.addEventListener('iatan:questionAnswered', onQuestionAnswered);
@@ -251,10 +200,8 @@ export function renderSiteChat(container, siteId) {
     }
 
     if (prepend) {
-      // Remove existing "load earlier" button if present
       const existing = feed.element.querySelector('.load-earlier-btn');
       if (existing) existing.remove();
-      // Prepend elements at the top
       const firstChild = feed.element.firstChild;
       for (const el of elements) {
         feed.element.insertBefore(el, firstChild);
@@ -281,6 +228,16 @@ export function renderSiteChat(container, siteId) {
         hasOlderMessages = messages.length >= 50;
       }
 
+      // Parse stage state from history so tracker shows correct position on load
+      for (const msg of messages) {
+        if (msg.session_id === 'brain' && msg.content) {
+          const sm = msg.content.match(/Starting stage: \*\*(\w+)\*\*/);
+          if (sm) tracker.setStage(sm[1]);
+          const bm = msg.content.match(/Plan ready: (\d+) pages?/);
+          if (bm) tracker.updateBuildStat('totalPages', parseInt(bm[1], 10));
+        }
+      }
+
       renderMessages(messages);
 
       if (hasOlderMessages) {
@@ -288,7 +245,7 @@ export function renderSiteChat(container, siteId) {
       }
 
       feed.scrollToBottom(true);
-    } catch (err) {
+    } catch {
       // Silently handle history load failures
     }
   }
@@ -310,7 +267,6 @@ export function renderSiteChat(container, siteId) {
     if (!oldestTimestamp || !hasOlderMessages || loadingEarlier) return;
     loadingEarlier = true;
 
-    // Show loading state on the button.
     const btnEl = feed.element.querySelector('.load-earlier-btn button');
     if (btnEl) {
       btnEl.textContent = 'Loading...';
@@ -328,19 +284,14 @@ export function renderSiteChat(container, siteId) {
       oldestTimestamp = messages[0].created_at;
       hasOlderMessages = messages.length >= 50;
 
-      // Preserve scroll position: capture height before prepending.
       const prevHeight = feed.element.scrollHeight;
-
       renderMessages(messages, true);
-
-      // Restore scroll so the user's current view stays stable.
       feed.element.scrollTop += feed.element.scrollHeight - prevHeight;
 
       if (hasOlderMessages) {
         addLoadEarlierButton();
       }
-    } catch (err) {
-      // Restore button so user can retry.
+    } catch {
       if (btnEl) {
         btnEl.textContent = 'Load earlier messages';
         btnEl.disabled = false;
@@ -355,7 +306,19 @@ export function renderSiteChat(container, siteId) {
       const questions = await get(`/admin/api/sites/${siteId}/questions?status=pending`);
       if (questions && questions.length > 0) {
         removeEmptyState();
-        for (const q of questions) {
+        const approval = questions.filter(q => q.type === 'approval');
+        const regular = questions.filter(q => q.type !== 'approval');
+
+        if (regular.length > 0) {
+          activeQuestionGroup = createQuestionGroup(regular);
+          for (const q of regular) {
+            questionCards[q.id] = activeQuestionGroup;
+            questionData[q.id] = q;
+          }
+          feed.append(activeQuestionGroup.element);
+        }
+
+        for (const q of approval) {
           if (!questionCards[q.id]) {
             const qCard = createQuestionCard(q);
             questionCards[q.id] = qCard;
@@ -363,6 +326,7 @@ export function renderSiteChat(container, siteId) {
             feed.append(qCard.element);
           }
         }
+
         feed.scrollToBottom();
         updateQuestionBanner();
       }
@@ -378,16 +342,54 @@ export function renderSiteChat(container, siteId) {
       if (!data || String(data.site_id) !== String(siteId)) return;
       if (data.content) {
         removeEmptyState();
+
+        // Parse stage start messages to drive the tracker
+        const stageMatch = data.content.match(/Starting stage: \*\*(\w+)\*\*/);
+        if (stageMatch) {
+          tracker.setStage(stageMatch[1]);
+          tracker.setDetail('');
+        }
+
+        // Parse build progress patterns
+        const planMatch = data.content.match(/Plan ready: (\d+) pages?, (\d+) endpoints?, (\d+) tables?/);
+        if (planMatch) {
+          tracker.updateBuildStat('totalPages', parseInt(planMatch[1], 10));
+        }
+        const buildDoneMatch = data.content.match(/Build complete: (\d+) tool calls/);
+        if (buildDoneMatch) {
+          tracker.updateBuildStat('toolCalls', parseInt(buildDoneMatch[1], 10));
+        }
+
+        // Parse phase detail
+        const phaseMatch = data.content.match(/^Phase (\d+)\/(\d+):/);
+        if (phaseMatch) {
+          tracker.setDetail(data.content.replace(/\*\*/g, ''));
+        }
+
         feed.append(createBrainMessage(data.content));
         feed.scrollToBottom();
-        updateBrainStatus('idle');
+        tracker.updateBrainStatus('idle');
+      }
+    }));
+
+    // Watch for structured stage change events
+    unwatchers.push(state.watch('brainStageChange', (data) => {
+      if (!data || String(data.site_id) !== String(siteId)) return;
+      const { prev_stage, stage, duration_ms } = data;
+
+      if (prev_stage) tracker.markCompleted(prev_stage);
+      if (stage) tracker.setStage(stage);
+
+      if (prev_stage) {
+        const dur = duration_ms ? formatDuration(duration_ms) : '';
+        feed.append(createStageTransition(prev_stage, dur));
+        feed.scrollToBottom();
       }
     }));
 
     unwatchers.push(state.watch('brainToolStart', (data) => {
       if (!data || String(data.site_id) !== String(siteId)) return;
       const toolName = data.tool || data.name || 'tool';
-      // Skip question tools — the interactive question card is rendered separately.
       const isQuestion = toolName === 'ask_question' || (toolName === 'manage_communication' && data.args?.action === 'ask');
       if (isQuestion) return;
       removeEmptyState();
@@ -396,7 +398,6 @@ export function renderSiteChat(container, siteId) {
       brainToolCards[key] = tc;
       feed.append(tc.element);
       feed.scrollToBottom();
-      updateBrainStatus('building', `Working: ${tc.element.querySelector('.chat-card__label, .message__tool-header span:nth-child(2)')?.textContent || toolName}`);
     }));
 
     unwatchers.push(state.watch('brainToolResult', (data) => {
@@ -411,6 +412,19 @@ export function renderSiteChat(container, siteId) {
           data.result || data.error
         );
       }
+
+      // Track build counters
+      if (!data.error && tracker.currentStageKey === 'BUILD') {
+        const action = data.args?.action;
+        if (toolName === 'manage_pages' && action === 'save') {
+          tracker.incrementBuildStat('pages');
+        } else if (toolName === 'manage_schema' && action === 'create') {
+          tracker.incrementBuildStat('tables');
+        } else if (toolName === 'manage_endpoints' && (action === 'create_api' || action === 'create_auth')) {
+          tracker.incrementBuildStat('endpoints');
+        }
+      }
+
       feed.scrollToBottom();
     }));
 
@@ -419,12 +433,41 @@ export function renderSiteChat(container, siteId) {
       if (!data || String(data.site_id) !== String(siteId)) return;
       if (data.question && !questionCards[data.id]) {
         removeEmptyState();
-        const qCard = createQuestionCard(data);
-        questionCards[data.id] = qCard;
-        questionData[data.id] = data;
-        feed.append(qCard.element);
+
+        if (data.type === 'approval') {
+          const qCard = createQuestionCard(data);
+          questionCards[data.id] = qCard;
+          questionData[data.id] = data;
+          feed.append(qCard.element);
+        } else if (activeQuestionGroup) {
+          activeQuestionGroup.addQuestion(data);
+          questionCards[data.id] = activeQuestionGroup;
+          questionData[data.id] = data;
+        } else {
+          activeQuestionGroup = createQuestionGroup([data]);
+          questionCards[data.id] = activeQuestionGroup;
+          questionData[data.id] = data;
+          feed.append(activeQuestionGroup.element);
+        }
+
         feed.scrollToBottom();
         updateQuestionBanner();
+      }
+    }));
+
+    // Watch for brain mode changes (e.g., entering monitoring)
+    unwatchers.push(state.watch('brainModeChanged', (data) => {
+      if (!data || String(data.site_id) !== String(siteId)) return;
+      if (data.mode === 'monitoring') {
+        tracker.markCompleted('PLAN');
+        tracker.markCompleted('BUILD');
+        tracker.markCompleted('COMPLETE');
+        tracker.setStage('MONITORING');
+      } else if (data.mode === 'paused') {
+        if (tracker.currentStageKey) {
+          tracker.setError(tracker.currentStageKey);
+          tracker.setDetail('Pipeline paused');
+        }
       }
     }));
 
@@ -503,7 +546,7 @@ export function renderSiteChat(container, siteId) {
 
   return function cleanup() {
     if (currentStream) currentStream.abort();
-    if (brainStatusTimer) clearTimeout(brainStatusTimer);
+    tracker.cleanup();
     document.removeEventListener('iatan:questionAnswered', onQuestionAnswered);
     for (const unwatch of unwatchers) {
       unwatch();

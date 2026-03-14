@@ -20,7 +20,13 @@ type ProvidersTool struct{}
 
 func (t *ProvidersTool) Name() string { return "manage_providers" }
 func (t *ProvidersTool) Description() string {
-	return "Manage external service providers. Actions: add, list, remove, update, request (authenticated HTTP call through a provider)."
+	return "Add, list, remove, update, or make authenticated requests through external service providers."
+}
+
+func (t *ProvidersTool) Guide() string {
+	return `### Service Providers (manage_providers)
+- External service providers with authenticated HTTP (bearer, API key, basic auth).
+- Use "request" action to make authenticated API calls through a configured provider.`
 }
 
 func (t *ProvidersTool) Parameters() map[string]interface{} {

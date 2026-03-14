@@ -25,9 +25,13 @@ type EmailTool struct{}
 
 func (t *EmailTool) Name() string { return "manage_email" }
 func (t *EmailTool) Description() string {
-	return "Send emails via configured providers. Actions: configure (set up email provider), send (send an email), " +
-		"save_template (store reusable templates), list_templates (list saved templates). " +
-		"Works with any email API provider (SendGrid, Mailgun, Resend, SES, etc.) via service_providers."
+	return "Configure, send, save templates, or list templates for email."
+}
+
+func (t *EmailTool) Guide() string {
+	return `### Email (manage_email)
+- Configure email provider (SendGrid, Mailgun, Resend, SES, generic) + send emails + manage templates.
+- Requires a service provider configured via manage_providers.`
 }
 
 func (t *EmailTool) Parameters() map[string]interface{} {

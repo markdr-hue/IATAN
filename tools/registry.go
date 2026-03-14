@@ -8,6 +8,7 @@ package tools
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/markdr-hue/IATAN/llm"
@@ -110,6 +111,29 @@ func (r *Registry) ToLLMTools() []llm.ToolDef {
 		})
 	}
 	return defs
+}
+
+// BuildGuide generates a markdown capabilities reference from tools in the
+// allowed set. Tools implementing Documented contribute their Guide() text;
+// others fall back to a one-liner from Description(). Used by PLAN and other
+// stages that need tool documentation in the system prompt.
+func (r *Registry) BuildGuide(allowed map[string]bool) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var b strings.Builder
+	for _, name := range r.sortedNames() {
+		if !allowed[name] {
+			continue
+		}
+		t := r.tools[name]
+		if doc, ok := t.(Documented); ok {
+			b.WriteString(doc.Guide())
+			b.WriteByte('\n')
+		} else {
+			fmt.Fprintf(&b, "- **%s**: %s\n", name, t.Description())
+		}
+	}
+	return b.String()
 }
 
 // ToLLMToolsFiltered returns tool definitions only for tools whose names

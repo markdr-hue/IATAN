@@ -113,6 +113,15 @@ func (h *Handler) Page(w http.ResponseWriter, r *http.Request) {
 		pagePath = "/"
 	}
 
+	// Check redirects for SPA navigation.
+	if target, code, found := checkRedirect(siteDB.DB, pagePath); found {
+		writePublicJSON(w, http.StatusOK, map[string]interface{}{
+			"redirect":    target,
+			"status_code": code,
+		})
+		return
+	}
+
 	var content, title, metadata, layoutName, pageAssets sql.NullString
 	var routeParams map[string]string
 	err = siteDB.QueryRow(
@@ -225,6 +234,12 @@ func (h *Handler) ServePage(w http.ResponseWriter, r *http.Request) {
 		pagePath = "/"
 	}
 
+	// Check redirects before page lookup.
+	if target, code, found := checkRedirect(siteDB.DB, pagePath); found {
+		http.Redirect(w, r, target, code)
+		return
+	}
+
 	var content, title, metadata, layoutName, pageAssets sql.NullString
 	err = siteDB.QueryRow(
 		"SELECT title, content, metadata, layout, assets FROM pages WHERE path = ? AND status = 'published' AND is_deleted = 0",
@@ -304,17 +319,22 @@ type layoutData struct {
 	HeadContent    string
 	BodyBeforeMain string
 	BodyAfterMain  string
+	Template       string
 }
 
 // loadLayout loads a layout by name from the site database. Returns nil if not found.
 func loadLayout(siteDB *sql.DB, name string) *layoutData {
 	var ld layoutData
+	var tmpl sql.NullString
 	err := siteDB.QueryRow(
-		"SELECT head_content, body_before_main, body_after_main FROM layouts WHERE name = ?",
+		"SELECT head_content, body_before_main, body_after_main, template FROM layouts WHERE name = ?",
 		name,
-	).Scan(&ld.HeadContent, &ld.BodyBeforeMain, &ld.BodyAfterMain)
+	).Scan(&ld.HeadContent, &ld.BodyBeforeMain, &ld.BodyAfterMain, &tmpl)
 	if err != nil {
 		return nil
+	}
+	if tmpl.Valid {
+		ld.Template = tmpl.String
 	}
 	return &ld
 }
@@ -400,8 +420,7 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 		json.Unmarshal([]byte(metadataJSON), &meta)
 	}
 
-	// Text direction attribute (always LTR for now; the site.Direction field
-	// stores the owner's building goals, NOT text direction).
+	// Text direction attribute (always LTR for now).
 	dir := "ltr"
 
 	// Build the page title.
@@ -502,27 +521,33 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 	b.WriteString("<body>\n")
 
 	if layout != nil {
-		// Strip nav/footer from page content — the layout provides these.
-		cleanContent = navBlockRe.ReplaceAllString(cleanContent, "")
-		cleanContent = footBlockRe.ReplaceAllString(cleanContent, "")
+		if layout.Template != "" {
+			// Template mode: replace {{content}} placeholder, no forced structure.
+			rendered := strings.Replace(layout.Template, "{{content}}", cleanContent, 1)
+			b.WriteString(rendered)
+			b.WriteString("\n")
+		} else {
+			// Traditional mode: body_before_main → <main> → content → </main> → body_after_main
+			// Strip nav/footer from page content — the layout provides these.
+			cleanContent = navBlockRe.ReplaceAllString(cleanContent, "")
+			cleanContent = footBlockRe.ReplaceAllString(cleanContent, "")
 
-		// Layout wrapping: body_before_main → <main> → content → </main> → body_after_main
-		if layout.BodyBeforeMain != "" {
-			b.WriteString(layout.BodyBeforeMain)
-			b.WriteString("\n")
-		}
-		b.WriteString("<main>\n")
-		b.WriteString(cleanContent)
-		b.WriteString("\n</main>\n")
-		if layout.BodyAfterMain != "" {
-			b.WriteString(layout.BodyAfterMain)
-			b.WriteString("\n")
+			if layout.BodyBeforeMain != "" {
+				b.WriteString(layout.BodyBeforeMain)
+				b.WriteString("\n")
+			}
+			b.WriteString("<main>\n")
+			b.WriteString(cleanContent)
+			b.WriteString("\n</main>\n")
+			if layout.BodyAfterMain != "" {
+				b.WriteString(layout.BodyAfterMain)
+				b.WriteString("\n")
+			}
 		}
 	} else {
-		// No layout — still wrap in <main> so SPA router has a target element.
-		b.WriteString("<main>\n")
+		// No layout (layout="none") — render content as-is, no <main> wrapping.
 		b.WriteString(cleanContent)
-		b.WriteString("\n</main>\n")
+		b.WriteString("\n")
 	}
 
 	// Inject route params for parameterized pages (e.g. /thread/:id → {id: "4"}).
@@ -844,6 +869,18 @@ func stripDocumentShell(content string) string {
 // homeFallbacks returns alternate paths to try when an exact page path isn't found.
 // This handles the common case where the brain saves the homepage as "/index.html"
 // but the browser requests "/", or vice versa.
+// checkRedirect looks up a redirect for the given path.
+func checkRedirect(siteDB *sql.DB, path string) (target string, statusCode int, found bool) {
+	err := siteDB.QueryRow(
+		"SELECT target_path, status_code FROM redirects WHERE source_path = ?",
+		path,
+	).Scan(&target, &statusCode)
+	if err != nil {
+		return "", 0, false
+	}
+	return target, statusCode, true
+}
+
 func homeFallbacks(path string) []string {
 	switch path {
 	case "/":
@@ -1288,13 +1325,13 @@ func (h *Handler) DynamicAPI(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		// Site API keys bypass role checks (owner-level access).
 		if !h.validateSiteToken(site.ID, token) {
-			// Try user JWT.
+			// Try user JWT — must be scoped to this site.
 			if h.deps.JWTManager == nil {
 				writePublicError(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
 			claims, err := h.deps.JWTManager.Validate(token)
-			if err != nil {
+			if err != nil || claims.SiteID != site.ID {
 				writePublicError(w, http.StatusUnauthorized, "invalid or expired token")
 				return
 			}
@@ -1396,7 +1433,60 @@ func (h *Handler) validateSiteToken(siteID int, token string) bool {
 // reservedParams are query parameters with special meaning that are not column filters.
 var reservedParams = map[string]bool{
 	"limit": true, "offset": true, "sort": true, "order": true,
-	"search": true, "stats": true,
+	"order_by": true, "direction": true, "page": true,
+	"search": true, "stats": true, "q": true,
+}
+
+// parseFilterParam extracts column name and SQL operator from a query param key.
+// Supports: col (exact), col__like, col__gt, col__gte, col__lt, col__lte, col__ne.
+func parseFilterParam(key string) (column, op string, isLike bool, ok bool) {
+	parts := strings.SplitN(key, "__", 2)
+	column = parts[0]
+	if len(parts) == 1 {
+		return column, "=", false, true
+	}
+	switch parts[1] {
+	case "like":
+		return column, "LIKE", true, true
+	case "gt":
+		return column, ">", false, true
+	case "gte":
+		return column, ">=", false, true
+	case "lt":
+		return column, "<", false, true
+	case "lte":
+		return column, "<=", false, true
+	case "ne":
+		return column, "!=", false, true
+	default:
+		return "", "", false, false
+	}
+}
+
+// getTextColumns returns all TEXT column names from a table, excluding secure columns.
+func getTextColumns(siteDB *sql.DB, physTable string, ep *apiEndpoint) []string {
+	rows, err := siteDB.Query(fmt.Sprintf("PRAGMA table_info(%s)", physTable))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt interface{}
+		if rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk) != nil {
+			continue
+		}
+		if strings.EqualFold(colType, "TEXT") && name != "id" && name != "created_at" {
+			if kind, ok := ep.SecureCols[name]; ok && kind == "hash" {
+				continue
+			}
+			cols = append(cols, name)
+		}
+	}
+	return cols
 }
 
 // apiList handles GET /api/{path} — list rows with pagination and filtering.
@@ -1422,21 +1512,44 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB
 	}
 
 	// Build WHERE clause from query parameters (column filters).
+	// Supports: ?col=val (exact), ?col__like=term, ?col__gt=5, ?col__gte=5,
+	// ?col__lt=10, ?col__lte=10, ?col__ne=val, ?q=term (full-text across TEXT columns).
 	var whereClauses []string
 	var whereArgs []interface{}
 	for key, vals := range r.URL.Query() {
 		if reservedParams[key] || len(vals) == 0 {
 			continue
 		}
-		if err := security.ValidateColumnName(key); err != nil {
-			continue // silently skip invalid column names
-		}
-		// Don't allow filtering on secure columns.
-		if kind, ok := ep.SecureCols[key]; ok && kind == "hash" {
+		col, op, isLike, valid := parseFilterParam(key)
+		if !valid {
 			continue
 		}
-		whereClauses = append(whereClauses, key+" = ?")
-		whereArgs = append(whereArgs, vals[0])
+		if err := security.ValidateColumnName(col); err != nil {
+			continue
+		}
+		if kind, ok := ep.SecureCols[col]; ok && kind == "hash" {
+			continue
+		}
+		if isLike {
+			whereClauses = append(whereClauses, col+" LIKE ? COLLATE NOCASE")
+			whereArgs = append(whereArgs, "%"+vals[0]+"%")
+		} else {
+			whereClauses = append(whereClauses, col+" "+op+" ?")
+			whereArgs = append(whereArgs, vals[0])
+		}
+	}
+
+	// ?q=term — search across all TEXT columns.
+	if qTerm := r.URL.Query().Get("q"); qTerm != "" {
+		textCols := getTextColumns(siteDB, physTable, ep)
+		if len(textCols) > 0 {
+			var orClauses []string
+			for _, tc := range textCols {
+				orClauses = append(orClauses, tc+" LIKE ? COLLATE NOCASE")
+				whereArgs = append(whereArgs, "%"+qTerm+"%")
+			}
+			whereClauses = append(whereClauses, "("+strings.Join(orClauses, " OR ")+")")
+		}
 	}
 
 	whereSQL := ""
@@ -1444,12 +1557,20 @@ func (h *Handler) apiList(w http.ResponseWriter, r *http.Request, siteDB *sql.DB
 		whereSQL = " WHERE " + strings.Join(whereClauses, " AND ")
 	}
 
-	// Sorting.
+	// Sorting: accept sort/order or order_by/direction.
 	orderSQL := "id DESC"
-	if sortCol := r.URL.Query().Get("sort"); sortCol != "" {
+	sortCol := r.URL.Query().Get("sort")
+	if sortCol == "" {
+		sortCol = r.URL.Query().Get("order_by")
+	}
+	if sortCol != "" {
 		if security.ValidateColumnName(sortCol) == nil {
 			dir := "ASC"
-			if strings.EqualFold(r.URL.Query().Get("order"), "desc") {
+			orderDir := r.URL.Query().Get("order")
+			if orderDir == "" {
+				orderDir = r.URL.Query().Get("direction")
+			}
+			if strings.EqualFold(orderDir, "desc") {
 				dir = "DESC"
 			}
 			orderSQL = sortCol + " " + dir
@@ -2038,32 +2159,22 @@ func (h *Handler) apiStream(w http.ResponseWriter, r *http.Request, siteID int, 
 var validTableName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 
 type wsEndpointConfig struct {
-	Path             string
-	EventTypes       []string
-	ReceiveEventType string
-	WriteToTable     string
-	RoomColumn       string
-	RequiresAuth     bool
+	Path         string
+	WriteToTable string
+	RequiresAuth bool
 	// Cached column schema for write_to_table (maps column name → type).
 	tableColumns map[string]string
 }
 
 func (h *Handler) loadWSEndpoint(siteDB *sql.DB, path string) (*wsEndpointConfig, error) {
 	var ws wsEndpointConfig
-	var eventTypesJSON string
-	var writeToTable, receiveEventType sql.NullString
+	var writeToTable sql.NullString
 	err := siteDB.QueryRow(
-		"SELECT path, event_types, receive_event_type, write_to_table, requires_auth, COALESCE(room_column, '') FROM ws_endpoints WHERE path = ?",
+		"SELECT path, write_to_table, requires_auth FROM ws_endpoints WHERE path = ?",
 		path,
-	).Scan(&ws.Path, &eventTypesJSON, &receiveEventType, &writeToTable, &ws.RequiresAuth, &ws.RoomColumn)
+	).Scan(&ws.Path, &writeToTable, &ws.RequiresAuth)
 	if err != nil {
 		return nil, err
-	}
-	json.Unmarshal([]byte(eventTypesJSON), &ws.EventTypes)
-	if receiveEventType.Valid {
-		ws.ReceiveEventType = receiveEventType.String
-	} else {
-		ws.ReceiveEventType = string(events.EventWSMessage)
 	}
 	if writeToTable.Valid {
 		ws.WriteToTable = writeToTable.String
@@ -2081,21 +2192,22 @@ func (h *Handler) loadWSEndpoint(siteDB *sql.DB, path string) (*wsEndpointConfig
 	return &ws, nil
 }
 
-// apiWebSocket handles GET /api/{path}/ws — bidirectional real-time communication.
+// apiWebSocket handles GET /api/{path}/ws — pure transparent relay with room support.
+// Messages are relayed as-sent to all other clients in the same room, with _sender injected.
 func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID int, siteDB *db.SiteDB) {
 	// Extract the endpoint path from the URL.
 	fullPath := strings.TrimPrefix(r.URL.Path, "/api/")
 	parts := strings.SplitN(fullPath, "/", 2)
 	endpointPath := parts[0]
 
-	ws, err := h.loadWSEndpoint(siteDB.DB, endpointPath)
+	wsCfg, err := h.loadWSEndpoint(siteDB.DB, endpointPath)
 	if err != nil {
 		writePublicError(w, http.StatusNotFound, "websocket endpoint not found")
 		return
 	}
 
 	// Check auth if required.
-	if ws.RequiresAuth {
+	if wsCfg.RequiresAuth {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token == "" {
 			token = r.URL.Query().Get("token")
@@ -2117,54 +2229,17 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 	defer conn.CloseNow()
 
 	clientID := uuid.New().String()
+	room := r.URL.Query().Get("room") // always available, default "" = global room
+	roomKey := fmt.Sprintf("%d:%s:%s", siteID, endpointPath, room)
 
-	// Room filtering: if room_column is set, read ?room= from the client.
-	roomValue := ""
-	if ws.RoomColumn != "" {
-		roomValue = r.URL.Query().Get("room")
-	}
-
-	// Build a set of allowed event types for outbound messages.
-	allowedTypes := make(map[events.EventType]bool)
-	for _, et := range ws.EventTypes {
-		allowedTypes[events.EventType(et)] = true
-	}
-	// Also allow the receive event type so clients see each other's messages.
-	allowedTypes[events.EventType(ws.ReceiveEventType)] = true
+	// Join the hub room.
+	client := h.deps.WSHub.join(roomKey, clientID)
+	defer h.deps.WSHub.leave(roomKey, clientID)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	eventCh := make(chan events.Event, 64)
-	subID := h.deps.Bus.SubscribeAll(func(e events.Event) {
-		if e.SiteID != siteID {
-			return
-		}
-		if !allowedTypes[e.Type] {
-			return
-		}
-		// Echo suppression: don't send events back to the originating client.
-		if cid, _ := e.Payload["client_id"].(string); cid == clientID {
-			return
-		}
-		// Room filtering: only forward events matching the client's room.
-		if ws.RoomColumn != "" && roomValue != "" {
-			if data, ok := e.Payload["data"].(map[string]interface{}); ok {
-				eventRoom := fmt.Sprintf("%v", data[ws.RoomColumn])
-				if eventRoom != roomValue {
-					return
-				}
-			}
-		}
-		select {
-		case eventCh <- e:
-		default:
-			slog.Warn("WS event dropped (channel full)", "site_id", siteID, "event", e.Type)
-		}
-	})
-	defer h.deps.Bus.Unsubscribe(subID)
-
-	// Read pump: reads incoming messages from the client.
+	// Read pump: reads incoming messages and broadcasts to room.
 	go func() {
 		defer cancel()
 		for {
@@ -2179,25 +2254,25 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 				continue // skip non-JSON or non-object messages
 			}
 
-			// Publish to event bus.
-			h.deps.Bus.Publish(events.NewEvent(
-				events.EventType(ws.ReceiveEventType),
-				siteID,
-				map[string]interface{}{
-					"path":      endpointPath,
-					"data":      msgMap,
-					"client_id": clientID,
-				},
-			))
+			// Inject _sender so receivers know who sent the message.
+			msgMap["_sender"] = clientID
+
+			outBytes, err := json.Marshal(msgMap)
+			if err != nil {
+				continue
+			}
+
+			// Broadcast to all other clients in the same room.
+			h.deps.WSHub.broadcast(roomKey, clientID, outBytes)
 
 			// Optional: write to table with structured column mapping.
-			if ws.WriteToTable != "" && validTableName.MatchString(ws.WriteToTable) {
-				wsWriteToTable(siteDB, ws, msgMap)
+			if wsCfg.WriteToTable != "" && validTableName.MatchString(wsCfg.WriteToTable) {
+				wsWriteToTable(siteDB, wsCfg, msgMap)
 			}
 		}
 	}()
 
-	// Write pump: sends events and keepalives to the client.
+	// Write pump: drains the client's outbound channel and sends keepalives.
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -2205,15 +2280,8 @@ func (h *Handler) apiWebSocket(w http.ResponseWriter, r *http.Request, siteID in
 		select {
 		case <-ctx.Done():
 			return
-		case e := <-eventCh:
-			payload, err := json.Marshal(map[string]interface{}{
-				"type":    string(e.Type),
-				"payload": e.Payload,
-			})
-			if err != nil {
-				continue
-			}
-			if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+		case msg := <-client.ch:
+			if err := conn.Write(ctx, websocket.MessageText, msg); err != nil {
 				return
 			}
 		case <-ticker.C:

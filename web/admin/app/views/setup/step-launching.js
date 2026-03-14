@@ -125,7 +125,7 @@ export function renderLaunching(container, setupData) {
         const site = await authPost('/admin/api/sites', {
           name: setupData.siteName,
           domain: setupData.siteDomain || null,
-          direction: setupData.siteDirection || null,
+          description: setupData.siteDescription || null,
           llm_model_id: setupData.llmModelId || null,
         });
         createdSiteId = site.id;

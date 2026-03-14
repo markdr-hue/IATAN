@@ -33,7 +33,14 @@ export function createFeed() {
   }
 
   function append(messageEl) {
+    messageEl.classList.add('chat-enter');
     element.appendChild(messageEl);
+    // Trigger animation after paint
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        messageEl.classList.remove('chat-enter');
+      });
+    });
     scrollToBottom();
   }
 

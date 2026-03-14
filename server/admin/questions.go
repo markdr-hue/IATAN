@@ -313,15 +313,43 @@ func (h *QuestionsHandler) Answer(w http.ResponseWriter, r *http.Request) {
 		questionID, req.Answer,
 	)
 
+	// Check if all pending questions for this site are now answered.
+	// Only wake the brain when every question has been answered.
+	var pendingCount int
+	row := siteDB.DB.QueryRow("SELECT COUNT(*) FROM questions WHERE status = 'pending'")
+	if err := row.Scan(&pendingCount); err != nil {
+		pendingCount = -1 // unknown, don't wake
+	}
+
 	if h.deps.Bus != nil {
-		h.deps.Bus.Publish(events.NewEvent(events.EventQuestionAnswered, siteID, map[string]interface{}{
-			"question_id": questionID,
-			"answer":      req.Answer,
-		}))
+		if pendingCount == 0 {
+			// All answered — collect all answers and wake the brain.
+			rows, err := siteDB.Query(
+				`SELECT q.question, a.answer FROM questions q
+				 JOIN answers a ON a.question_id = q.id
+				 WHERE q.status = 'answered'
+				 ORDER BY q.id`)
+			if err == nil {
+				var parts []string
+				for rows.Next() {
+					var question, answer string
+					if rows.Scan(&question, &answer) == nil {
+						parts = append(parts, question+": "+answer)
+					}
+				}
+				rows.Close()
+				combined := strings.Join(parts, "\n")
+				h.deps.Bus.Publish(events.NewEvent(events.EventQuestionAnswered, siteID, map[string]interface{}{
+					"question_id": questionID,
+					"answer":      combined,
+				}))
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":     questionID,
-		"status": "answered",
+		"id":       questionID,
+		"status":   "answered",
+		"pending":  pendingCount,
 	})
 }

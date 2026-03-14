@@ -11,7 +11,7 @@ import * as router from './core/router.js';
 import * as theme from './core/theme.js';
 import * as state from './core/state.js';
 import { SSEClient } from './core/sse.js';
-import { get } from './core/http.js';
+import { get, TOKEN_KEY } from './core/http.js';
 import { render, clear, h } from './core/dom.js';
 import { addRecent, setActiveSite } from './ui/site-switcher.js';
 
@@ -29,7 +29,6 @@ import { renderUsage } from './views/global/usage.js';
 import { renderUsers } from './views/global/users.js';
 import { renderQuestions } from './views/global/questions.js';
 
-const TOKEN_KEY = 'iatan_token';
 let sse = null;
 let layout = null;
 
@@ -263,6 +262,11 @@ function connectSSE() {
 
   sse.on('brain.tool_result', (data) => {
     state.set('brainToolResult', { site_id: data.site_id, ...(data.payload || {}) });
+  });
+
+  sse.on('brain.stage_change', (data) => {
+    state.set('brainStageChange', { site_id: data.site_id, ...(data.payload || {}) });
+    trackSiteActivity(data.site_id);
   });
 
   sse.on('tool.executed', (data) => {

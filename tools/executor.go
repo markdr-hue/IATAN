@@ -32,8 +32,30 @@ func (e *Executor) Execute(ctx context.Context, toolCtx *ToolContext, name strin
 		return e.marshalError(fmt.Sprintf("unknown tool: %s", name))
 	}
 
+	// Propagate context so tools can use context-aware DB calls.
+	toolCtx.Ctx = ctx
+
 	start := time.Now()
-	result, execErr := tool.Execute(toolCtx, args)
+
+	// Run tool in a goroutine so the context timeout can cancel it.
+	type toolResult struct {
+		result *Result
+		err    error
+	}
+	ch := make(chan toolResult, 1)
+	go func() {
+		r, err := tool.Execute(toolCtx, args)
+		ch <- toolResult{r, err}
+	}()
+
+	var result *Result
+	var execErr error
+	select {
+	case tr := <-ch:
+		result, execErr = tr.result, tr.err
+	case <-ctx.Done():
+		execErr = fmt.Errorf("tool %s timed out: %w", name, ctx.Err())
+	}
 	duration := time.Since(start)
 
 	// Build event payload.

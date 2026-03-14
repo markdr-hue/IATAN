@@ -57,37 +57,45 @@ export function createAssistantMessage(text, createdAt) {
 
 /**
  * Create a streaming assistant message that can be updated.
+ * Shows a 3-dot typing indicator until the first token arrives.
  * @returns {{ element: HTMLElement, appendText: Function, finish: Function }}
  */
 export function createStreamingMessage() {
   const msg = h('div', { className: 'message message--assistant' });
+  const dots = h('div', { className: 'typing-indicator' }, [
+    h('span', { className: 'typing-dot' }),
+    h('span', { className: 'typing-dot' }),
+    h('span', { className: 'typing-dot' }),
+  ]);
   const cursor = h('span', { className: 'typing-cursor' });
-  msg.appendChild(cursor);
+  msg.appendChild(dots);
 
   let buffer = '';
+  let hasFirstToken = false;
 
   function appendText(text) {
     buffer += text;
+    if (!hasFirstToken) {
+      hasFirstToken = true;
+      if (dots.parentNode) dots.remove();
+    }
     msg.innerHTML = renderMarkdown(buffer);
     msg.appendChild(cursor);
   }
 
   function finish() {
-    if (cursor.parentNode) {
-      cursor.parentNode.removeChild(cursor);
-    }
+    if (dots.parentNode) dots.remove();
+    if (cursor.parentNode) cursor.remove();
     const content = h('div', { className: 'message__content' });
     content.innerHTML = renderMarkdown(buffer);
     msg.innerHTML = '';
     msg.appendChild(content);
     msg.appendChild(timestamp());
+    msg.classList.add('message--just-finished');
+    setTimeout(() => msg.classList.remove('message--just-finished'), 800);
   }
 
-  function getText() {
-    return buffer;
-  }
-
-  return { element: msg, appendText, finish, getText };
+  return { element: msg, appendText, finish };
 }
 
 /**
@@ -128,6 +136,24 @@ export function createBrainMessage(text, createdAt) {
 
   const msg = h('div', { className: 'message message--brain' }, [badge, body]);
   return msg;
+}
+
+/**
+ * Create a stage transition divider element.
+ * Shows a horizontal line with the completed stage name and duration.
+ * @param {string} stageName — The stage that just completed.
+ * @param {string} [duration] — Human-readable duration (e.g., "12s").
+ */
+export function createStageTransition(stageName, duration) {
+  const meta = duration ? ` (${duration})` : '';
+  return h('div', { className: 'stage-transition' }, [
+    h('div', { className: 'stage-transition__line' }),
+    h('div', { className: 'stage-transition__label' }, [
+      h('span', { innerHTML: icon('check') }),
+      h('span', {}, `${stageName} complete${meta}`),
+    ]),
+    h('div', { className: 'stage-transition__line' }),
+  ]);
 }
 
 /**
@@ -183,6 +209,27 @@ export function createToolCall(toolName, status, result, args) {
   return createGenericToolCall(toolName, status, result, args);
 }
 
+// Map tool names to icons for generic tool cards
+const toolIcons = {
+  manage_pages: 'file-text',
+  manage_files: 'image',
+  manage_schema: 'database',
+  manage_data: 'database',
+  manage_endpoints: 'zap',
+  manage_layout: 'layers',
+  manage_communication: 'help-circle',
+  manage_analytics: 'bar-chart',
+  manage_diagnostics: 'activity',
+  manage_webhooks: 'zap',
+  manage_providers: 'globe',
+  manage_secrets: 'lock',
+  manage_site: 'settings',
+  manage_scheduler: 'clock',
+  manage_email: 'send',
+  manage_payments: 'shield',
+  make_http_request: 'globe',
+};
+
 /**
  * Generic tool call card (collapsible, status badge, 1-line summary on completion).
  */
@@ -196,8 +243,10 @@ function createGenericToolCall(toolName, status, result, args) {
       ])
     : h('span', { className: 'badge badge--danger' }, 'Error');
 
+  const toolIcon = toolIcons[toolName] || 'settings';
   const header = h('div', { className: 'message__tool-header' }, [
     h('span', { innerHTML: icon('chevron-right') }),
+    h('span', { innerHTML: icon(toolIcon), className: 'message__tool-icon' }),
     h('span', {}, getToolLabel(toolName, args)),
     timestamp(),
     h('span', { className: 'message__tool-status' }, [statusBadge]),

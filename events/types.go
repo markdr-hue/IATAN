@@ -27,6 +27,7 @@ const (
 	EventBrainMessage           EventType = "brain.message"
 	EventBrainToolStart         EventType = "brain.tool_start"
 	EventBrainToolResult        EventType = "brain.tool_result"
+	EventBrainStageChange       EventType = "brain.stage_change"
 	EventWebhookReceived        EventType = "webhook.received"
 	EventWebhookDelivered       EventType = "webhook.delivered"
 	EventWebhookFailed          EventType = "webhook.failed"

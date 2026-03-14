@@ -78,33 +78,40 @@ func (s *Scheduler) initializeNextRunForSite(siteDB *db.SiteDB) {
 	}
 	defer rows.Close()
 
-	now := time.Now()
+	type taskInit struct {
+		id          int
+		cronExpr    sql.NullString
+		intervalSec sql.NullInt64
+	}
+	var tasks []taskInit
 	for rows.Next() {
-		var id int
-		var cronExpr sql.NullString
-		var intervalSec sql.NullInt64
-
-		if err := rows.Scan(&id, &cronExpr, &intervalSec); err != nil {
+		var t taskInit
+		if err := rows.Scan(&t.id, &t.cronExpr, &t.intervalSec); err != nil {
 			continue
 		}
+		tasks = append(tasks, t)
+	}
+	rows.Close() // release read cursor before writes
 
+	now := time.Now()
+	for _, t := range tasks {
 		var nextRun time.Time
-		if cronExpr.Valid && cronExpr.String != "" {
-			nextRun = cron.NextTime(cronExpr.String, now)
-		} else if intervalSec.Valid && intervalSec.Int64 > 0 {
-			nextRun = now.Add(time.Duration(intervalSec.Int64) * time.Second)
+		if t.cronExpr.Valid && t.cronExpr.String != "" {
+			nextRun = cron.NextTime(t.cronExpr.String, now)
+		} else if t.intervalSec.Valid && t.intervalSec.Int64 > 0 {
+			nextRun = now.Add(time.Duration(t.intervalSec.Int64) * time.Second)
 		} else {
 			continue
 		}
 
 		if _, err := siteDB.ExecWrite(
 			"UPDATE scheduled_tasks SET next_run = ? WHERE id = ?",
-			nextRun, id,
+			nextRun, t.id,
 		); err != nil {
-			s.logger.Error("scheduler: failed to initialize next_run", "site_id", siteDB.SiteID, "task_id", id, "error", err)
+			s.logger.Error("scheduler: failed to initialize next_run", "site_id", siteDB.SiteID, "task_id", t.id, "error", err)
 			continue
 		}
-		s.logger.Info("initialized next_run for task", "site_id", siteDB.SiteID, "task_id", id, "next_run", nextRun)
+		s.logger.Info("initialized next_run for task", "site_id", siteDB.SiteID, "task_id", t.id, "next_run", nextRun)
 	}
 }
 

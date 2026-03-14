@@ -7,7 +7,7 @@
  * Site detail shell — Home (stats + chat) or full-width content panel.
  */
 
-import { h, render, clear, qs } from '../../core/dom.js';
+import { h, render, clear } from '../../core/dom.js';
 import { get, post } from '../../core/http.js';
 import { navigate, currentPath } from '../../core/router.js';
 import { icon } from '../../ui/icon.js';

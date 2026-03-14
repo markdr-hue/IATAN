@@ -18,9 +18,15 @@ type SecretsTool struct{}
 
 func (t *SecretsTool) Name() string { return "manage_secrets" }
 func (t *SecretsTool) Description() string {
-	return "Manage encrypted secrets. Actions: store (encrypt and save), list (names only, never values), delete."
+	return "Store, list, or delete encrypted secrets for API keys and tokens."
 }
-
+func (t *SecretsTool) Guide() string {
+	return `### Encrypted Secrets (manage_secrets)
+- store: encrypt and save a secret by name (e.g. "stripe_api_key"). Stored AES-encrypted at rest.
+- list: show all stored secret names (values are never exposed).
+- Secrets are referenced by name in provider configs, email configs, and payment configs.
+`
+}
 func (t *SecretsTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",

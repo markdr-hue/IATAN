@@ -18,7 +18,7 @@ type DiagnosticsTool struct{}
 
 func (t *DiagnosticsTool) Name() string { return "manage_diagnostics" }
 func (t *DiagnosticsTool) Description() string {
-	return "System diagnostics. Actions: health (runtime/memory/DB stats), errors (recent brain log errors), integrity (check layout/page/asset consistency)."
+	return "Check system health, recent errors, or page/asset integrity."
 }
 
 func (t *DiagnosticsTool) Parameters() map[string]interface{} {

@@ -15,7 +15,7 @@ type AnalyticsTool struct{}
 
 func (t *AnalyticsTool) Name() string { return "manage_analytics" }
 func (t *AnalyticsTool) Description() string {
-	return "Site analytics. Actions: query (raw analytics data with date range), summary (total views, unique visitors, top pages, top referrers)."
+	return "Query raw analytics data or get a traffic summary."
 }
 
 func (t *AnalyticsTool) Parameters() map[string]interface{} {

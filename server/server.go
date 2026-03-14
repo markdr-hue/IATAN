@@ -117,6 +117,7 @@ func New(deps *ServerDeps) *Server {
 		DB:            deps.DB,
 		SiteDBManager: deps.SiteDBManager,
 		Bus:           deps.Bus,
+		WSHub:         public.NewWSHub(),
 		Encryptor:     deps.Encryptor,
 		JWTManager:    deps.JWTManager,
 		Logger:        logger.With("server", "public"),

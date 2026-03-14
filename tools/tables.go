@@ -39,10 +39,29 @@ var secureColumnKinds = map[string]string{
 	"ENCRYPTED": "encrypt",
 }
 
+// systemTables are internal tables that the LLM must not create, alter, or drop.
+var systemTables = map[string]bool{
+	"pages": true, "page_versions": true, "assets": true, "files": true,
+	"file_versions": true, "brain_log": true, "memory": true,
+	"chat_messages": true, "questions": true, "answers": true,
+	"dynamic_tables": true, "api_endpoints": true, "auth_endpoints": true,
+	"oauth_providers": true, "webhooks": true, "webhook_subscriptions": true,
+	"webhook_logs": true, "analytics": true, "secrets": true,
+	"scheduled_tasks": true, "task_runs": true, "activity_log": true,
+	"approval_rules": true, "site_snapshots": true, "service_providers": true,
+	"llm_log": true, "layouts": true, "layout_versions": true,
+	"pipeline_state": true, "stage_log": true,
+	"upload_endpoints": true, "stream_endpoints": true,
+	"redirects": true, "ws_endpoints": true,
+}
+
 // sanitizedTableName validates and returns the physical table name.
 func sanitizedTableName(name string) (string, error) {
 	if !validTableName.MatchString(name) {
 		return "", fmt.Errorf("invalid table name: %s (must be alphanumeric/underscore, start with letter)", name)
+	}
+	if systemTables[name] {
+		return "", fmt.Errorf("cannot use reserved system table: %s", name)
 	}
 	return name, nil
 }
@@ -131,8 +150,18 @@ type SchemaTool struct{}
 
 func (t *SchemaTool) Name() string { return "manage_schema" }
 func (t *SchemaTool) Description() string {
-	return "Manage dynamic table schemas. Actions: create (create table), alter (add/drop columns), describe (show columns), list (list tables), drop (delete table and related endpoints — requires owner approval). Dropping columns via alter also requires owner approval. Note: 'id' and 'created_at' columns are auto-added — do NOT include them in your column definitions."
+	return "Create, alter, describe, list, or drop dynamic tables."
 }
+
+func (t *SchemaTool) Guide() string {
+	return `### Dynamic Tables (manage_schema)
+- Column types: TEXT, INTEGER, REAL, BOOLEAN, PASSWORD (bcrypt), ENCRYPTED (AES).
+- id and created_at columns are auto-added — do NOT include them.
+- searchable_columns enables FTS5 full-text search (used with manage_data search action).
+- PASSWORD columns auto-hash with bcrypt. ENCRYPTED columns auto-encrypt with AES.
+- Dropping tables or columns requires owner approval via manage_communication.`
+}
+
 func (t *SchemaTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -157,6 +186,11 @@ func (t *SchemaTool) Parameters() map[string]interface{} {
 			"drop_columns": map[string]interface{}{
 				"type":        "array",
 				"description": "Column names to drop for alter",
+				"items":       map[string]interface{}{"type": "string"},
+			},
+			"searchable_columns": map[string]interface{}{
+				"type":        "array",
+				"description": "TEXT column names to index for full-text search (FTS5). Creates a virtual table and sync triggers. Used with manage_data search action.",
 				"items":       map[string]interface{}{"type": "string"},
 			},
 		},
@@ -247,11 +281,105 @@ func (t *SchemaTool) create(ctx *ToolContext, args map[string]interface{}) (*Res
 		return nil, fmt.Errorf("recording dynamic table: %w", err)
 	}
 
-	return &Result{Success: true, Data: map[string]interface{}{
+	// Create FTS5 full-text search index if searchable_columns provided.
+	var searchableCols []string
+	if rawSearchable, ok := args["searchable_columns"].([]interface{}); ok && len(rawSearchable) > 0 {
+		for _, sc := range rawSearchable {
+			colName, ok := sc.(string)
+			if !ok || !validColumnName.MatchString(colName) {
+				continue
+			}
+			// Verify the column exists and is TEXT type.
+			if colType, exists := columnsRaw[colName]; exists {
+				if ct, ok := colType.(string); ok && strings.EqualFold(ct, "TEXT") {
+					searchableCols = append(searchableCols, colName)
+				}
+			}
+		}
+		if len(searchableCols) > 0 {
+			if err := createFTSIndex(ctx.DB, physicalName, searchableCols); err != nil {
+				// Non-fatal — FTS is a bonus, not a requirement.
+				return &Result{Success: true, Data: map[string]interface{}{
+					"table":          tableName,
+					"columns":        columnsRaw,
+					"secure_columns": secureCols,
+					"fts_warning":    fmt.Sprintf("FTS5 index creation failed: %v", err),
+				}}, nil
+			}
+		}
+	}
+
+	resultData := map[string]interface{}{
 		"table":          tableName,
 		"columns":        columnsRaw,
 		"secure_columns": secureCols,
-	}}, nil
+	}
+	if len(searchableCols) > 0 {
+		resultData["fts_columns"] = searchableCols
+	}
+	return &Result{Success: true, Data: resultData}, nil
+}
+
+// createFTSIndex creates an FTS5 virtual table and sync triggers for the given columns.
+func createFTSIndex(db *sql.DB, tableName string, columns []string) error {
+	ftsTable := tableName + "_fts"
+	colList := strings.Join(columns, ", ")
+
+	// Create FTS5 virtual table.
+	ftsSQL := fmt.Sprintf(
+		"CREATE VIRTUAL TABLE IF NOT EXISTS %s USING fts5(%s, content=%s, content_rowid=id)",
+		ftsTable, colList, tableName,
+	)
+	if _, err := db.Exec(ftsSQL); err != nil {
+		return fmt.Errorf("creating FTS5 table: %w", err)
+	}
+
+	// Build column references for triggers.
+	var newCols, oldCols []string
+	for _, c := range columns {
+		newCols = append(newCols, "new."+c)
+		oldCols = append(oldCols, "old."+c)
+	}
+	newColList := strings.Join(newCols, ", ")
+	oldColList := strings.Join(oldCols, ", ")
+
+	// AFTER INSERT trigger.
+	_, err := db.Exec(fmt.Sprintf(
+		`CREATE TRIGGER IF NOT EXISTS %s_ai AFTER INSERT ON %s BEGIN
+			INSERT INTO %s(rowid, %s) VALUES (new.id, %s);
+		END`,
+		tableName, tableName, ftsTable, colList, newColList,
+	))
+	if err != nil {
+		return fmt.Errorf("creating INSERT trigger: %w", err)
+	}
+
+	// AFTER DELETE trigger.
+	_, err = db.Exec(fmt.Sprintf(
+		`CREATE TRIGGER IF NOT EXISTS %s_ad AFTER DELETE ON %s BEGIN
+			INSERT INTO %s(%s, rowid, %s) VALUES('delete', old.id, %s);
+		END`,
+		tableName, tableName, ftsTable, ftsTable, colList, oldColList,
+	))
+	if err != nil {
+		return fmt.Errorf("creating DELETE trigger: %w", err)
+	}
+
+	// AFTER UPDATE trigger.
+	_, err = db.Exec(fmt.Sprintf(
+		`CREATE TRIGGER IF NOT EXISTS %s_au AFTER UPDATE ON %s BEGIN
+			INSERT INTO %s(%s, rowid, %s) VALUES('delete', old.id, %s);
+			INSERT INTO %s(rowid, %s) VALUES (new.id, %s);
+		END`,
+		tableName, tableName,
+		ftsTable, ftsTable, colList, oldColList,
+		ftsTable, colList, newColList,
+	))
+	if err != nil {
+		return fmt.Errorf("creating UPDATE trigger: %w", err)
+	}
+
+	return nil
 }
 
 func (t *SchemaTool) alter(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
@@ -559,7 +687,15 @@ type DataTool struct{}
 
 func (t *DataTool) Name() string { return "manage_data" }
 func (t *DataTool) Description() string {
-	return "Manage dynamic table data. Actions: query (select rows), insert (single row via 'data' or bulk via 'rows' array, max 100 rows per call), update (by id), delete (by id), count, aggregate (sum/avg/min/max with optional group_by). PASSWORD columns are auto-hashed on insert and never returned in query results — use manage_endpoints verify_password to check credentials. ENCRYPTED columns are auto-encrypted. Query returns max 50 rows by default (specify limit to override)."
+	return "Query, insert, update, delete, count, aggregate, or search table data. Supports bulk insert via 'rows' array."
+}
+func (t *DataTool) Guide() string {
+	return `### Data Operations (manage_data)
+- query: filters=[{"column":"x","op":"=","value":"v"}], order_by={"column":"x","direction":"ASC"}, limit (default 50).
+- insert: single row via data={}, bulk via rows=[{},{}]. PASSWORD columns auto-hash, ENCRYPTED auto-encrypt.
+- search: full-text search via query_text on FTS5-indexed columns (set via manage_schema searchable_columns).
+- aggregate: function=count|sum|avg|min|max, column, group_by=[]. Use for dashboards and stats.
+`
 }
 func (t *DataTool) Parameters() map[string]interface{} {
 	return map[string]interface{}{
@@ -567,8 +703,12 @@ func (t *DataTool) Parameters() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"action": map[string]interface{}{
 				"type":        "string",
-				"enum":        []string{"query", "insert", "update", "delete", "count", "aggregate"},
+				"enum":        []string{"query", "insert", "update", "delete", "count", "aggregate", "search"},
 				"description": "Data operation to perform",
+			},
+			"query_text": map[string]interface{}{
+				"type":        "string",
+				"description": "Search query for full-text search action. Searches FTS5-indexed columns.",
 			},
 			"table_name": map[string]interface{}{
 				"type":        "string",
@@ -632,7 +772,11 @@ func (t *DataTool) Execute(ctx *ToolContext, args map[string]interface{}) (*Resu
 		"delete":    t.del,
 		"count":     t.count,
 		"aggregate": t.aggregate,
+		"search":    t.search,
 	}, func(a map[string]interface{}) string {
+		if _, has := a["query_text"]; has {
+			return "search"
+		}
 		if _, has := a["rows"]; has {
 			return "insert"
 		}
@@ -1107,6 +1251,99 @@ func (t *DataTool) aggregate(ctx *ToolContext, args map[string]interface{}) (*Re
 		"function": fn,
 		"data":     results,
 	}}, nil
+}
+
+func (t *DataTool) search(ctx *ToolContext, args map[string]interface{}) (*Result, error) {
+	tableName, _ := args["table_name"].(string)
+	queryText, _ := args["query_text"].(string)
+	if tableName == "" || queryText == "" {
+		return &Result{Success: false, Error: "table_name and query_text are required"}, nil
+	}
+
+	physicalName, err := sanitizedTableName(tableName)
+	if err != nil {
+		return &Result{Success: false, Error: err.Error()}, nil
+	}
+
+	ftsTable := physicalName + "_fts"
+
+	// Check that the FTS table exists.
+	var cnt int
+	err = ctx.DB.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+		ftsTable,
+	).Scan(&cnt)
+	if err != nil || cnt == 0 {
+		return &Result{Success: false, Error: fmt.Sprintf("no full-text search index for table %s — create with searchable_columns in manage_schema", tableName)}, nil
+	}
+
+	limit := 50
+	if l, ok := args["limit"].(float64); ok && l > 0 && l <= 200 {
+		limit = int(l)
+	}
+
+	// Query FTS5 with ranking.
+	query := fmt.Sprintf(
+		"SELECT t.* FROM %s t JOIN %s f ON t.id = f.rowid WHERE %s MATCH ? ORDER BY f.rank LIMIT ?",
+		physicalName, ftsTable, ftsTable,
+	)
+
+	rows, err := ctx.DB.Query(query, queryText, limit)
+	if err != nil {
+		return &Result{Success: false, Error: fmt.Sprintf("search error: %v", err)}, nil
+	}
+	defer rows.Close()
+
+	results := scanRowsMaps(rows)
+
+	// Strip secure columns.
+	secureCols, _ := loadSecureColumns(ctx, tableName)
+	stripSecureCols(results, secureCols)
+
+	return &Result{Success: true, Data: map[string]interface{}{
+		"query":   queryText,
+		"count":   len(results),
+		"results": results,
+	}}, nil
+}
+
+// scanRowsMaps scans rows into a slice of maps (generic column scanning).
+func scanRowsMaps(rows *sql.Rows) []map[string]interface{} {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil
+	}
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if rows.Scan(ptrs...) != nil {
+			continue
+		}
+		row := make(map[string]interface{})
+		for i, col := range cols {
+			row[col] = values[i]
+		}
+		results = append(results, row)
+	}
+	return results
+}
+
+// stripSecureCols removes hash/encrypt columns from result maps.
+func stripSecureCols(results []map[string]interface{}, secureCols map[string]string) {
+	if len(secureCols) == 0 {
+		return
+	}
+	for _, row := range results {
+		for col, kind := range secureCols {
+			if kind == "hash" {
+				delete(row, col)
+			}
+		}
+	}
 }
 
 func (t *DataTool) MaxResultSize() int { return 12000 }
