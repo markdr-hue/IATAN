@@ -121,13 +121,14 @@ func (t *LayoutTool) save(ctx *ToolContext, args map[string]interface{}) (*Resul
 		return &Result{Success: false, Error: "name is required (use \"default\" for the main layout)"}, nil
 	}
 
-	headContent, _ := args["head_content"].(string)
-	bodyBefore, _ := args["body_before_main"].(string)
-	bodyAfter, _ := args["body_after_main"].(string)
+	// Track which fields were explicitly provided (vs omitted).
+	headContent, headGiven := args["head_content"].(string)
+	bodyBefore, beforeGiven := args["body_before_main"].(string)
+	bodyAfter, afterGiven := args["body_after_main"].(string)
 
 	var warnings []string
 
-	// Strip document shell tags and shared asset references from layout fields.
+	// Strip document shell tags and shared asset references from provided fields.
 	for _, field := range []*string{&headContent, &bodyBefore, &bodyAfter} {
 		if layoutDocShellRe.MatchString(*field) {
 			*field = layoutDocShellRe.ReplaceAllString(*field, "")
@@ -159,6 +160,17 @@ func (t *LayoutTool) save(ctx *ToolContext, args map[string]interface{}) (*Resul
 			 VALUES (?, ?, ?, ?, ?, ?, ?, 'brain')`,
 			existingID, name, oldHead, oldBefore, oldAfter, oldTemplate, maxVer+1,
 		)
+
+		// Merge: keep existing values for fields not provided in this call.
+		if !headGiven {
+			headContent = oldHead.String
+		}
+		if !beforeGiven {
+			bodyBefore = oldBefore.String
+		}
+		if !afterGiven {
+			bodyAfter = oldAfter.String
+		}
 	}
 
 	// Always write NULL for template (template mode removed).

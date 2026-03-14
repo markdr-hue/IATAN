@@ -52,6 +52,7 @@ func (t *EndpointsTool) Guide() string {
   Connect: new EventSource('/api/{path}/stream'). Options: event_types, requires_auth.
 - **create_upload**: File upload (multipart form).
   POST /api/{path}/upload -> {url, filename, size, type}. Options: allowed_types, max_size_mb, requires_auth.
+  Optional table_name: auto-inserts a row with columns (filename TEXT, url TEXT, content_type TEXT, size INTEGER) on each upload. Table must exist with those exact columns.
 - **create_oauth**: OAuth provider linked to an existing auth endpoint.`
 }
 
@@ -70,7 +71,7 @@ func (t *EndpointsTool) Parameters() map[string]interface{} {
 			},
 			"table_name": map[string]interface{}{
 				"type":        "string",
-				"description": "Dynamic table to map to (must already exist). Required for create_api, create_auth, and verify_password.",
+				"description": "Dynamic table to map to (must already exist). Required for create_api, create_auth, and verify_password. Optional for create_upload: auto-inserts (filename, url, content_type, size) per upload — table must have those columns.",
 			},
 			"methods": map[string]interface{}{
 				"type":        "array",

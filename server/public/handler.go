@@ -441,14 +441,14 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 		description = *site.Description
 	}
 
-	// Load layout (NULL or empty → "default", "none" → no layout).
+	// Load layout (NULL or empty → "default", "none" → no layout wrapping).
+	// Even "none" pages still get the default head_content (fonts, meta, CDN scripts).
 	var layout *layoutData
-	if layoutName != "none" {
-		if layoutName == "" {
-			layoutName = "default"
-		}
-		layout = loadLayout(siteDB, layoutName)
+	noLayoutWrap := layoutName == "none"
+	if layoutName == "" || layoutName == "none" {
+		layoutName = "default"
 	}
+	layout = loadLayout(siteDB, layoutName)
 
 	// Auto-inject global-scoped CSS/JS assets from the assets table.
 	cssLinks, jsScripts := autoInjectAssets(siteDB)
@@ -496,6 +496,7 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 
 	// Layout head_content (extra fonts, meta, etc.).
 	if layout != nil && layout.HeadContent != "" {
+		b.WriteString("  ")
 		b.WriteString(layout.HeadContent)
 		b.WriteString("\n")
 	}
@@ -520,34 +521,32 @@ func (h *Handler) renderDocument(site *models.Site, siteDB *sql.DB, pagePath, ti
 
 	b.WriteString("<body>\n")
 
-	if layout != nil {
-		if layout.Template != "" {
-			// Template mode: replace {{content}} placeholder, no forced structure.
-			rendered := strings.Replace(layout.Template, "{{content}}", cleanContent, 1)
-			b.WriteString(rendered)
-			b.WriteString("\n")
-		} else {
-			// Traditional mode: body_before_main → <main> → content → </main> → body_after_main
-			// Strip nav/footer from page content — the layout provides these.
-			cleanContent = navBlockRe.ReplaceAllString(cleanContent, "")
-			cleanContent = footBlockRe.ReplaceAllString(cleanContent, "")
-
-			if layout.BodyBeforeMain != "" {
-				b.WriteString(layout.BodyBeforeMain)
-				b.WriteString("\n")
-			}
-			b.WriteString("<main>\n")
-			b.WriteString(cleanContent)
-			b.WriteString("\n</main>\n")
-			if layout.BodyAfterMain != "" {
-				b.WriteString(layout.BodyAfterMain)
-				b.WriteString("\n")
-			}
-		}
-	} else {
-		// No layout (layout="none") — render content as-is, no <main> wrapping.
+	if noLayoutWrap || layout == nil {
+		// No layout wrapping (layout="none" or layout not found) — render content as-is.
 		b.WriteString(cleanContent)
 		b.WriteString("\n")
+	} else if layout.Template != "" {
+		// Template mode: replace {{content}} placeholder, no forced structure.
+		rendered := strings.Replace(layout.Template, "{{content}}", cleanContent, 1)
+		b.WriteString(rendered)
+		b.WriteString("\n")
+	} else {
+		// Traditional mode: body_before_main → <main> → content → </main> → body_after_main
+		// Strip nav/footer from page content — the layout provides these.
+		cleanContent = navBlockRe.ReplaceAllString(cleanContent, "")
+		cleanContent = footBlockRe.ReplaceAllString(cleanContent, "")
+
+		if layout.BodyBeforeMain != "" {
+			b.WriteString(layout.BodyBeforeMain)
+			b.WriteString("\n")
+		}
+		b.WriteString("<main>\n")
+		b.WriteString(cleanContent)
+		b.WriteString("\n</main>\n")
+		if layout.BodyAfterMain != "" {
+			b.WriteString(layout.BodyAfterMain)
+			b.WriteString("\n")
+		}
 	}
 
 	// Inject route params for parameterized pages (e.g. /thread/:id → {id: "4"}).
@@ -2017,15 +2016,20 @@ func (h *Handler) apiUpload(w http.ResponseWriter, r *http.Request, siteID int, 
 	)
 	if err != nil {
 		slog.Error("upload: failed to insert file metadata", "error", err)
+		os.Remove(storagePath) // clean up orphaned file
+		writePublicError(w, http.StatusInternalServerError, "storage error")
+		return
 	}
 
 	// If linked to a table, also insert a row there.
 	fileURL := "/files/" + storageName
 	if ue.TableName != "" {
-		siteDB.Writer().Exec(
-			fmt.Sprintf("INSERT INTO %s (filename, url, content_type, size) VALUES (?, ?, ?, ?)", ue.TableName),
+		if _, err := siteDB.Writer().Exec(
+			`INSERT INTO `+ue.TableName+` (filename, url, content_type, size) VALUES (?, ?, ?, ?)`,
 			header.Filename, fileURL, ct, len(data),
-		)
+		); err != nil {
+			slog.Warn("upload: linked table insert failed", "table", ue.TableName, "error", err)
+		}
 	}
 
 	writePublicJSON(w, http.StatusCreated, map[string]interface{}{
